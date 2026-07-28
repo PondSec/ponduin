@@ -189,6 +189,7 @@ schemars = { workspace = true, features = [
 shellexpand = { workspace = true }
 indexmap = { version = "2.9", default-features = false, features = ["serde", "std"] }
 ignore = { workspace = true }
+globset = { version = "0.4", default-features = false }
 rayon = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-go = { workspace = true }

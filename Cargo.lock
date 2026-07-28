@@ -7912,6 +7912,7 @@ dependencies = [
  "fs2",
  "futures",
  "gethostname",
+ "globset",
  "http 1.4.2",
  "icu_calendar",
  "icu_locale",
