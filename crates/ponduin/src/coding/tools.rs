@@ -3,6 +3,7 @@ use crate::coding::file::{
     FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
 };
 use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitOwnedPath, GitRepository};
+use crate::coding::intelligence::{IntelligenceLimits, RepositoryIndex, RepositoryIntelligence};
 use crate::coding::patch::{
     MutationBatch, MutationPreview, MutationResult, PatchEngine, PatchLimits, RollbackRecord,
     DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
@@ -16,11 +17,11 @@ use rmcp::model::{
 };
 use rmcp::object;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const CODING_TOOL_PREFIX: &str = "coding__";
@@ -41,16 +42,22 @@ pub const GIT_UNSTAGE_OWNED_TOOL_NAME: &str = "coding__git_unstage_owned";
 pub const GIT_COMMIT_OWNED_TOOL_NAME: &str = "coding__git_commit_owned";
 pub const GIT_CREATE_BRANCH_TOOL_NAME: &str = "coding__git_create_branch";
 pub const GIT_PUSH_OWNED_TOOL_NAME: &str = "coding__git_push_owned";
+pub const REPOSITORY_MAP_TOOL_NAME: &str = "coding__repository_map";
+pub const SEARCH_SYMBOLS_TOOL_NAME: &str = "coding__search_symbols";
+pub const FIND_REFERENCES_TOOL_NAME: &str = "coding__find_references";
+pub const SELECT_CONTEXT_TOOL_NAME: &str = "coding__select_context";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
 const MAX_ROLLBACK_RECORDS: usize = 20;
 const MAX_ROLLBACK_BYTES: usize = 64 * 1_024 * 1_024;
+const MAX_INTELLIGENCE_CACHE_ENTRIES: usize = 4;
 
 #[derive(Debug, Default)]
 pub(crate) struct CodingToolState {
     rollback_journal: Mutex<VecDeque<RollbackJournalEntry>>,
     committed: Mutex<VecDeque<OwnedCommit>>,
+    intelligence_cache: Mutex<VecDeque<IntelligenceCacheEntry>>,
 }
 
 #[derive(Debug)]
@@ -65,6 +72,13 @@ struct RollbackJournalEntry {
 struct OwnedCommit {
     workspace_root: PathBuf,
     oid: String,
+}
+
+#[derive(Debug)]
+struct IntelligenceCacheEntry {
+    workspace_root: PathBuf,
+    limits: IntelligenceLimits,
+    index: Arc<RepositoryIndex>,
 }
 
 impl CodingToolState {
@@ -228,6 +242,67 @@ impl CodingToolState {
             .iter()
             .any(|commit| commit.workspace_root == workspace_root && commit.oid == oid)
     }
+
+    fn intelligence_index(
+        &self,
+        config: &CodingConfig,
+        workspace: &CodingWorkspace,
+        limits: IntelligenceLimits,
+    ) -> Result<Arc<RepositoryIndex>, ErrorData> {
+        if !config.tree_sitter {
+            return Err(tool_unavailable(
+                "Tree-sitter repository intelligence is disabled by coding configuration",
+            ));
+        }
+        if !config.indexing {
+            return RepositoryIntelligence::build(workspace, limits)
+                .map(Arc::new)
+                .map_err(|error| invalid_arguments(error.to_string()));
+        }
+
+        let fingerprint = RepositoryIntelligence::fingerprint(workspace, limits)
+            .map_err(|error| invalid_arguments(error.to_string()))?;
+        if let Some(index) = self
+            .intelligence_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|entry| {
+                entry.workspace_root == workspace.root()
+                    && entry.limits == limits
+                    && entry.index.source_fingerprint == fingerprint
+            })
+            .map(|entry| Arc::clone(&entry.index))
+        {
+            return Ok(index);
+        }
+
+        let index = Arc::new(
+            RepositoryIntelligence::build(workspace, limits)
+                .map_err(|error| invalid_arguments(error.to_string()))?,
+        );
+        let mut cache = self
+            .intelligence_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|entry| entry.workspace_root != workspace.root() || entry.limits != limits);
+        cache.push_back(IntelligenceCacheEntry {
+            workspace_root: workspace.root().to_path_buf(),
+            limits,
+            index: Arc::clone(&index),
+        });
+        while cache.len() > MAX_INTELLIGENCE_CACHE_ENTRIES {
+            cache.pop_front();
+        }
+        Ok(index)
+    }
+
+    fn invalidate_intelligence(&self, workspace_root: &Path) {
+        self.intelligence_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| entry.workspace_root != workspace_root);
+    }
 }
 
 pub fn definitions() -> Vec<Tool> {
@@ -249,6 +324,10 @@ pub fn definitions() -> Vec<Tool> {
         git_commit_owned_tool(),
         git_create_branch_tool(),
         git_push_owned_tool(),
+        repository_map_tool(),
+        search_symbols_tool(),
+        find_references_tool(),
+        select_context_tool(),
     ]
 }
 
@@ -319,6 +398,7 @@ pub(crate) async fn execute_async(
             .run(request)
             .await
             .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.invalidate_intelligence(workspace.root());
             bounded_process_result(output, config.output_limit)
         }
         GIT_STATUS_TOOL_NAME => {
@@ -542,6 +622,7 @@ pub(crate) fn execute_with_state(
                 .apply(prepared)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             state.remember(workspace.root(), applied.rollback, &applied.result.preview);
+            state.invalidate_intelligence(workspace.root());
             json_result(&applied.result, config.output_limit)
         }
         ROLLBACK_CHANGES_TOOL_NAME => {
@@ -557,6 +638,39 @@ pub(crate) fn execute_with_state(
                 .rollback(record)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             state.forget(&params.rollback_id);
+            state.invalidate_intelligence(workspace.root());
+            json_result(&result, config.output_limit)
+        }
+        REPOSITORY_MAP_TOOL_NAME => {
+            let params: RepositoryMapParams = parse_arguments(&tool_call)?;
+            let index = state.intelligence_index(config, &workspace, params.limits())?;
+            json_result(
+                &RepositoryMapResult::from(index.as_ref()),
+                config.output_limit,
+            )
+        }
+        SEARCH_SYMBOLS_TOOL_NAME => {
+            let params: SymbolSearchParams = parse_arguments(&tool_call)?;
+            let index = state.intelligence_index(config, &workspace, params.limits())?;
+            let result = index
+                .search_symbols(&params.query, params.exact, params.max_results)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&result, config.output_limit)
+        }
+        FIND_REFERENCES_TOOL_NAME => {
+            let params: ReferenceSearchParams = parse_arguments(&tool_call)?;
+            let index = state.intelligence_index(config, &workspace, params.limits())?;
+            let result = index
+                .references(&params.symbol, params.max_results)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&result, config.output_limit)
+        }
+        SELECT_CONTEXT_TOOL_NAME => {
+            let params: ContextSelectionParams = parse_arguments(&tool_call)?;
+            let index = state.intelligence_index(config, &workspace, params.limits())?;
+            let result = index
+                .context_candidates(&params.query, params.max_results)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&result, config.output_limit)
         }
         RUN_PROCESS_TOOL_NAME
@@ -1050,6 +1164,142 @@ fn git_push_owned_tool() -> Tool {
     .annotate(mutation_annotations("Push agent-owned Git commit"))
 }
 
+fn repository_map_tool() -> Tool {
+    Tool::new(
+        REPOSITORY_MAP_TOOL_NAME.to_string(),
+        "Build a bounded internal Tree-sitter repository map without using an extension. Returns \
+         analyzed source files, framework evidence, entry points, configuration and generated \
+         files, aggregate symbol/import/call counts, scan bounds, fingerprint, and warnings."
+            .to_string(),
+        intelligence_limits_schema(),
+    )
+    .annotate(read_only_annotations("Map repository code"))
+}
+
+fn search_symbols_tool() -> Tool {
+    Tool::new(
+        SEARCH_SYMBOLS_TOOL_NAME.to_string(),
+        "Search function and type definitions in the bounded internal Tree-sitter repository \
+         index. Results include workspace-relative paths, qualified names, kinds, and source \
+         lines; no extension or project code is executed."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "minLength": 1},
+                "exact": {"type": "boolean", "default": false},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 100
+                },
+                "max_files": intelligence_max_files_schema(),
+                "max_file_bytes": intelligence_max_file_bytes_schema(),
+                "max_symbols": intelligence_max_symbols_schema()
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Search repository symbols"))
+}
+
+fn find_references_tool() -> Tool {
+    Tool::new(
+        FIND_REFERENCES_TOOL_NAME.to_string(),
+        "Find bounded call-site references to an exact callee name in the internal Tree-sitter \
+         repository index. Results identify the caller, source path, and line without executing \
+         repository code."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["symbol"],
+            "properties": {
+                "symbol": {"type": "string", "minLength": 1},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 100
+                },
+                "max_files": intelligence_max_files_schema(),
+                "max_file_bytes": intelligence_max_file_bytes_schema(),
+                "max_symbols": intelligence_max_symbols_schema()
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Find repository references"))
+}
+
+fn select_context_tool() -> Tool {
+    Tool::new(
+        SELECT_CONTEXT_TOOL_NAME.to_string(),
+        "Rank bounded repository files as context candidates for a coding query using paths, \
+         symbols, imports, calls, framework evidence, entry points, and configuration files from \
+         the internal Tree-sitter index. This selects files but does not read their contents."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "minLength": 1},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 20
+                },
+                "max_files": intelligence_max_files_schema(),
+                "max_file_bytes": intelligence_max_file_bytes_schema(),
+                "max_symbols": intelligence_max_symbols_schema()
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Select repository context"))
+}
+
+fn intelligence_limits_schema() -> serde_json::Map<String, Value> {
+    object!({
+        "type": "object",
+        "properties": {
+            "max_files": intelligence_max_files_schema(),
+            "max_file_bytes": intelligence_max_file_bytes_schema(),
+            "max_symbols": intelligence_max_symbols_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn intelligence_max_files_schema() -> Value {
+    serde_json::json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100000,
+        "default": 20000
+    })
+}
+
+fn intelligence_max_file_bytes_schema() -> Value {
+    serde_json::json!({
+        "type": "integer",
+        "minimum": 8192,
+        "maximum": 10485760,
+        "default": 2097152
+    })
+}
+
+fn intelligence_max_symbols_schema() -> Value {
+    serde_json::json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 500000,
+        "default": 50000
+    })
+}
+
 fn owned_paths_schema() -> serde_json::Map<String, Value> {
     object!({
         "type": "object",
@@ -1382,6 +1632,136 @@ struct ReadFileParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RepositoryMapParams {
+    max_files: usize,
+    max_file_bytes: usize,
+    max_symbols: usize,
+}
+
+impl RepositoryMapParams {
+    fn limits(&self) -> IntelligenceLimits {
+        IntelligenceLimits {
+            max_files: self.max_files,
+            max_file_bytes: self.max_file_bytes,
+            max_symbols: self.max_symbols,
+        }
+    }
+}
+
+impl Default for RepositoryMapParams {
+    fn default() -> Self {
+        let limits = IntelligenceLimits::default();
+        Self {
+            max_files: limits.max_files,
+            max_file_bytes: limits.max_file_bytes,
+            max_symbols: limits.max_symbols,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymbolSearchParams {
+    query: String,
+    #[serde(default)]
+    exact: bool,
+    #[serde(default = "default_symbol_results")]
+    max_results: usize,
+    #[serde(default = "default_intelligence_max_files")]
+    max_files: usize,
+    #[serde(default = "default_intelligence_max_file_bytes")]
+    max_file_bytes: usize,
+    #[serde(default = "default_intelligence_max_symbols")]
+    max_symbols: usize,
+}
+
+impl SymbolSearchParams {
+    fn limits(&self) -> IntelligenceLimits {
+        intelligence_limits(self.max_files, self.max_file_bytes, self.max_symbols)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceSearchParams {
+    symbol: String,
+    #[serde(default = "default_symbol_results")]
+    max_results: usize,
+    #[serde(default = "default_intelligence_max_files")]
+    max_files: usize,
+    #[serde(default = "default_intelligence_max_file_bytes")]
+    max_file_bytes: usize,
+    #[serde(default = "default_intelligence_max_symbols")]
+    max_symbols: usize,
+}
+
+impl ReferenceSearchParams {
+    fn limits(&self) -> IntelligenceLimits {
+        intelligence_limits(self.max_files, self.max_file_bytes, self.max_symbols)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextSelectionParams {
+    query: String,
+    #[serde(default = "default_context_results")]
+    max_results: usize,
+    #[serde(default = "default_intelligence_max_files")]
+    max_files: usize,
+    #[serde(default = "default_intelligence_max_file_bytes")]
+    max_file_bytes: usize,
+    #[serde(default = "default_intelligence_max_symbols")]
+    max_symbols: usize,
+}
+
+impl ContextSelectionParams {
+    fn limits(&self) -> IntelligenceLimits {
+        intelligence_limits(self.max_files, self.max_file_bytes, self.max_symbols)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RepositoryMapResult<'a> {
+    files: &'a [crate::coding::intelligence::CodeFileMap],
+    frameworks: &'a [crate::coding::intelligence::FrameworkDetection],
+    entry_points: &'a [PathBuf],
+    config_files: &'a [PathBuf],
+    generated_files: &'a [PathBuf],
+    excluded_directory_names: &'a [String],
+    symbol_count: usize,
+    import_count: usize,
+    call_count: usize,
+    scanned_files: usize,
+    analyzed_bytes: usize,
+    source_fingerprint: &'a str,
+    truncated: bool,
+    warnings: &'a [String],
+}
+
+impl<'a> From<&'a RepositoryIndex> for RepositoryMapResult<'a> {
+    fn from(index: &'a RepositoryIndex) -> Self {
+        Self {
+            files: &index.files,
+            frameworks: &index.frameworks,
+            entry_points: &index.entry_points,
+            config_files: &index.config_files,
+            generated_files: &index.generated_files,
+            excluded_directory_names: &index.excluded_directory_names,
+            symbol_count: index.symbols.len(),
+            import_count: index.imports.len(),
+            call_count: index.calls.len(),
+            scanned_files: index.scanned_files,
+            analyzed_bytes: index.analyzed_bytes,
+            source_fingerprint: &index.source_fingerprint,
+            truncated: index.truncated,
+            warnings: &index.warnings,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RollbackChangesParams {
     rollback_id: String,
@@ -1477,6 +1857,38 @@ fn default_read_limit() -> usize {
     DEFAULT_READ_LIMIT
 }
 
+fn intelligence_limits(
+    max_files: usize,
+    max_file_bytes: usize,
+    max_symbols: usize,
+) -> IntelligenceLimits {
+    IntelligenceLimits {
+        max_files,
+        max_file_bytes,
+        max_symbols,
+    }
+}
+
+fn default_symbol_results() -> usize {
+    100
+}
+
+fn default_context_results() -> usize {
+    20
+}
+
+fn default_intelligence_max_files() -> usize {
+    IntelligenceLimits::default().max_files
+}
+
+fn default_intelligence_max_file_bytes() -> usize {
+    IntelligenceLimits::default().max_file_bytes
+}
+
+fn default_intelligence_max_symbols() -> usize {
+    IntelligenceLimits::default().max_symbols
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1519,7 +1931,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 21);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -1554,6 +1966,128 @@ mod tests {
 
         assert_eq!(json["manifests"][0]["kind"], "cargo");
         assert_eq!(json["languages"]["rust"], 1);
+    }
+
+    #[test]
+    fn exposes_direct_repository_intelligence_tools() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(temp_dir.path().join("src")).unwrap();
+        fs::write(
+            temp_dir.path().join("src/lib.rs"),
+            "pub struct Service;\npub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("worker.py"),
+            "def process_item():\n    return 1\n",
+        )
+        .unwrap();
+        let state = CodingToolState::default();
+
+        let map = execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(REPOSITORY_MAP_TOOL_NAME),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let map: Value = serde_json::from_str(&result_text(map)).unwrap();
+        assert_eq!(map["symbol_count"], 4);
+        assert_eq!(map["files"].as_array().unwrap().len(), 2);
+        assert!(map["source_fingerprint"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("blake3:")));
+
+        let symbols = execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(SEARCH_SYMBOLS_TOOL_NAME).with_arguments(object!({
+                "query": "process"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let symbols: Value = serde_json::from_str(&result_text(symbols)).unwrap();
+        assert_eq!(symbols["matches"][0]["name"], "process_item");
+        assert_eq!(symbols["matches"][0]["path"], "worker.py");
+
+        let references = execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(FIND_REFERENCES_TOOL_NAME).with_arguments(object!({
+                "symbol": "target"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let references: Value = serde_json::from_str(&result_text(references)).unwrap();
+        assert_eq!(references["matches"][0]["caller"], "caller");
+        assert_eq!(references["matches"][0]["path"], "src/lib.rs");
+
+        let context = execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(SELECT_CONTEXT_TOOL_NAME).with_arguments(object!({
+                "query": "process item"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let context: Value = serde_json::from_str(&result_text(context)).unwrap();
+        assert_eq!(context[0]["path"], "worker.py");
+        assert!(context[0]["score"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn repository_intelligence_cache_tracks_external_content_changes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("lib.rs");
+        fs::write(&path, "pub fn before() {}\n").unwrap();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let state = CodingToolState::default();
+        let config = enabled_config();
+        let limits = IntelligenceLimits::default();
+
+        let first = state
+            .intelligence_index(&config, &workspace, limits)
+            .unwrap();
+        let cached = state
+            .intelligence_index(&config, &workspace, limits)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        fs::write(&path, "pub fn after() {}\n").unwrap();
+        let refreshed = state
+            .intelligence_index(&config, &workspace, limits)
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert!(refreshed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "after"));
+        assert!(!refreshed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "before"));
+    }
+
+    #[test]
+    fn disabled_tree_sitter_fails_intelligence_tools_closed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
+        let mut config = enabled_config();
+        config.tree_sitter = false;
+
+        let error = execute(
+            &config,
+            CallToolRequestParams::new(REPOSITORY_MAP_TOOL_NAME),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert!(error.message.contains("Tree-sitter"));
     }
 
     #[test]

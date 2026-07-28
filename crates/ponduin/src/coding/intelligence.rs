@@ -64,6 +64,7 @@ impl RepositoryIntelligence {
         let mut warnings = Vec::new();
         let mut scanned_files = 0usize;
         let mut analyzed_bytes = 0usize;
+        let mut fingerprint_entries = Vec::new();
         let mut truncated = false;
 
         for entry in builder.build() {
@@ -112,6 +113,10 @@ impl RepositoryIntelligence {
                     continue;
                 }
             };
+            fingerprint_entries.push((
+                relative.clone(),
+                crate::coding::file::content_digest(source.as_bytes()),
+            ));
             detect_frameworks(&relative, &source, &mut frameworks);
             let Some(analysis) = parser.analyze_file(entry.path(), &source) else {
                 continue;
@@ -212,13 +217,63 @@ impl RepositoryIntelligence {
                 .collect(),
             scanned_files,
             analyzed_bytes,
+            source_fingerprint: fingerprint(fingerprint_entries),
             truncated,
             warnings,
         })
     }
+
+    pub fn fingerprint(
+        workspace: &CodingWorkspace,
+        limits: IntelligenceLimits,
+    ) -> Result<String, IntelligenceError> {
+        limits.validate()?;
+        let mut builder = WalkBuilder::new(workspace.root());
+        builder
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(false)
+            .parents(false)
+            .require_git(false)
+            .ignore(true)
+            .hidden(false)
+            .follow_links(false)
+            .filter_entry(|entry| entry.depth() == 0 || !is_excluded_directory(entry.path()));
+        let mut entries = Vec::new();
+        let mut scanned = 0usize;
+        for entry in builder.build().filter_map(Result::ok) {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                continue;
+            }
+            if scanned == limits.max_files {
+                break;
+            }
+            scanned += 1;
+            let Ok(relative) = entry.path().strip_prefix(workspace.root()) else {
+                continue;
+            };
+            if is_sensitive_path(relative)
+                || entry
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.len() > limits.max_file_bytes as u64)
+            {
+                continue;
+            }
+            if let Ok(Some(source)) = read_utf8_bounded(entry.path(), limits.max_file_bytes) {
+                entries.push((
+                    relative.to_path_buf(),
+                    crate::coding::file::content_digest(source.as_bytes()),
+                ));
+            }
+        }
+        Ok(fingerprint(entries))
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IntelligenceLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
@@ -263,6 +318,7 @@ pub struct RepositoryIndex {
     pub excluded_directory_names: Vec<String>,
     pub scanned_files: usize,
     pub analyzed_bytes: usize,
+    pub source_fingerprint: String,
     pub truncated: bool,
     pub warnings: Vec<String>,
 }
@@ -621,6 +677,18 @@ fn record_warning(warnings: &mut Vec<String>, warning: String) {
     }
 }
 
+fn fingerprint(mut entries: Vec<(PathBuf, String)>) -> String {
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = blake3::Hasher::new();
+    for (path, digest) in entries {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(digest.as_bytes());
+        hasher.update(&[0]);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IntelligenceError {
     #[error("invalid repository intelligence file limit: {0}")]
@@ -690,6 +758,10 @@ mod tests {
             .iter()
             .any(|framework| framework.framework == Framework::FastApi));
         assert!(index.entry_points.contains(&PathBuf::from("api/main.py")));
+        assert_eq!(
+            index.source_fingerprint,
+            RepositoryIntelligence::fingerprint(&workspace, IntelligenceLimits::default()).unwrap()
+        );
     }
 
     #[test]
@@ -743,5 +815,17 @@ mod tests {
             .files
             .iter()
             .any(|file| file.path == Path::new("large.py")));
+    }
+
+    #[test]
+    fn source_fingerprint_changes_when_indexed_content_changes() {
+        let (_temp_dir, workspace) = fixture();
+        let limits = IntelligenceLimits::default();
+        let before = RepositoryIntelligence::fingerprint(&workspace, limits).unwrap();
+
+        fs::write(workspace.root().join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        let after = RepositoryIntelligence::fingerprint(&workspace, limits).unwrap();
+
+        assert_ne!(before, after);
     }
 }
