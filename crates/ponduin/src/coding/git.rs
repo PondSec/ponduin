@@ -439,6 +439,99 @@ impl<'workspace> GitRepository<'workspace> {
         })
     }
 
+    pub async fn push_current_branch(
+        &self,
+        owned_commit_oid: &str,
+        remote: &str,
+    ) -> Result<GitPushResult, GitError> {
+        validate_object_id(owned_commit_oid)?;
+        validate_revision_text(remote, "remote name")?;
+        let head_oid = self
+            .optional_stdout(["rev-parse", "--verify", "HEAD"])
+            .await?
+            .ok_or(GitError::MalformedOutput("push HEAD"))?;
+        if head_oid != owned_commit_oid {
+            return Err(GitError::PushHeadMismatch {
+                expected: owned_commit_oid.to_string(),
+                actual: head_oid,
+            });
+        }
+        let branch = self
+            .optional_stdout(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .await?
+            .ok_or(GitError::DetachedPush)?;
+        validate_revision_text(&branch, "current branch")?;
+
+        let remote_output = self.run(["remote", "get-url", "--push", remote]).await?;
+        if !remote_output.success {
+            return Err(GitError::InvalidPushRemote(remote.to_string()));
+        }
+        let remote_url = remote_output.stdout.trim();
+        if !self.allowed_push_url(remote_url)? {
+            return Err(GitError::UnsafePushRemote(remote.to_string()));
+        }
+
+        let output = self
+            .run(vec![
+                "-c".to_string(),
+                format!(
+                    "core.hooksPath={}",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" }
+                ),
+                "-c".to_string(),
+                "credential.helper=".to_string(),
+                "push".to_string(),
+                "--no-verify".to_string(),
+                "--porcelain".to_string(),
+                "--".to_string(),
+                remote.to_string(),
+                format!("{owned_commit_oid}:refs/heads/{branch}"),
+            ])
+            .await?;
+        if !output.success {
+            return Err(GitError::PushFailed {
+                remote: remote.to_string(),
+                exit_code: output.exit_code,
+            });
+        }
+        Ok(GitPushResult {
+            oid: owned_commit_oid.to_string(),
+            remote: remote.to_string(),
+            branch,
+        })
+    }
+
+    fn allowed_push_url(&self, url: &str) -> Result<bool, GitError> {
+        if let Some(authority) = url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split('/').next())
+        {
+            return Ok(!authority.is_empty() && !authority.contains('@'));
+        }
+        if let Some(rest) = url.strip_prefix("ssh://") {
+            return Ok(!rest.is_empty() && !rest.chars().any(char::is_whitespace));
+        }
+        if url.contains('@')
+            && url.contains(':')
+            && !url.chars().any(char::is_whitespace)
+            && !url.starts_with('-')
+        {
+            return Ok(true);
+        }
+
+        let path = Path::new(url.strip_prefix("file://").unwrap_or(url));
+        let local_path = url.starts_with("file://")
+            || (!url.is_empty() && !url.contains("://") && !url.contains(':'));
+        if local_path {
+            return match self.workspace.resolve_existing(path) {
+                Ok(resolved) => Ok(resolved.is_dir()),
+                Err(WorkspaceError::OutsideWorkspace(_)) => Ok(false),
+                Err(error) => Err(GitError::Workspace(error)),
+            };
+        }
+        Ok(false)
+    }
+
     fn verify_owned_worktree(&self, owned: &GitOwnedPath) -> Result<(), GitError> {
         if is_sensitive_path(&owned.path) {
             return Err(GitError::SensitivePath(owned.path.clone()));
@@ -846,6 +939,13 @@ pub struct GitBranchResult {
     pub start_oid: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPushResult {
+    pub oid: String,
+    pub remote: String,
+    pub branch: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitIndexEntry {
     oid: String,
@@ -944,6 +1044,14 @@ fn validate_revision_text(value: &str, kind: &'static str) -> Result<(), GitErro
         Err(GitError::InvalidRevision { kind })
     } else {
         Ok(())
+    }
+}
+
+fn validate_object_id(oid: &str) -> Result<(), GitError> {
+    if matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(GitError::InvalidOwnedCommit)
     }
 }
 
@@ -1089,6 +1197,21 @@ pub enum GitError {
     InvalidCommitMessage,
     #[error("invalid Git {kind}")]
     InvalidRevision { kind: &'static str },
+    #[error("invalid agent-owned commit object id")]
+    InvalidOwnedCommit,
+    #[error("current HEAD {actual} does not match agent-owned commit {expected}")]
+    PushHeadMismatch { expected: String, actual: String },
+    #[error("cannot push from a detached HEAD")]
+    DetachedPush,
+    #[error("Git push remote does not exist or has no push URL: {0}")]
+    InvalidPushRemote(String),
+    #[error("Git push remote is not an approved network URL or workspace-local repository: {0}")]
+    UnsafePushRemote(String),
+    #[error("Git push to remote {remote} failed with exit code {exit_code:?}")]
+    PushFailed {
+        remote: String,
+        exit_code: Option<i32>,
+    },
 }
 
 #[cfg(test)]
@@ -1304,6 +1427,29 @@ mod tests {
             repository.history(1).await.unwrap().commits[0].subject,
             "agent change"
         );
+
+        git(workspace.root(), &["init", "--bare", ".test-remote.git"]);
+        git(
+            workspace.root(),
+            &["remote", "add", "test-origin", ".test-remote.git"],
+        );
+        let pushed = repository
+            .push_current_branch(&committed.oid, "test-origin")
+            .await
+            .unwrap();
+        assert_eq!(pushed.oid, committed.oid);
+        assert_eq!(pushed.remote, "test-origin");
+        let remote_head = Command::new("git")
+            .arg("--git-dir")
+            .arg(workspace.root().join(".test-remote.git"))
+            .args(["rev-parse", &format!("refs/heads/{}", pushed.branch)])
+            .output()
+            .unwrap();
+        assert!(remote_head.status.success());
+        assert_eq!(
+            String::from_utf8(remote_head.stdout).unwrap().trim(),
+            committed.oid
+        );
     }
 
     #[tokio::test]
@@ -1434,6 +1580,28 @@ mod tests {
 
         assert_eq!(committed.committed_files, vec![PathBuf::from("new.txt")]);
         assert!(!repository.status().await.unwrap().unborn);
+    }
+
+    #[tokio::test]
+    async fn rejects_pushes_to_local_repositories_outside_the_workspace() {
+        let (_temp_dir, workspace) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        git(outside.path(), &["init", "--bare"]);
+        git(
+            workspace.root(),
+            &["remote", "add", "outside", outside.path().to_str().unwrap()],
+        );
+        let repository = GitRepository::open(&workspace, GitLimits::default())
+            .await
+            .unwrap();
+        let oid = repository.status().await.unwrap().head_oid.unwrap();
+
+        let error = repository
+            .push_current_branch(&oid, "outside")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GitError::UnsafePushRemote(_)));
     }
 
     #[tokio::test]

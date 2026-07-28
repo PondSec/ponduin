@@ -40,6 +40,7 @@ pub const GIT_STAGE_OWNED_TOOL_NAME: &str = "coding__git_stage_owned";
 pub const GIT_UNSTAGE_OWNED_TOOL_NAME: &str = "coding__git_unstage_owned";
 pub const GIT_COMMIT_OWNED_TOOL_NAME: &str = "coding__git_commit_owned";
 pub const GIT_CREATE_BRANCH_TOOL_NAME: &str = "coding__git_create_branch";
+pub const GIT_PUSH_OWNED_TOOL_NAME: &str = "coding__git_push_owned";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -49,6 +50,7 @@ const MAX_ROLLBACK_BYTES: usize = 64 * 1_024 * 1_024;
 #[derive(Debug, Default)]
 pub(crate) struct CodingToolState {
     rollback_journal: Mutex<VecDeque<RollbackJournalEntry>>,
+    committed: Mutex<VecDeque<OwnedCommit>>,
 }
 
 #[derive(Debug)]
@@ -57,6 +59,12 @@ struct RollbackJournalEntry {
     workspace_root: PathBuf,
     owned_paths: Vec<GitOwnedPath>,
     staged_paths: BTreeSet<PathBuf>,
+}
+
+#[derive(Debug)]
+struct OwnedCommit {
+    workspace_root: PathBuf,
+    oid: String,
 }
 
 impl CodingToolState {
@@ -198,6 +206,28 @@ impl CodingToolState {
                         .any(|owned| paths.contains(&owned.path))
             });
     }
+
+    fn remember_commit(&self, workspace_root: &Path, oid: &str) {
+        let mut committed = self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        committed.push_back(OwnedCommit {
+            workspace_root: workspace_root.to_path_buf(),
+            oid: oid.to_string(),
+        });
+        while committed.len() > MAX_ROLLBACK_RECORDS {
+            committed.pop_front();
+        }
+    }
+
+    fn owns_commit(&self, workspace_root: &Path, oid: &str) -> bool {
+        self.committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|commit| commit.workspace_root == workspace_root && commit.oid == oid)
+    }
 }
 
 pub fn definitions() -> Vec<Tool> {
@@ -218,6 +248,7 @@ pub fn definitions() -> Vec<Tool> {
         git_unstage_owned_tool(),
         git_commit_owned_tool(),
         git_create_branch_tool(),
+        git_push_owned_tool(),
     ]
 }
 
@@ -236,6 +267,7 @@ pub(crate) fn is_async_tool(name: &str) -> bool {
             | GIT_UNSTAGE_OWNED_TOOL_NAME
             | GIT_COMMIT_OWNED_TOOL_NAME
             | GIT_CREATE_BRANCH_TOOL_NAME
+            | GIT_PUSH_OWNED_TOOL_NAME
     )
 }
 
@@ -359,6 +391,7 @@ pub(crate) async fn execute_async(
                 .commit_owned(&params.message, &owned)
                 .await
                 .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.remember_commit(workspace.root(), &result.oid);
             state.expire_committed(workspace.root(), &result.committed_files);
             json_result(&result, config.output_limit)
         }
@@ -369,6 +402,23 @@ pub(crate) async fn execute_async(
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             let result = repository
                 .create_branch(&params.name, params.start_point.as_deref())
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&result, config.output_limit)
+        }
+        GIT_PUSH_OWNED_TOOL_NAME => {
+            let params: GitPushOwnedParams = parse_arguments(&tool_call)?;
+            if !state.owns_commit(workspace.root(), &params.oid) {
+                return Err(invalid_arguments(format!(
+                    "commit `{}` is not retained as an agent-owned commit",
+                    params.oid
+                )));
+            }
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = repository
+                .push_current_branch(&params.oid, &params.remote)
                 .await
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&result, config.output_limit)
@@ -516,7 +566,8 @@ pub(crate) fn execute_with_state(
         | GIT_STAGE_OWNED_TOOL_NAME
         | GIT_UNSTAGE_OWNED_TOOL_NAME
         | GIT_COMMIT_OWNED_TOOL_NAME
-        | GIT_CREATE_BRANCH_TOOL_NAME => Err(internal_error(
+        | GIT_CREATE_BRANCH_TOOL_NAME
+        | GIT_PUSH_OWNED_TOOL_NAME => Err(internal_error(
             "asynchronous coding tools require asynchronous dispatch",
         )),
         _ => Err(invalid_arguments(format!(
@@ -968,6 +1019,37 @@ fn git_create_branch_tool() -> Tool {
     .annotate(mutation_annotations("Create local Git branch"))
 }
 
+fn git_push_owned_tool() -> Tool {
+    Tool::new(
+        GIT_PUSH_OWNED_TOOL_NAME.to_string(),
+        "Push exactly one commit retained as created by this agent from the current local branch. \
+         Requires an explicit configured remote, disables pre-push hooks and credential helpers, \
+         rejects force/deletion refspecs, detached or changed HEAD, embedded HTTPS credentials, \
+         unsafe protocols, and local repositories outside the workspace."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["oid", "remote"],
+            "properties": {
+                "oid": {
+                    "type": "string",
+                    "minLength": 40,
+                    "maxLength": 64,
+                    "description": "Commit object id returned by coding__git_commit_owned."
+                },
+                "remote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Existing configured Git remote name."
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(mutation_annotations("Push agent-owned Git commit"))
+}
+
 fn owned_paths_schema() -> serde_json::Map<String, Value> {
     object!({
         "type": "object",
@@ -1364,6 +1446,13 @@ struct GitCreateBranchParams {
     start_point: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitPushOwnedParams {
+    oid: String,
+    remote: String,
+}
+
 fn default_path() -> PathBuf {
     PathBuf::from(".")
 }
@@ -1430,7 +1519,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -1445,6 +1534,7 @@ mod tests {
                     | GIT_UNSTAGE_OWNED_TOOL_NAME
                     | GIT_COMMIT_OWNED_TOOL_NAME
                     | GIT_CREATE_BRANCH_TOOL_NAME
+                    | GIT_PUSH_OWNED_TOOL_NAME
             );
             assert_eq!(annotations.read_only_hint, Some(!mutating));
             assert_eq!(annotations.destructive_hint, Some(mutating));
@@ -1849,6 +1939,23 @@ mod tests {
         let committed_json: Value = serde_json::from_str(&result_text(committed)).unwrap();
         assert_eq!(committed_json["committed_files"][0], "app.txt");
         assert!(state.find(&rollback_id).unwrap().is_none());
+        let commit_oid = committed_json["oid"].as_str().unwrap();
+
+        run_git(temp_dir.path(), &["init", "--bare", ".test-remote.git"]);
+        run_git(
+            temp_dir.path(),
+            &["remote", "add", "test-origin", ".test-remote.git"],
+        );
+        let push = CallToolRequestParams::new(GIT_PUSH_OWNED_TOOL_NAME).with_arguments(object!({
+            "oid": commit_oid,
+            "remote": "test-origin"
+        }));
+        let pushed = execute_async(&config, &state, push, temp_dir.path())
+            .await
+            .unwrap();
+        let pushed_json: Value = serde_json::from_str(&result_text(pushed)).unwrap();
+        assert_eq!(pushed_json["oid"], commit_oid);
+        assert_eq!(pushed_json["remote"], "test-origin");
 
         let history = execute_async(
             &config,
