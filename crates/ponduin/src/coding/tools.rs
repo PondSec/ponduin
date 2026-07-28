@@ -1,4 +1,5 @@
 use crate::coding::config::CodingConfig;
+use crate::coding::context::{ContextLimits, ContextPlanner};
 use crate::coding::file::{
     FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
 };
@@ -48,6 +49,7 @@ pub const SEARCH_SYMBOLS_TOOL_NAME: &str = "coding__search_symbols";
 pub const FIND_REFERENCES_TOOL_NAME: &str = "coding__find_references";
 pub const SELECT_CONTEXT_TOOL_NAME: &str = "coding__select_context";
 pub const PROJECT_CAPABILITIES_TOOL_NAME: &str = "coding__project_capabilities";
+pub const PREPARE_CONTEXT_TOOL_NAME: &str = "coding__prepare_context";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -331,6 +333,7 @@ pub fn definitions() -> Vec<Tool> {
         find_references_tool(),
         select_context_tool(),
         project_capabilities_tool(),
+        prepare_context_tool(),
     ]
 }
 
@@ -686,6 +689,39 @@ pub(crate) fn execute_with_state(
             let capabilities = ProjectDiscovery::discover(&workspace, params.max_files)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&capabilities, config.output_limit)
+        }
+        PREPARE_CONTEXT_TOOL_NAME => {
+            let params: PrepareContextParams = parse_arguments(&tool_call)?;
+            let requested_budget = params
+                .token_budget
+                .unwrap_or_else(|| config.max_context_tokens.min(config.output_limit / 8));
+            if requested_budget > config.max_context_tokens {
+                return Err(invalid_arguments(format!(
+                    "token_budget cannot exceed the configured coding context limit of {}",
+                    config.max_context_tokens
+                )));
+            }
+            let output_safe_budget = config.output_limit / 8;
+            if requested_budget > output_safe_budget {
+                return Err(invalid_arguments(format!(
+                    "token_budget {requested_budget} can exceed the configured serialized output \
+                     limit; use at most {output_safe_budget}"
+                )));
+            }
+            let index = state.intelligence_index(config, &workspace, params.index_limits())?;
+            let bundle = ContextPlanner::new(&workspace, index.as_ref())
+                .prepare(
+                    &params.query,
+                    ContextLimits {
+                        token_budget: requested_budget,
+                        max_files: params.max_files,
+                        max_file_bytes: params.max_file_bytes,
+                        chunk_lines: params.chunk_lines,
+                        overlap_lines: params.overlap_lines,
+                    },
+                )
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&bundle, config.output_limit)
         }
         RUN_PROCESS_TOOL_NAME
         | GIT_STATUS_TOOL_NAME
@@ -1298,6 +1334,59 @@ fn project_capabilities_tool() -> Tool {
     .annotate(read_only_annotations("Detect project capabilities"))
 }
 
+fn prepare_context_tool() -> Tool {
+    Tool::new(
+        PREPARE_CONTEXT_TOOL_NAME.to_string(),
+        "Prepare exact-token-budgeted, versioned source chunks for a coding query using the \
+         internal Tree-sitter index. Relevant symbol and call-site windows are ranked; sensitive, \
+         generated, binary, oversized, and excess files are excluded with explicit evidence."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "minLength": 1},
+                "token_budget": {
+                    "type": ["integer", "null"],
+                    "minimum": 128,
+                    "maximum": 1000000,
+                    "default": null,
+                    "description": "Defaults to the lower configured context or serialized-output-safe limit."
+                },
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20
+                },
+                "max_file_bytes": {
+                    "type": "integer",
+                    "minimum": MIN_READ_LIMIT,
+                    "maximum": MAX_READ_LIMIT,
+                    "default": DEFAULT_READ_LIMIT
+                },
+                "chunk_lines": {
+                    "type": "integer",
+                    "minimum": 10,
+                    "maximum": 400,
+                    "default": 120
+                },
+                "overlap_lines": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 399,
+                    "default": 20
+                },
+                "index_max_files": intelligence_max_files_schema(),
+                "index_max_file_bytes": intelligence_max_file_bytes_schema(),
+                "index_max_symbols": intelligence_max_symbols_schema()
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Prepare bounded coding context"))
+}
+
 fn intelligence_limits_schema() -> serde_json::Map<String, Value> {
     object!({
         "type": "object",
@@ -1753,6 +1842,38 @@ struct ContextSelectionParams {
     max_symbols: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareContextParams {
+    query: String,
+    #[serde(default)]
+    token_budget: Option<usize>,
+    #[serde(default = "default_context_results")]
+    max_files: usize,
+    #[serde(default = "default_read_limit")]
+    max_file_bytes: usize,
+    #[serde(default = "default_context_chunk_lines")]
+    chunk_lines: usize,
+    #[serde(default = "default_context_overlap_lines")]
+    overlap_lines: usize,
+    #[serde(default = "default_intelligence_max_files")]
+    index_max_files: usize,
+    #[serde(default = "default_intelligence_max_file_bytes")]
+    index_max_file_bytes: usize,
+    #[serde(default = "default_intelligence_max_symbols")]
+    index_max_symbols: usize,
+}
+
+impl PrepareContextParams {
+    fn index_limits(&self) -> IntelligenceLimits {
+        intelligence_limits(
+            self.index_max_files,
+            self.index_max_file_bytes,
+            self.index_max_symbols,
+        )
+    }
+}
+
 impl ContextSelectionParams {
     fn limits(&self) -> IntelligenceLimits {
         intelligence_limits(self.max_files, self.max_file_bytes, self.max_symbols)
@@ -1926,6 +2047,14 @@ fn default_intelligence_max_symbols() -> usize {
     IntelligenceLimits::default().max_symbols
 }
 
+fn default_context_chunk_lines() -> usize {
+    ContextLimits::default().chunk_lines
+}
+
+fn default_context_overlap_lines() -> usize {
+    ContextLimits::default().overlap_lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1968,7 +2097,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -2038,6 +2167,39 @@ mod tests {
             json["projects"][0]["validation_commands"][0]["args"],
             serde_json::json!(["run", "test"])
         );
+    }
+
+    #[test]
+    fn prepares_versioned_context_within_the_requested_token_budget() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("billing.rs"),
+            "pub fn process_invoice() {\n    validate_invoice();\n}\n",
+        )
+        .unwrap();
+
+        let result = execute(
+            &enabled_config(),
+            CallToolRequestParams::new(PREPARE_CONTEXT_TOOL_NAME).with_arguments(object!({
+                "query": "process invoice",
+                "token_budget": 256,
+                "max_files": 2,
+                "chunk_lines": 20,
+                "overlap_lines": 2
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert!(json["used_tokens"].as_u64().unwrap() <= 256);
+        assert_eq!(json["chunks"][0]["path"], "billing.rs");
+        assert!(json["chunks"][0]["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("blake3:")));
+        assert!(json["chunks"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("process_invoice")));
     }
 
     #[test]
