@@ -267,7 +267,10 @@ impl Agent {
             .with_hints(working_dir)
             .with_ponduin_mode(ponduin_mode)
             .build();
-        if let Some(coding_prompt) = self.coding_agent.system_prompt(ponduin_mode) {
+        if let Some(coding_prompt) = self
+            .coding_agent
+            .system_prompt_for_model(ponduin_mode, &model_config)
+        {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&coding_prompt);
         }

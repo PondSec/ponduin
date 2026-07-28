@@ -4,6 +4,7 @@
 //! on MCP or platform-extension dispatch.
 
 pub mod agent;
+pub mod capabilities;
 pub mod config;
 pub mod context;
 pub mod file;
@@ -21,6 +22,7 @@ pub mod tools;
 pub mod workspace;
 
 pub use agent::CodingAgent;
+pub use capabilities::ModelCapabilityProfile;
 pub use config::CodingConfig;
 pub use context::ContextPlanner;
 pub use file::FileSnapshot;
