@@ -996,7 +996,7 @@ pub(crate) fn execute_with_state(
         }
         APPLY_CHANGES_TOOL_NAME => {
             let batch: MutationBatch = parse_arguments(&tool_call)?;
-            let file_count = batch.changes.len();
+            let file_count = batch.touched_file_count();
             let _mutation = state.mutation_guard();
             state.authorize_mutation_locked(
                 workspace.root(),
@@ -1365,7 +1365,8 @@ fn preview_changes_tool() -> Tool {
         "Validate a bounded batch of workspace file changes and return unified diffs without \
          modifying the filesystem. Existing files require the complete BLAKE3 digest returned by \
          coding__read_file. Exact replacements are conflict-safe and must be unique unless \
-         replace_all is explicitly true."
+         replace_all is explicitly true. Moves validate both source and destination and are shown \
+         as paired move_from and move_to previews."
             .to_string(),
         mutation_batch_schema(),
     )
@@ -1378,7 +1379,7 @@ fn apply_changes_tool() -> Tool {
         "Atomically apply a validated batch of workspace file changes. Existing files require the \
          complete BLAKE3 digest returned by coding__read_file. All files are validated and staged \
          before mutation; failures restore already-applied files. Returns unified diffs and a \
-         bounded agent-local rollback_id."
+         bounded agent-local rollback_id. Moves are applied and rolled back as one guarded batch."
             .to_string(),
         mutation_batch_schema(),
     )
@@ -2180,6 +2181,28 @@ fn mutation_batch_schema() -> serde_json::Map<String, Value> {
                                 "expected_digest": {
                                     "type": "string",
                                     "description": "Complete BLAKE3 digest returned by coding__read_file."
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "required": ["operation", "path", "destination", "expected_digest"],
+                            "properties": {
+                                "operation": {"const": "move"},
+                                "path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "Existing workspace-relative source file."
+                                },
+                                "destination": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "Unoccupied workspace-relative destination whose parent exists."
+                                },
+                                "expected_digest": {
+                                    "type": "string",
+                                    "description": "Complete source BLAKE3 digest returned by coding__read_file."
                                 }
                             },
                             "additionalProperties": false
@@ -3437,6 +3460,64 @@ mod tests {
         let error =
             execute_with_state(&enabled_config(), &state, repeated, temp_dir.path()).unwrap_err();
         assert!(error.message.contains("unknown or expired rollback_id"));
+    }
+
+    #[test]
+    fn moves_and_rolls_back_through_the_internal_patch_tools() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(temp_dir.path().join("src")).unwrap();
+        fs::write(temp_dir.path().join("app.py"), "print('safe')\n").unwrap();
+        let digest =
+            crate::coding::file::content_digest(&fs::read(temp_dir.path().join("app.py")).unwrap());
+        let state = CodingToolState::default();
+        let arguments = object!({
+            "changes": [{
+                "operation": "move",
+                "path": "app.py",
+                "destination": "src/app.py",
+                "expected_digest": digest
+            }]
+        });
+
+        let preview = execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(PREVIEW_CHANGES_TOOL_NAME).with_arguments(arguments.clone()),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let preview: Value = serde_json::from_str(&result_text(preview)).unwrap();
+        assert_eq!(preview["files"][0]["operation"], "move_from");
+        assert_eq!(preview["files"][1]["operation"], "move_to");
+
+        let applied = execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(arguments),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let applied: Value = serde_json::from_str(&result_text(applied)).unwrap();
+        assert!(!temp_dir.path().join("app.py").exists());
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("src/app.py")).unwrap(),
+            "print('safe')\n"
+        );
+
+        execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(ROLLBACK_CHANGES_TOOL_NAME).with_arguments(object!({
+                "rollback_id": applied["rollback_id"].as_str().unwrap()
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("app.py")).unwrap(),
+            "print('safe')\n"
+        );
+        assert!(!temp_dir.path().join("src/app.py").exists());
     }
 
     #[test]

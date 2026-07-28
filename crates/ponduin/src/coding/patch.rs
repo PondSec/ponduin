@@ -31,34 +31,36 @@ impl<'workspace> PatchEngine<'workspace> {
         if batch.changes.is_empty() {
             return Err(PatchError::EmptyBatch);
         }
-        if batch.changes.len() > self.limits.max_files {
+        let touched_files = batch.touched_file_count();
+        if touched_files > self.limits.max_files {
             return Err(PatchError::TooManyFiles {
-                count: batch.changes.len(),
+                count: touched_files,
                 limit: self.limits.max_files,
             });
         }
 
         let mut seen = HashSet::new();
-        let mut prepared = Vec::with_capacity(batch.changes.len());
+        let mut prepared = Vec::with_capacity(touched_files);
         let mut batch_bytes = 0usize;
         for change in batch.changes {
-            let prepared_change = self.prepare_change(change)?;
-            if !seen.insert(prepared_change.path.clone()) {
-                return Err(PatchError::DuplicatePath(prepared_change.relative_path));
+            for prepared_change in self.prepare_change(change)? {
+                if !seen.insert(prepared_change.path.clone()) {
+                    return Err(PatchError::DuplicatePath(prepared_change.relative_path));
+                }
+                batch_bytes = batch_bytes
+                    .checked_add(prepared_change.retained_bytes())
+                    .ok_or(PatchError::BatchTooLarge {
+                        size: usize::MAX,
+                        limit: self.limits.max_batch_bytes,
+                    })?;
+                if batch_bytes > self.limits.max_batch_bytes {
+                    return Err(PatchError::BatchTooLarge {
+                        size: batch_bytes,
+                        limit: self.limits.max_batch_bytes,
+                    });
+                }
+                prepared.push(prepared_change);
             }
-            batch_bytes = batch_bytes
-                .checked_add(prepared_change.retained_bytes())
-                .ok_or(PatchError::BatchTooLarge {
-                    size: usize::MAX,
-                    limit: self.limits.max_batch_bytes,
-                })?;
-            if batch_bytes > self.limits.max_batch_bytes {
-                return Err(PatchError::BatchTooLarge {
-                    size: batch_bytes,
-                    limit: self.limits.max_batch_bytes,
-                });
-            }
-            prepared.push(prepared_change);
         }
 
         let files = prepared.iter().map(PreparedChange::preview).collect();
@@ -182,7 +184,7 @@ impl<'workspace> PatchEngine<'workspace> {
         })
     }
 
-    fn prepare_change(&self, change: FileChange) -> Result<PreparedChange, PatchError> {
+    fn prepare_change(&self, change: FileChange) -> Result<Vec<PreparedChange>, PatchError> {
         match change {
             FileChange::Create { path, content } => {
                 let resolved = self.workspace.resolve_for_write(&path)?;
@@ -194,7 +196,7 @@ impl<'workspace> PatchEngine<'workspace> {
                 require_existing_parent(&resolved, &relative)?;
                 validate_content_size(&relative, content.len(), self.limits.max_file_bytes)?;
                 reject_nul(&relative, content.as_bytes())?;
-                Ok(PreparedChange {
+                Ok(vec![PreparedChange {
                     path: resolved,
                     relative_path: relative,
                     operation: MutationOperation::Create,
@@ -203,37 +205,81 @@ impl<'workspace> PatchEngine<'workspace> {
                     original_digest: None,
                     new_digest: Some(content_digest(content.as_bytes())),
                     new_content: Some(content.into_bytes()),
-                })
+                }])
             }
             FileChange::Write {
                 path,
                 expected_digest,
                 content,
-            } => self.prepare_existing(path, expected_digest, MutationOperation::Write, |_, _| {
-                Ok(Some(content.into_bytes()))
-            }),
+            } => self
+                .prepare_existing(path, expected_digest, MutationOperation::Write, |_, _| {
+                    Ok(Some(content.into_bytes()))
+                })
+                .map(|change| vec![change]),
             FileChange::Replace {
                 path,
                 expected_digest,
                 replacements,
-            } => self.prepare_existing(
-                path,
-                expected_digest,
-                MutationOperation::Replace,
-                |relative, original| {
-                    let original_text = std::str::from_utf8(original)
-                        .map_err(|_| PatchError::Binary(relative.to_path_buf()))?;
-                    let updated = apply_replacements(relative, original_text, &replacements)?;
-                    Ok(Some(updated.into_bytes()))
-                },
-            ),
+            } => self
+                .prepare_existing(
+                    path,
+                    expected_digest,
+                    MutationOperation::Replace,
+                    |relative, original| {
+                        let original_text = std::str::from_utf8(original)
+                            .map_err(|_| PatchError::Binary(relative.to_path_buf()))?;
+                        let updated = apply_replacements(relative, original_text, &replacements)?;
+                        Ok(Some(updated.into_bytes()))
+                    },
+                )
+                .map(|change| vec![change]),
             FileChange::Delete {
                 path,
                 expected_digest,
-            } => self.prepare_existing(path, expected_digest, MutationOperation::Delete, |_, _| {
-                Ok(None)
-            }),
+            } => self
+                .prepare_existing(path, expected_digest, MutationOperation::Delete, |_, _| {
+                    Ok(None)
+                })
+                .map(|change| vec![change]),
+            FileChange::Move {
+                path,
+                destination,
+                expected_digest,
+            } => self.prepare_move(path, destination, expected_digest),
         }
+    }
+
+    fn prepare_move(
+        &self,
+        path: PathBuf,
+        destination: PathBuf,
+        expected_digest: String,
+    ) -> Result<Vec<PreparedChange>, PatchError> {
+        let source = self.prepare_existing(
+            path,
+            expected_digest,
+            MutationOperation::MoveFrom,
+            |_, _| Ok(None),
+        )?;
+        let resolved = self.workspace.resolve_for_write(&destination)?;
+        let relative = self.relative(&resolved)?;
+        reject_sensitive(&relative)?;
+        if resolved.symlink_metadata().is_ok() {
+            return Err(PatchError::AlreadyExists(relative));
+        }
+        require_existing_parent(&resolved, &relative)?;
+
+        let destination = PreparedChange {
+            path: resolved,
+            relative_path: relative,
+            operation: MutationOperation::MoveTo,
+            original_content: None,
+            original_permissions: source.original_permissions.clone(),
+            original_digest: None,
+            new_digest: source.original_digest.clone(),
+            new_content: source.original_content.clone(),
+        };
+        Ok(vec![source, destination])
     }
 
     fn prepare_existing(
@@ -331,6 +377,18 @@ pub struct MutationBatch {
     pub changes: Vec<FileChange>,
 }
 
+impl MutationBatch {
+    pub fn touched_file_count(&self) -> usize {
+        self.changes.iter().fold(0usize, |count, change| {
+            count.saturating_add(if matches!(change, FileChange::Move { .. }) {
+                2
+            } else {
+                1
+            })
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FileChange {
@@ -350,6 +408,11 @@ pub enum FileChange {
     },
     Delete {
         path: PathBuf,
+        expected_digest: String,
+    },
+    Move {
+        path: PathBuf,
+        destination: PathBuf,
         expected_digest: String,
     },
 }
@@ -401,6 +464,8 @@ pub enum MutationOperation {
     Write,
     Replace,
     Delete,
+    MoveFrom,
+    MoveTo,
 }
 
 #[derive(Debug)]
@@ -959,6 +1024,107 @@ mod tests {
             .contains("before"));
         assert!(!workspace.root().join("new.rs").exists());
         assert!(workspace.root().join("delete.txt").exists());
+    }
+
+    #[test]
+    fn moves_and_rolls_back_a_versioned_file_as_one_batch() {
+        let (_temp_dir, workspace) = fixture();
+        fs::create_dir(workspace.root().join("moved")).unwrap();
+        let source = workspace.root().join("app.py");
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let prepared = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Move {
+                    path: PathBuf::from("app.py"),
+                    destination: PathBuf::from("moved/app.py"),
+                    expected_digest: digest(&source),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(prepared.preview.files.len(), 2);
+        assert_eq!(
+            prepared.preview.files[0].operation,
+            MutationOperation::MoveFrom
+        );
+        assert_eq!(
+            prepared.preview.files[1].operation,
+            MutationOperation::MoveTo
+        );
+        assert!(source.exists());
+        assert!(!workspace.root().join("moved/app.py").exists());
+
+        let applied = engine.apply(prepared).unwrap();
+
+        assert!(!source.exists());
+        assert!(fs::read_to_string(workspace.root().join("moved/app.py"))
+            .unwrap()
+            .contains("before"));
+
+        engine.rollback(applied.rollback).unwrap();
+
+        assert!(fs::read_to_string(source).unwrap().contains("before"));
+        assert!(!workspace.root().join("moved/app.py").exists());
+    }
+
+    #[test]
+    fn move_refuses_destination_collisions_and_post_preview_changes() {
+        let (_temp_dir, workspace) = fixture();
+        fs::create_dir(workspace.root().join("moved")).unwrap();
+        let source = workspace.root().join("app.py");
+        let destination = workspace.root().join("moved/app.py");
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let change = || MutationBatch {
+            changes: vec![FileChange::Move {
+                path: PathBuf::from("app.py"),
+                destination: PathBuf::from("moved/app.py"),
+                expected_digest: digest(&source),
+            }],
+        };
+
+        fs::write(&destination, "occupied\n").unwrap();
+        assert!(matches!(
+            engine.prepare(change()),
+            Err(PatchError::AlreadyExists(path)) if path == Path::new("moved/app.py")
+        ));
+        fs::remove_file(&destination).unwrap();
+
+        let prepared = engine.prepare(change()).unwrap();
+        fs::write(&destination, "created later\n").unwrap();
+        assert!(matches!(
+            engine.apply(prepared),
+            Err(PatchError::AlreadyExists(path)) if path == Path::new("moved/app.py")
+        ));
+        assert!(source.exists());
+        assert_eq!(fs::read_to_string(destination).unwrap(), "created later\n");
+    }
+
+    #[test]
+    fn move_counts_both_touched_paths_against_the_batch_limit() {
+        let (_temp_dir, workspace) = fixture();
+        let source = workspace.root().join("app.py");
+        let engine = PatchEngine::new(
+            &workspace,
+            PatchLimits {
+                max_files: 1,
+                ..PatchLimits::default()
+            },
+        );
+
+        let error = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Move {
+                    path: PathBuf::from("app.py"),
+                    destination: PathBuf::from("renamed.py"),
+                    expected_digest: digest(&source),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PatchError::TooManyFiles { count: 2, limit: 1 }
+        ));
     }
 
     #[test]
