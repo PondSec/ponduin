@@ -1,3 +1,5 @@
+//! Shared local Tree-sitter source analysis used by direct agent capabilities.
+
 use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Parser as TsParser, Query, QueryCursor, StreamingIterator};
 
