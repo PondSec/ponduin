@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod file;
 pub mod instructions;
 pub mod repository;
 pub mod search;
@@ -15,6 +16,7 @@ pub mod workspace;
 
 pub use agent::CodingAgent;
 pub use config::CodingConfig;
+pub use file::FileSnapshot;
 pub use instructions::RepositoryInstructions;
 pub use repository::RepositoryProfile;
 pub use search::RepositorySearch;
