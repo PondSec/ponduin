@@ -67,6 +67,35 @@ impl PermissionInspector {
         self.readonly_tools.read().unwrap().contains(tool_name)
     }
 
+    fn internal_coding_action(
+        &self,
+        tool_name: &str,
+        ponduin_mode: PonduinMode,
+    ) -> Option<InspectionAction> {
+        if !crate::coding::tools::is_reserved_name(tool_name) {
+            return None;
+        }
+
+        let user_permission = self.permission_manager.get_user_permission(tool_name);
+        Some(match ponduin_mode {
+            PonduinMode::Chat => return None,
+            PonduinMode::Auto => InspectionAction::Allow,
+            PonduinMode::Approve => {
+                if user_permission == Some(PermissionLevel::NeverAllow) {
+                    InspectionAction::Deny
+                } else {
+                    InspectionAction::RequireApproval(None)
+                }
+            }
+            PonduinMode::SmartApprove => match user_permission {
+                Some(PermissionLevel::NeverAllow) => InspectionAction::Deny,
+                Some(PermissionLevel::AskBefore) => InspectionAction::RequireApproval(None),
+                _ if self.is_readonly_annotated_tool(tool_name) => InspectionAction::Allow,
+                _ => InspectionAction::RequireApproval(None),
+            },
+        })
+    }
+
     /// Process inspection results into permission decisions
     /// This method takes all inspection results and converts them into a PermissionCheckResult
     /// that can be used by the agent to determine which tools to approve, deny, or ask for approval
@@ -156,41 +185,48 @@ impl ToolInspector for PermissionInspector {
             if let Ok(tool_call) = &request.tool_call {
                 let tool_name = &tool_call.name;
 
-                let action = match ponduin_mode {
-                    PonduinMode::Chat => continue,
-                    PonduinMode::Auto => InspectionAction::Allow,
-                    PonduinMode::Approve | PonduinMode::SmartApprove => {
-                        // 1. Check user-defined permission first
-                        if let Some(level) = permission_manager.get_user_permission(tool_name) {
-                            match level {
-                                PermissionLevel::AlwaysAllow => InspectionAction::Allow,
-                                PermissionLevel::NeverAllow => InspectionAction::Deny,
-                                PermissionLevel::AskBefore => {
-                                    InspectionAction::RequireApproval(None)
+                let action = if let Some(action) =
+                    self.internal_coding_action(tool_name, ponduin_mode)
+                {
+                    action
+                } else {
+                    match ponduin_mode {
+                        PonduinMode::Chat => continue,
+                        PonduinMode::Auto => InspectionAction::Allow,
+                        PonduinMode::Approve | PonduinMode::SmartApprove => {
+                            // 1. Check user-defined permission first
+                            if let Some(level) = permission_manager.get_user_permission(tool_name) {
+                                match level {
+                                    PermissionLevel::AlwaysAllow => InspectionAction::Allow,
+                                    PermissionLevel::NeverAllow => InspectionAction::Deny,
+                                    PermissionLevel::AskBefore => {
+                                        InspectionAction::RequireApproval(None)
+                                    }
                                 }
+                            // 2. Check for a read-only annotation in SmartApprove mode
+                            } else if ponduin_mode == PonduinMode::SmartApprove
+                                && self.is_readonly_annotated_tool(tool_name)
+                            {
+                                InspectionAction::Allow
+                            // 3. Special case for extension management
+                            } else if tool_name == MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE {
+                                InspectionAction::RequireApproval(Some(
+                                    "Extension management requires approval for security"
+                                        .to_string(),
+                                ))
+                            // 4. Defer to LLM detection (SmartApprove, uncached or legacy cached allow)
+                            } else if ponduin_mode == PonduinMode::SmartApprove
+                                && matches!(
+                                    permission_manager.get_smart_approve_permission(tool_name),
+                                    None | Some(PermissionLevel::AlwaysAllow)
+                                )
+                            {
+                                llm_detect_candidates.push(request);
+                                continue;
+                            // 5. Default: require approval for unknown tools
+                            } else {
+                                InspectionAction::RequireApproval(None)
                             }
-                        // 2. Check for a read-only annotation in SmartApprove mode
-                        } else if ponduin_mode == PonduinMode::SmartApprove
-                            && self.is_readonly_annotated_tool(tool_name)
-                        {
-                            InspectionAction::Allow
-                        // 3. Special case for extension management
-                        } else if tool_name == MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE {
-                            InspectionAction::RequireApproval(Some(
-                                "Extension management requires approval for security".to_string(),
-                            ))
-                        // 4. Defer to LLM detection (SmartApprove, uncached or legacy cached allow)
-                        } else if ponduin_mode == PonduinMode::SmartApprove
-                            && matches!(
-                                permission_manager.get_smart_approve_permission(tool_name),
-                                None | Some(PermissionLevel::AlwaysAllow)
-                            )
-                        {
-                            llm_detect_candidates.push(request);
-                            continue;
-                        // 5. Default: require approval for unknown tools
-                        } else {
-                            InspectionAction::RequireApproval(None)
                         }
                     }
                 };
@@ -284,12 +320,29 @@ mod tests {
         user_permission: Option<PermissionLevel>,
         smart_approve_cache: Option<PermissionLevel>,
     ) -> (InspectionAction, Option<PermissionLevel>) {
+        inspect_named_tool(
+            "tool",
+            mode,
+            smart_approved,
+            user_permission,
+            smart_approve_cache,
+        )
+        .await
+    }
+
+    async fn inspect_named_tool(
+        tool_name: &str,
+        mode: PonduinMode,
+        smart_approved: bool,
+        user_permission: Option<PermissionLevel>,
+        smart_approve_cache: Option<PermissionLevel>,
+    ) -> (InspectionAction, Option<PermissionLevel>) {
         let pm = Arc::new(PermissionManager::new(tempfile::tempdir().unwrap().keep()));
         if let Some(level) = user_permission {
-            pm.update_user_permission("tool", level);
+            pm.update_user_permission(tool_name, level);
         }
         if let Some(level) = smart_approve_cache {
-            pm.update_smart_approve_permission("tool", level);
+            pm.update_smart_approve_permission(tool_name, level);
         }
         let session_manager = Arc::new(crate::session::SessionManager::new(
             tempfile::tempdir().unwrap().keep(),
@@ -297,11 +350,14 @@ mod tests {
         let inspector =
             PermissionInspector::new(Arc::clone(&pm), Arc::new(Mutex::new(None)), session_manager);
         if smart_approved {
-            *inspector.readonly_tools.write().unwrap() = ["tool".to_string()].into_iter().collect();
+            *inspector.readonly_tools.write().unwrap() =
+                [tool_name.to_string()].into_iter().collect();
         }
         let req = ToolRequest {
             id: "req".into(),
-            tool_call: Ok(CallToolRequestParams::new("tool").with_arguments(object!({}))),
+            tool_call: Ok(
+                CallToolRequestParams::new(tool_name.to_string()).with_arguments(object!({}))
+            ),
             metadata: None,
             tool_meta: None,
         };
@@ -312,7 +368,7 @@ mod tests {
 
         (
             results.remove(0).action,
-            pm.get_smart_approve_permission("tool"),
+            pm.get_smart_approve_permission(tool_name),
         )
     }
 
@@ -367,6 +423,31 @@ mod tests {
 
         assert_eq!(action, InspectionAction::RequireApproval(None));
         assert_eq!(cache, Some(PermissionLevel::AskBefore));
+    }
+
+    #[test_case(PonduinMode::Auto, false, Some(PermissionLevel::AlwaysAllow), InspectionAction::Allow; "auto_is_fully_autonomous")]
+    #[test_case(PonduinMode::Approve, true, Some(PermissionLevel::AlwaysAllow), InspectionAction::RequireApproval(None); "approve_still_asks_for_read_only_with_explicit_allow")]
+    #[test_case(PonduinMode::Approve, false, Some(PermissionLevel::NeverAllow), InspectionAction::Deny; "approve_preserves_explicit_deny")]
+    #[test_case(PonduinMode::SmartApprove, true, Some(PermissionLevel::AlwaysAllow), InspectionAction::Allow; "smart_approve_allows_annotated_read_only")]
+    #[test_case(PonduinMode::SmartApprove, true, Some(PermissionLevel::AskBefore), InspectionAction::RequireApproval(None); "smart_approve_preserves_explicit_ask")]
+    #[test_case(PonduinMode::SmartApprove, false, Some(PermissionLevel::AlwaysAllow), InspectionAction::RequireApproval(None); "smart_approve_never_uses_explicit_allow_for_mutation")]
+    #[tokio::test]
+    async fn internal_coding_tools_follow_session_mode(
+        mode: PonduinMode,
+        read_only: bool,
+        user_permission: Option<PermissionLevel>,
+        expected: InspectionAction,
+    ) {
+        let (action, _) = inspect_named_tool(
+            crate::coding::tools::REPOSITORY_PROFILE_TOOL_NAME,
+            mode,
+            read_only,
+            user_permission,
+            None,
+        )
+        .await;
+
+        assert_eq!(action, expected);
     }
 
     #[test]
