@@ -4,6 +4,7 @@ import { SecurityToggle } from '../security/SecurityToggle';
 import { ResponseStylesSection } from '../response_styles/ResponseStylesSection';
 import { PonduinhintsSection } from './PonduinhintsSection';
 import { SpellcheckToggle } from './SpellcheckToggle';
+import { CodingAgentSettings } from './CodingAgentSettings';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../ui/card';
 import { defineMessages, useIntl } from '../../../i18n';
 
@@ -16,6 +17,15 @@ const i18n = defineMessages({
     id: 'chatSettings.modeDescription',
     defaultMessage:
       'Choose the default mode Ponduin uses for new sessions. Existing sessions keep their current mode.',
+  },
+  codingAgentTitle: {
+    id: 'chatSettings.codingAgentTitle',
+    defaultMessage: 'Internal Coding Agent',
+  },
+  codingAgentDescription: {
+    id: 'chatSettings.codingAgentDescription',
+    defaultMessage:
+      'Enable provider-independent coding capabilities and choose the workflow for new tasks.',
   },
   responseStylesTitle: {
     id: 'chatSettings.responseStylesTitle',
@@ -39,6 +49,16 @@ export default function ChatSettingsSection() {
         </CardHeader>
         <CardContent className="px-2">
           <ModeSection />
+        </CardContent>
+      </Card>
+
+      <Card className="pb-2 rounded-lg">
+        <CardHeader className="pb-0">
+          <CardTitle>{intl.formatMessage(i18n.codingAgentTitle)}</CardTitle>
+          <CardDescription>{intl.formatMessage(i18n.codingAgentDescription)}</CardDescription>
+        </CardHeader>
+        <CardContent className="px-2">
+          <CodingAgentSettings />
         </CardContent>
       </Card>
 
