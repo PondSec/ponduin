@@ -105,6 +105,7 @@ pub enum Ecosystem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationCommand {
+    pub id: String,
     pub kind: ValidationKind,
     pub program: String,
     pub args: Vec<String>,
@@ -438,15 +439,21 @@ impl ProjectAccumulator {
     }
 
     fn add_command(&mut self, kind: ValidationKind, program: &str, args: &[&str], evidence: &str) {
+        let cwd = if self.root.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            self.root.clone()
+        };
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
         let command = ValidationCommand {
+            id: validation_command_id(kind, program, &args, &cwd),
             kind,
             program: program.to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
-            cwd: if self.root.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                self.root.clone()
-            },
+            args,
+            cwd,
             evidence: evidence.to_string(),
         };
         if !self.commands.contains(&command) {
@@ -480,6 +487,25 @@ impl ProjectAccumulator {
             warnings: self.warnings,
         }
     }
+}
+
+fn validation_command_id(
+    kind: ValidationKind,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("{kind:?}").as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(program.as_bytes());
+    bytes.push(0);
+    for argument in args {
+        bytes.extend_from_slice(argument.as_bytes());
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(cwd.to_string_lossy().as_bytes());
+    format!("validation:{}", crate::coding::file::content_digest(&bytes))
 }
 
 fn ecosystem_for_manifest(kind: ManifestKind) -> Ecosystem {

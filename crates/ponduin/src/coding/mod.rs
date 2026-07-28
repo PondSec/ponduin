@@ -19,6 +19,7 @@ pub mod search;
 pub mod sensitive;
 pub mod strategy;
 pub mod tools;
+pub mod validation;
 pub mod workflow;
 pub mod workspace;
 
@@ -36,5 +37,6 @@ pub use project::ProjectDiscovery;
 pub use repository::RepositoryProfile;
 pub use search::RepositorySearch;
 pub use strategy::CodingTaskMode;
+pub use validation::ValidationService;
 pub use workflow::CodingWorkflow;
 pub use workspace::CodingWorkspace;
