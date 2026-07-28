@@ -35,8 +35,43 @@ impl<'workspace> ProcessRunner<'workspace> {
     }
 
     pub async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+        self.run_with_policy(request, CommandPolicy::General).await
+    }
+
+    pub(crate) async fn run_git(
+        &self,
+        args: Vec<String>,
+        cwd: PathBuf,
+    ) -> Result<ProcessOutput, ProcessError> {
+        let mut protected_args = vec![
+            "-c".to_string(),
+            "safe.bareRepository=explicit".to_string(),
+            "-c".to_string(),
+            "core.fsmonitor=false".to_string(),
+            "--no-optional-locks".to_string(),
+        ];
+        protected_args.extend(args);
+        let mut environment = BTreeMap::new();
+        environment.insert("LC_ALL".to_string(), "C".to_string());
+        self.run_with_policy(
+            ProcessRequest {
+                program: "git".to_string(),
+                args: protected_args,
+                cwd,
+                environment,
+            },
+            CommandPolicy::ProtectedGit,
+        )
+        .await
+    }
+
+    async fn run_with_policy(
+        &self,
+        request: ProcessRequest,
+        policy: CommandPolicy,
+    ) -> Result<ProcessOutput, ProcessError> {
         self.limits.validate()?;
-        let validated = self.validate(request)?;
+        let validated = self.validate(request, policy)?;
         let started = Instant::now();
         let process_temp =
             tempfile::tempdir().map_err(ProcessError::TemporaryDirectoryUnavailable)?;
@@ -130,11 +165,17 @@ impl<'workspace> ProcessRunner<'workspace> {
         })
     }
 
-    fn validate(&self, request: ProcessRequest) -> Result<ValidatedProcess, ProcessError> {
+    fn validate(
+        &self,
+        request: ProcessRequest,
+        policy: CommandPolicy,
+    ) -> Result<ValidatedProcess, ProcessError> {
         validate_program_text(&request.program)?;
         validate_arguments(&request.args)?;
         validate_environment(&request.environment)?;
-        classify_command(&request.program, &request.args)?;
+        if policy == CommandPolicy::General {
+            classify_command(&request.program, &request.args)?;
+        }
 
         let cwd = self.workspace.resolve_existing(&request.cwd)?;
         if !cwd.is_dir() {
@@ -157,6 +198,12 @@ impl<'workspace> ProcessRunner<'workspace> {
             environment: request.environment,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandPolicy {
+    General,
+    ProtectedGit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -579,6 +626,9 @@ fn apply_minimal_environment(command: &mut Command, process_temp: &Path) {
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("PONDUIN_CODING_AGENT", "1");
 }
 

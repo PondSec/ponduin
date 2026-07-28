@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod config;
 pub mod file;
+pub mod git;
 pub mod instructions;
 pub mod patch;
 pub mod process;
@@ -19,6 +20,7 @@ pub mod workspace;
 pub use agent::CodingAgent;
 pub use config::CodingConfig;
 pub use file::FileSnapshot;
+pub use git::GitRepository;
 pub use instructions::RepositoryInstructions;
 pub use patch::PatchEngine;
 pub use process::ProcessRunner;
