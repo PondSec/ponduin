@@ -299,6 +299,63 @@ impl<'workspace> GitRepository<'workspace> {
         })
     }
 
+    pub async fn unstage_owned(
+        &self,
+        paths: &[GitOwnedPath],
+    ) -> Result<GitUnstageResult, GitError> {
+        let paths = validate_owned_paths(paths)?;
+        for owned in &paths {
+            self.verify_index_matches_applied(owned).await?;
+        }
+
+        let head_exists = self
+            .optional_stdout(["rev-parse", "--verify", "HEAD"])
+            .await?
+            .is_some();
+        let mut args = if head_exists {
+            vec![
+                "reset".to_string(),
+                "--quiet".to_string(),
+                "HEAD".to_string(),
+                "--".to_string(),
+            ]
+        } else {
+            vec![
+                "rm".to_string(),
+                "--cached".to_string(),
+                "--quiet".to_string(),
+                "--ignore-unmatch".to_string(),
+                "--".to_string(),
+            ]
+        };
+        args.extend(paths.iter().map(|owned| literal_pathspec(&owned.path)));
+        let output = self.run(args).await?;
+        require_success(&output, "unstage owned files")?;
+
+        for owned in &paths {
+            let index = self.index_entry(&owned.path).await?;
+            match (&owned.original_digest, index) {
+                (Some(expected), Some(entry)) => {
+                    let actual = self.index_digest(&entry).await?;
+                    if &actual != expected {
+                        return Err(GitError::OriginalDoesNotMatchIndex {
+                            path: owned.path.clone(),
+                            expected: expected.clone(),
+                            actual,
+                        });
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(GitError::OriginalIndexStateMismatch(owned.path.clone()));
+                }
+            }
+        }
+        Ok(GitUnstageResult {
+            unstaged_files: paths.into_iter().map(|owned| owned.path).collect(),
+        })
+    }
+
     pub async fn commit_owned(
         &self,
         message: &str,
@@ -773,6 +830,11 @@ pub struct GitStageResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitUnstageResult {
+    pub unstaged_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCommitResult {
     pub oid: String,
     pub committed_files: Vec<PathBuf>,
@@ -1211,6 +1273,25 @@ mod tests {
             .unwrap()
             .patch
             .contains("+after"));
+        let unstaged = repository
+            .unstage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+        assert_eq!(unstaged.unstaged_files, vec![PathBuf::from("app.txt")]);
+        assert!(repository
+            .diff(GitDiffRequest {
+                staged: true,
+                paths: vec![PathBuf::from("app.txt")],
+                context_lines: 3,
+            })
+            .await
+            .unwrap()
+            .patch
+            .is_empty());
+        repository
+            .stage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
 
         let committed = repository
             .commit_owned("agent change", std::slice::from_ref(&owned))
@@ -1310,6 +1391,49 @@ mod tests {
                 kind: "branch name"
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn stages_unstages_and_commits_agent_created_files_on_an_unborn_branch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        git(temp_dir.path(), &["init"]);
+        git(temp_dir.path(), &["config", "user.name", "Test User"]);
+        git(
+            temp_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        let path = temp_dir.path().join("new.txt");
+        fs::write(&path, "created\n").unwrap();
+        let owned = GitOwnedPath {
+            path: PathBuf::from("new.txt"),
+            original_digest: None,
+            applied_digest: Some(content_digest(&fs::read(&path).unwrap())),
+        };
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let repository = GitRepository::open(&workspace, GitLimits::default())
+            .await
+            .unwrap();
+
+        repository
+            .stage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+        repository
+            .unstage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+        assert!(repository.status().await.unwrap().changes[0].untracked);
+        repository
+            .stage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+        let committed = repository
+            .commit_owned("initial agent file", std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+
+        assert_eq!(committed.committed_files, vec![PathBuf::from("new.txt")]);
+        assert!(!repository.status().await.unwrap().unborn);
     }
 
     #[tokio::test]

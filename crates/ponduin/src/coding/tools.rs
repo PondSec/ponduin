@@ -2,9 +2,9 @@ use crate::coding::config::CodingConfig;
 use crate::coding::file::{
     FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
 };
-use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitRepository};
+use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitOwnedPath, GitRepository};
 use crate::coding::patch::{
-    MutationBatch, MutationResult, PatchEngine, PatchLimits, RollbackRecord,
+    MutationBatch, MutationPreview, MutationResult, PatchEngine, PatchLimits, RollbackRecord,
     DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
 };
 use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner};
@@ -18,7 +18,7 @@ use rmcp::object;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -36,6 +36,10 @@ pub const RUN_PROCESS_TOOL_NAME: &str = "coding__run_process";
 pub const GIT_STATUS_TOOL_NAME: &str = "coding__git_status";
 pub const GIT_DIFF_TOOL_NAME: &str = "coding__git_diff";
 pub const GIT_HISTORY_TOOL_NAME: &str = "coding__git_history";
+pub const GIT_STAGE_OWNED_TOOL_NAME: &str = "coding__git_stage_owned";
+pub const GIT_UNSTAGE_OWNED_TOOL_NAME: &str = "coding__git_unstage_owned";
+pub const GIT_COMMIT_OWNED_TOOL_NAME: &str = "coding__git_commit_owned";
+pub const GIT_CREATE_BRANCH_TOOL_NAME: &str = "coding__git_create_branch";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -44,20 +48,41 @@ const MAX_ROLLBACK_BYTES: usize = 64 * 1_024 * 1_024;
 
 #[derive(Debug, Default)]
 pub(crate) struct CodingToolState {
-    rollback_journal: Mutex<VecDeque<RollbackRecord>>,
+    rollback_journal: Mutex<VecDeque<RollbackJournalEntry>>,
+}
+
+#[derive(Debug)]
+struct RollbackJournalEntry {
+    record: RollbackRecord,
+    workspace_root: PathBuf,
+    owned_paths: Vec<GitOwnedPath>,
+    staged_paths: BTreeSet<PathBuf>,
 }
 
 impl CodingToolState {
-    fn remember(&self, record: RollbackRecord) {
+    fn remember(&self, workspace_root: &Path, record: RollbackRecord, preview: &MutationPreview) {
         let mut journal = self
             .rollback_journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        journal.push_back(record);
+        journal.push_back(RollbackJournalEntry {
+            record,
+            workspace_root: workspace_root.to_path_buf(),
+            owned_paths: preview
+                .files
+                .iter()
+                .map(|file| GitOwnedPath {
+                    path: file.path.clone(),
+                    original_digest: file.original_digest.clone(),
+                    applied_digest: file.new_digest.clone(),
+                })
+                .collect(),
+            staged_paths: BTreeSet::new(),
+        });
         while journal.len() > MAX_ROLLBACK_RECORDS
             || journal
                 .iter()
-                .map(RollbackRecord::retained_bytes)
+                .map(|entry| entry.record.retained_bytes())
                 .sum::<usize>()
                 > MAX_ROLLBACK_BYTES
         {
@@ -65,20 +90,113 @@ impl CodingToolState {
         }
     }
 
-    fn find(&self, rollback_id: &str) -> Option<RollbackRecord> {
-        self.rollback_journal
+    fn find(&self, rollback_id: &str) -> Result<Option<RollbackRecord>, ErrorData> {
+        let journal = self
+            .rollback_journal
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = journal
             .iter()
-            .find(|record| record.id() == rollback_id)
-            .cloned()
+            .find(|entry| entry.record.id() == rollback_id)
+        else {
+            return Ok(None);
+        };
+        if entry.staged_paths.is_empty() {
+            Ok(Some(entry.record.clone()))
+        } else {
+            Err(invalid_arguments(format!(
+                "rollback_id `{rollback_id}` has staged files; unstage the owned files before rollback"
+            )))
+        }
     }
 
     fn forget(&self, rollback_id: &str) {
         self.rollback_journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|record| record.id() != rollback_id);
+            .retain(|entry| entry.record.id() != rollback_id);
+    }
+
+    fn owned_paths(
+        &self,
+        workspace_root: &Path,
+        requested: &[PathBuf],
+    ) -> Result<Vec<GitOwnedPath>, ErrorData> {
+        if requested.is_empty() {
+            return Err(invalid_arguments(
+                "at least one agent-owned path is required",
+            ));
+        }
+        let journal = self
+            .rollback_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut seen = std::collections::HashSet::new();
+        let mut owned = Vec::with_capacity(requested.len());
+        for path in requested {
+            if !seen.insert(path.clone()) {
+                return Err(invalid_arguments(format!(
+                    "duplicate agent-owned path `{}`",
+                    path.display()
+                )));
+            }
+            let found = journal
+                .iter()
+                .rev()
+                .filter(|entry| entry.workspace_root == workspace_root)
+                .flat_map(|entry| entry.owned_paths.iter())
+                .find(|owned| owned.path == *path)
+                .cloned()
+                .ok_or_else(|| {
+                    invalid_arguments(format!(
+                        "path `{}` is not retained as an agent-owned mutation",
+                        path.display()
+                    ))
+                })?;
+            owned.push(found);
+        }
+        Ok(owned)
+    }
+
+    fn mark_staged(&self, workspace_root: &Path, paths: &[PathBuf]) {
+        let mut journal = self
+            .rollback_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for path in paths {
+            if let Some(entry) = journal.iter_mut().rev().find(|entry| {
+                entry.workspace_root == workspace_root
+                    && entry.owned_paths.iter().any(|owned| owned.path == *path)
+            }) {
+                entry.staged_paths.insert(path.clone());
+            }
+        }
+    }
+
+    fn mark_unstaged(&self, workspace_root: &Path, paths: &[PathBuf]) {
+        let mut journal = self
+            .rollback_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in journal
+            .iter_mut()
+            .filter(|entry| entry.workspace_root == workspace_root)
+        {
+            entry.staged_paths.retain(|path| !paths.contains(path));
+        }
+    }
+
+    fn expire_committed(&self, workspace_root: &Path, paths: &[PathBuf]) {
+        self.rollback_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| {
+                entry.workspace_root != workspace_root
+                    || !entry
+                        .owned_paths
+                        .iter()
+                        .any(|owned| paths.contains(&owned.path))
+            });
     }
 }
 
@@ -96,6 +214,10 @@ pub fn definitions() -> Vec<Tool> {
         git_status_tool(),
         git_diff_tool(),
         git_history_tool(),
+        git_stage_owned_tool(),
+        git_unstage_owned_tool(),
+        git_commit_owned_tool(),
+        git_create_branch_tool(),
     ]
 }
 
@@ -103,15 +225,23 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with(CODING_TOOL_PREFIX)
 }
 
-pub fn is_async_tool(name: &str) -> bool {
+pub(crate) fn is_async_tool(name: &str) -> bool {
     matches!(
         name,
-        RUN_PROCESS_TOOL_NAME | GIT_STATUS_TOOL_NAME | GIT_DIFF_TOOL_NAME | GIT_HISTORY_TOOL_NAME
+        RUN_PROCESS_TOOL_NAME
+            | GIT_STATUS_TOOL_NAME
+            | GIT_DIFF_TOOL_NAME
+            | GIT_HISTORY_TOOL_NAME
+            | GIT_STAGE_OWNED_TOOL_NAME
+            | GIT_UNSTAGE_OWNED_TOOL_NAME
+            | GIT_COMMIT_OWNED_TOOL_NAME
+            | GIT_CREATE_BRANCH_TOOL_NAME
     )
 }
 
-pub async fn execute_async(
+pub(crate) async fn execute_async(
     config: &CodingConfig,
+    state: &CodingToolState,
     tool_call: CallToolRequestParams,
     working_dir: &Path,
 ) -> Result<CallToolResult, ErrorData> {
@@ -192,6 +322,56 @@ pub async fn execute_async(
                 .await
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&history, config.output_limit)
+        }
+        GIT_STAGE_OWNED_TOOL_NAME => {
+            let params: GitOwnedPathsParams = parse_arguments(&tool_call)?;
+            let owned = state.owned_paths(workspace.root(), &params.paths)?;
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = repository
+                .stage_owned(&owned)
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.mark_staged(workspace.root(), &result.staged_files);
+            json_result(&result, config.output_limit)
+        }
+        GIT_UNSTAGE_OWNED_TOOL_NAME => {
+            let params: GitOwnedPathsParams = parse_arguments(&tool_call)?;
+            let owned = state.owned_paths(workspace.root(), &params.paths)?;
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = repository
+                .unstage_owned(&owned)
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.mark_unstaged(workspace.root(), &result.unstaged_files);
+            json_result(&result, config.output_limit)
+        }
+        GIT_COMMIT_OWNED_TOOL_NAME => {
+            let params: GitCommitOwnedParams = parse_arguments(&tool_call)?;
+            let owned = state.owned_paths(workspace.root(), &params.paths)?;
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = repository
+                .commit_owned(&params.message, &owned)
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.expire_committed(workspace.root(), &result.committed_files);
+            json_result(&result, config.output_limit)
+        }
+        GIT_CREATE_BRANCH_TOOL_NAME => {
+            let params: GitCreateBranchParams = parse_arguments(&tool_call)?;
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = repository
+                .create_branch(&params.name, params.start_point.as_deref())
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&result, config.output_limit)
         }
         _ => unreachable!("async coding tool name was checked"),
     }
@@ -311,12 +491,12 @@ pub(crate) fn execute_with_state(
             let applied = engine
                 .apply(prepared)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
-            state.remember(applied.rollback);
+            state.remember(workspace.root(), applied.rollback, &applied.result.preview);
             json_result(&applied.result, config.output_limit)
         }
         ROLLBACK_CHANGES_TOOL_NAME => {
             let params: RollbackChangesParams = parse_arguments(&tool_call)?;
-            let record = state.find(&params.rollback_id).ok_or_else(|| {
+            let record = state.find(&params.rollback_id)?.ok_or_else(|| {
                 invalid_arguments(format!(
                     "unknown or expired rollback_id `{}`",
                     params.rollback_id
@@ -332,7 +512,11 @@ pub(crate) fn execute_with_state(
         RUN_PROCESS_TOOL_NAME
         | GIT_STATUS_TOOL_NAME
         | GIT_DIFF_TOOL_NAME
-        | GIT_HISTORY_TOOL_NAME => Err(internal_error(
+        | GIT_HISTORY_TOOL_NAME
+        | GIT_STAGE_OWNED_TOOL_NAME
+        | GIT_UNSTAGE_OWNED_TOOL_NAME
+        | GIT_COMMIT_OWNED_TOOL_NAME
+        | GIT_CREATE_BRANCH_TOOL_NAME => Err(internal_error(
             "asynchronous coding tools require asynchronous dispatch",
         )),
         _ => Err(invalid_arguments(format!(
@@ -664,7 +848,7 @@ fn git_diff_tool() -> Tool {
                 "paths": {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1},
-                    "maxItems": 200,
+                    "maxItems": 100,
                     "default": []
                 },
                 "context_lines": {
@@ -700,6 +884,104 @@ fn git_history_tool() -> Tool {
         }),
     )
     .annotate(read_only_annotations("Read Git history"))
+}
+
+fn git_stage_owned_tool() -> Tool {
+    Tool::new(
+        GIT_STAGE_OWNED_TOOL_NAME.to_string(),
+        "Stage only explicitly listed files retained in this agent's mutation journal. Refuses \
+         files that were already dirty or staged before the agent change, files changed after \
+         apply, sensitive files, conflicts, and expired ownership records. Executable Git content \
+         filters are neutralized."
+            .to_string(),
+        owned_paths_schema(),
+    )
+    .annotate(mutation_annotations("Stage agent-owned Git changes"))
+}
+
+fn git_unstage_owned_tool() -> Tool {
+    Tool::new(
+        GIT_UNSTAGE_OWNED_TOOL_NAME.to_string(),
+        "Unstage only explicitly listed files whose staged index content still exactly matches \
+         this agent's retained mutation. Restores their prior index state without changing the \
+         working tree and re-enables patch rollback."
+            .to_string(),
+        owned_paths_schema(),
+    )
+    .annotate(mutation_annotations("Unstage agent-owned Git changes"))
+}
+
+fn git_commit_owned_tool() -> Tool {
+    Tool::new(
+        GIT_COMMIT_OWNED_TOOL_NAME.to_string(),
+        "Commit exactly the listed agent-owned staged files. Refuses the commit if any foreign, \
+         missing, changed, or additional staged path exists. Git hooks and commit signing are \
+         disabled. This never pushes."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["message", "paths"],
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                },
+                "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {"type": "string", "minLength": 1}
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(mutation_annotations("Commit agent-owned Git changes"))
+}
+
+fn git_create_branch_tool() -> Tool {
+    Tool::new(
+        GIT_CREATE_BRANCH_TOOL_NAME.to_string(),
+        "Create a new local Git branch at a verified commit without switching branches, deleting \
+         branches, overwriting an existing branch, contacting remotes, or pushing."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                },
+                "start_point": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "default": null
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(mutation_annotations("Create local Git branch"))
+}
+
+fn owned_paths_schema() -> serde_json::Map<String, Value> {
+    object!({
+        "type": "object",
+        "required": ["paths"],
+        "properties": {
+            "paths": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {"type": "string", "minLength": 1}
+            }
+        },
+        "additionalProperties": false
+    })
 }
 
 fn mutation_batch_schema() -> serde_json::Map<String, Value> {
@@ -1061,6 +1343,27 @@ impl Default for GitHistoryParams {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitOwnedPathsParams {
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitCommitOwnedParams {
+    message: String,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitCreateBranchParams {
+    name: String,
+    #[serde(default)]
+    start_point: Option<String>,
+}
+
 fn default_path() -> PathBuf {
     PathBuf::from(".")
 }
@@ -1127,7 +1430,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 16);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -1135,7 +1438,13 @@ mod tests {
             let annotations = tool.annotations.as_ref().unwrap();
             let mutating = matches!(
                 tool.name.as_ref(),
-                APPLY_CHANGES_TOOL_NAME | ROLLBACK_CHANGES_TOOL_NAME | RUN_PROCESS_TOOL_NAME
+                APPLY_CHANGES_TOOL_NAME
+                    | ROLLBACK_CHANGES_TOOL_NAME
+                    | RUN_PROCESS_TOOL_NAME
+                    | GIT_STAGE_OWNED_TOOL_NAME
+                    | GIT_UNSTAGE_OWNED_TOOL_NAME
+                    | GIT_COMMIT_OWNED_TOOL_NAME
+                    | GIT_CREATE_BRANCH_TOOL_NAME
             );
             assert_eq!(annotations.read_only_hint, Some(!mutating));
             assert_eq!(annotations.destructive_hint, Some(mutating));
@@ -1329,9 +1638,14 @@ mod tests {
             "timeout_seconds": 2
         }));
 
-        let result = execute_async(&enabled_config(), call, temp_dir.path())
-            .await
-            .unwrap();
+        let result = execute_async(
+            &enabled_config(),
+            &CodingToolState::default(),
+            call,
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
         let json: Value = serde_json::from_str(&result_text(result)).unwrap();
 
         assert_eq!(json["success"], true);
@@ -1354,12 +1668,22 @@ mod tests {
             "timeout_seconds": 121
         }));
 
-        let blocked_error = execute_async(&enabled_config(), blocked, temp_dir.path())
-            .await
-            .unwrap_err();
-        let timeout_error = execute_async(&enabled_config(), excessive, temp_dir.path())
-            .await
-            .unwrap_err();
+        let blocked_error = execute_async(
+            &enabled_config(),
+            &CodingToolState::default(),
+            blocked,
+            temp_dir.path(),
+        )
+        .await
+        .unwrap_err();
+        let timeout_error = execute_async(
+            &enabled_config(),
+            &CodingToolState::default(),
+            excessive,
+            temp_dir.path(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(blocked_error.message.contains("blocked command"));
         assert!(timeout_error
@@ -1409,6 +1733,7 @@ mod tests {
 
         let status = execute_async(
             &enabled_config(),
+            &CodingToolState::default(),
             CallToolRequestParams::new(GIT_STATUS_TOOL_NAME),
             temp_dir.path(),
         )
@@ -1421,6 +1746,7 @@ mod tests {
 
         let diff = execute_async(
             &enabled_config(),
+            &CodingToolState::default(),
             CallToolRequestParams::new(GIT_DIFF_TOOL_NAME).with_arguments(object!({
                 "paths": ["app.txt"],
                 "context_lines": 1
@@ -1436,6 +1762,7 @@ mod tests {
 
         let history = execute_async(
             &enabled_config(),
+            &CodingToolState::default(),
             CallToolRequestParams::new(GIT_HISTORY_TOOL_NAME).with_arguments(object!({
                 "max_entries": 5
             })),
@@ -1445,5 +1772,111 @@ mod tests {
         .unwrap();
         let history_json: Value = serde_json::from_str(&result_text(history)).unwrap();
         assert_eq!(history_json["commits"][0]["subject"], "initial");
+    }
+
+    #[tokio::test]
+    async fn stages_and_commits_only_changes_owned_by_shared_agent_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        run_git(temp_dir.path(), &["init"]);
+        run_git(temp_dir.path(), &["config", "user.name", "Test User"]);
+        run_git(
+            temp_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        let path = temp_dir.path().join("app.txt");
+        fs::write(&path, "before\n").unwrap();
+        run_git(temp_dir.path(), &["add", "--", "app.txt"]);
+        run_git(temp_dir.path(), &["commit", "-m", "initial"]);
+        let digest = crate::coding::file::content_digest(&fs::read(&path).unwrap());
+        let state = CodingToolState::default();
+        let config = enabled_config();
+        let apply = CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
+            "changes": [{
+                "operation": "write",
+                "path": "app.txt",
+                "expected_digest": digest,
+                "content": "after\n"
+            }]
+        }));
+        let applied = execute_with_state(&config, &state, apply, temp_dir.path()).unwrap();
+        let applied_json: Value = serde_json::from_str(&result_text(applied)).unwrap();
+        let rollback_id = applied_json["rollback_id"].as_str().unwrap().to_string();
+
+        let stage = CallToolRequestParams::new(GIT_STAGE_OWNED_TOOL_NAME).with_arguments(object!({
+            "paths": ["app.txt"]
+        }));
+        let staged = execute_async(&config, &state, stage, temp_dir.path())
+            .await
+            .unwrap();
+        let staged_json: Value = serde_json::from_str(&result_text(staged)).unwrap();
+        assert_eq!(staged_json["staged_files"][0], "app.txt");
+
+        let blocked_rollback = CallToolRequestParams::new(ROLLBACK_CHANGES_TOOL_NAME)
+            .with_arguments(object!({
+                "rollback_id": rollback_id
+            }));
+        let rollback_error =
+            execute_with_state(&config, &state, blocked_rollback, temp_dir.path()).unwrap_err();
+        assert!(rollback_error
+            .message
+            .contains("unstage the owned files before rollback"));
+
+        let unstage =
+            CallToolRequestParams::new(GIT_UNSTAGE_OWNED_TOOL_NAME).with_arguments(object!({
+                "paths": ["app.txt"]
+            }));
+        execute_async(&config, &state, unstage, temp_dir.path())
+            .await
+            .unwrap();
+        assert!(state.find(&rollback_id).unwrap().is_some());
+
+        let restage =
+            CallToolRequestParams::new(GIT_STAGE_OWNED_TOOL_NAME).with_arguments(object!({
+                "paths": ["app.txt"]
+            }));
+        execute_async(&config, &state, restage, temp_dir.path())
+            .await
+            .unwrap();
+
+        let commit =
+            CallToolRequestParams::new(GIT_COMMIT_OWNED_TOOL_NAME).with_arguments(object!({
+                "message": "agent-owned change",
+                "paths": ["app.txt"]
+            }));
+        let committed = execute_async(&config, &state, commit, temp_dir.path())
+            .await
+            .unwrap();
+        let committed_json: Value = serde_json::from_str(&result_text(committed)).unwrap();
+        assert_eq!(committed_json["committed_files"][0], "app.txt");
+        assert!(state.find(&rollback_id).unwrap().is_none());
+
+        let history = execute_async(
+            &config,
+            &state,
+            CallToolRequestParams::new(GIT_HISTORY_TOOL_NAME).with_arguments(object!({
+                "max_entries": 1
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let history_json: Value = serde_json::from_str(&result_text(history)).unwrap();
+        assert_eq!(history_json["commits"][0]["subject"], "agent-owned change");
+
+        let unknown_stage =
+            CallToolRequestParams::new(GIT_STAGE_OWNED_TOOL_NAME).with_arguments(object!({
+                "paths": ["app.txt"]
+            }));
+        let error = execute_async(
+            &config,
+            &CodingToolState::default(),
+            unknown_stage,
+            temp_dir.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .message
+            .contains("not retained as an agent-owned mutation"));
     }
 }
