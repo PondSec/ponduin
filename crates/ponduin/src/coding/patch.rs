@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 pub const DEFAULT_PATCH_FILE_LIMIT: usize = 2 * 1_024 * 1_024;
 pub const MAX_PATCH_FILE_LIMIT: usize = 10 * 1_024 * 1_024;
+pub const DEFAULT_PATCH_BATCH_LIMIT: usize = 16 * 1_024 * 1_024;
+pub const MAX_PATCH_BATCH_LIMIT: usize = 100 * 1_024 * 1_024;
 
 #[derive(Debug)]
 pub struct PatchEngine<'workspace> {
@@ -38,10 +40,23 @@ impl<'workspace> PatchEngine<'workspace> {
 
         let mut seen = HashSet::new();
         let mut prepared = Vec::with_capacity(batch.changes.len());
+        let mut batch_bytes = 0usize;
         for change in batch.changes {
             let prepared_change = self.prepare_change(change)?;
             if !seen.insert(prepared_change.path.clone()) {
                 return Err(PatchError::DuplicatePath(prepared_change.relative_path));
+            }
+            batch_bytes = batch_bytes
+                .checked_add(prepared_change.retained_bytes())
+                .ok_or(PatchError::BatchTooLarge {
+                    size: usize::MAX,
+                    limit: self.limits.max_batch_bytes,
+                })?;
+            if batch_bytes > self.limits.max_batch_bytes {
+                return Err(PatchError::BatchTooLarge {
+                    size: batch_bytes,
+                    limit: self.limits.max_batch_bytes,
+                });
             }
             prepared.push(prepared_change);
         }
@@ -178,6 +193,7 @@ impl<'workspace> PatchEngine<'workspace> {
                 }
                 require_existing_parent(&resolved, &relative)?;
                 validate_content_size(&relative, content.len(), self.limits.max_file_bytes)?;
+                reject_nul(&relative, content.as_bytes())?;
                 Ok(PreparedChange {
                     path: resolved,
                     relative_path: relative,
@@ -255,6 +271,7 @@ impl<'workspace> PatchEngine<'workspace> {
         }
         if let Some(content) = &new_content {
             validate_content_size(&relative, content.len(), self.limits.max_file_bytes)?;
+            reject_nul(&relative, content)?;
         }
 
         Ok(PreparedChange {
@@ -280,6 +297,7 @@ impl<'workspace> PatchEngine<'workspace> {
 pub struct PatchLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
+    pub max_batch_bytes: usize,
 }
 
 impl Default for PatchLimits {
@@ -287,6 +305,7 @@ impl Default for PatchLimits {
         Self {
             max_files: 20,
             max_file_bytes: DEFAULT_PATCH_FILE_LIMIT,
+            max_batch_bytes: DEFAULT_PATCH_BATCH_LIMIT,
         }
     }
 }
@@ -299,11 +318,15 @@ impl PatchLimits {
         if self.max_file_bytes == 0 || self.max_file_bytes > MAX_PATCH_FILE_LIMIT {
             return Err(PatchError::InvalidFileSizeLimit(self.max_file_bytes));
         }
+        if self.max_batch_bytes == 0 || self.max_batch_bytes > MAX_PATCH_BATCH_LIMIT {
+            return Err(PatchError::InvalidBatchSizeLimit(self.max_batch_bytes));
+        }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MutationBatch {
     pub changes: Vec<FileChange>,
 }
@@ -393,6 +416,11 @@ struct PreparedChange {
 }
 
 impl PreparedChange {
+    fn retained_bytes(&self) -> usize {
+        self.original_content.as_ref().map_or(0, Vec::len)
+            + self.new_content.as_ref().map_or(0, Vec::len)
+    }
+
     fn preview(&self) -> FileMutationPreview {
         let old = self
             .original_content
@@ -421,7 +449,7 @@ impl PreparedChange {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RollbackRecord {
     id: String,
     entries: Vec<RollbackEntry>,
@@ -431,9 +459,17 @@ impl RollbackRecord {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.original_content.as_ref())
+            .map(Vec::len)
+            .sum()
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RollbackEntry {
     path: PathBuf,
     relative_path: PathBuf,
@@ -708,6 +744,14 @@ fn reject_sensitive(path: &Path) -> Result<(), PatchError> {
     }
 }
 
+fn reject_nul(path: &Path, content: &[u8]) -> Result<(), PatchError> {
+    if content.contains(&0) {
+        Err(PatchError::Binary(path.to_path_buf()))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_content_size(path: &Path, size: usize, limit: usize) -> Result<(), PatchError> {
     if size <= limit {
         Ok(())
@@ -756,6 +800,10 @@ pub enum PatchError {
     InvalidFileCountLimit(usize),
     #[error("invalid patch file-size limit: {0}")]
     InvalidFileSizeLimit(usize),
+    #[error("invalid patch batch-size limit: {0}")]
+    InvalidBatchSizeLimit(usize),
+    #[error("mutation batch retains {size} bytes, limit is {limit}")]
+    BatchTooLarge { size: usize, limit: usize },
     #[error("duplicate mutation path in batch: {0}")]
     DuplicatePath(PathBuf),
     #[error("resolved path changed for {path}: expected {expected}, current {actual}")]
@@ -988,6 +1036,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_batches_that_exceed_the_total_retained_byte_limit() {
+        let (_temp_dir, workspace) = fixture();
+        let engine = PatchEngine::new(
+            &workspace,
+            PatchLimits {
+                max_batch_bytes: 10,
+                ..PatchLimits::default()
+            },
+        );
+
+        let error = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Create {
+                    path: PathBuf::from("large.txt"),
+                    content: "more than ten bytes".to_string(),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PatchError::BatchTooLarge {
+                size: 19,
+                limit: 10
+            }
+        ));
+        assert!(!workspace.root().join("large.txt").exists());
+    }
+
+    #[test]
     fn exact_replacements_must_be_unique_unless_explicitly_all() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("values.txt");
@@ -1085,6 +1163,36 @@ mod tests {
 
         assert!(matches!(error, PatchError::Binary(_)));
         assert_eq!(fs::read(path).unwrap(), b"text\0binary");
+    }
+
+    #[test]
+    fn rejects_new_content_containing_nul_bytes() {
+        let (_temp_dir, workspace) = fixture();
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let existing = workspace.root().join("app.py");
+
+        let create_error = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Create {
+                    path: PathBuf::from("binary.dat"),
+                    content: "text\0binary".to_string(),
+                }],
+            })
+            .unwrap_err();
+        let write_error = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Write {
+                    path: PathBuf::from("app.py"),
+                    expected_digest: digest(&existing),
+                    content: "text\0binary".to_string(),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(create_error, PatchError::Binary(_)));
+        assert!(matches!(write_error, PatchError::Binary(_)));
+        assert!(!workspace.root().join("binary.dat").exists());
+        assert!(fs::read_to_string(existing).unwrap().contains("before"));
     }
 
     #[cfg(unix)]

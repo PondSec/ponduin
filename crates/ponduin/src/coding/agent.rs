@@ -3,16 +3,21 @@ use crate::coding::tools;
 use crate::config::PonduinMode;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorCode, ErrorData, Tool};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Internal coding capability owned directly by the main agent.
 #[derive(Debug, Clone)]
 pub struct CodingAgent {
     config: CodingConfig,
+    tool_state: Arc<tools::CodingToolState>,
 }
 
 impl CodingAgent {
     pub fn new(config: CodingConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            tool_state: Arc::new(tools::CodingToolState::default()),
+        }
     }
 
     pub fn config(&self) -> &CodingConfig {
@@ -69,16 +74,19 @@ impl CodingAgent {
         }
 
         let config = self.config.clone();
+        let tool_state = Arc::clone(&self.tool_state);
         let working_dir = PathBuf::from(working_dir);
-        tokio::task::spawn_blocking(move || tools::execute(&config, tool_call, &working_dir))
-            .await
-            .map_err(|error| {
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("internal coding tool task failed: {error}"),
-                    None,
-                )
-            })?
+        tokio::task::spawn_blocking(move || {
+            tools::execute_with_state(&config, &tool_state, tool_call, &working_dir)
+        })
+        .await
+        .map_err(|error| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("internal coding tool task failed: {error}"),
+                None,
+            )
+        })?
     }
 
     fn available(&self, ponduin_mode: PonduinMode) -> bool {
@@ -90,6 +98,9 @@ impl CodingAgent {
 mod tests {
     use super::*;
     use crate::coding::CodingTaskMode;
+    use rmcp::object;
+    use serde_json::Value;
+    use std::fs;
 
     fn enabled_agent() -> CodingAgent {
         CodingAgent::new(CodingConfig {
@@ -104,9 +115,9 @@ mod tests {
         let agent = enabled_agent();
 
         assert!(agent.tools(PonduinMode::Chat).is_empty());
-        assert_eq!(agent.tool_count(PonduinMode::Auto), 5);
-        assert_eq!(agent.tool_count(PonduinMode::Approve), 5);
-        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 5);
+        assert_eq!(agent.tool_count(PonduinMode::Auto), 8);
+        assert_eq!(agent.tool_count(PonduinMode::Approve), 8);
+        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 8);
     }
 
     #[test]
@@ -117,5 +128,47 @@ mod tests {
         assert!(prompt.contains("not extensions or MCP tools"));
         assert!(prompt.contains("only `auto` removes confirmation prompts"));
         assert!(prompt.contains("hard security denials still apply"));
+    }
+
+    #[tokio::test]
+    async fn retains_rollback_state_across_direct_agent_tool_calls() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("app.py");
+        fs::write(&path, "before\n").unwrap();
+        let digest = crate::coding::file::content_digest(&fs::read(&path).unwrap());
+        let agent = enabled_agent();
+        let apply =
+            CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
+                "changes": [{
+                    "operation": "write",
+                    "path": "app.py",
+                    "expected_digest": digest,
+                    "content": "after\n"
+                }]
+            }));
+
+        let applied = agent
+            .execute(PonduinMode::Auto, apply, temp_dir.path())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_str(
+            &applied.content[0]
+                .as_text()
+                .expect("expected text result")
+                .text,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+
+        let rollback = CallToolRequestParams::new(tools::ROLLBACK_CHANGES_TOOL_NAME)
+            .with_arguments(object!({
+                "rollback_id": json["rollback_id"].as_str().unwrap()
+            }));
+        agent
+            .execute(PonduinMode::Auto, rollback, temp_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "before\n");
     }
 }
