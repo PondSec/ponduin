@@ -190,6 +190,7 @@ shellexpand = { workspace = true }
 indexmap = { version = "2.9", default-features = false, features = ["serde", "std"] }
 ignore = { workspace = true }
 globset = { version = "0.4", default-features = false }
+similar = { version = "2.7", default-features = false, features = ["text"] }
 rayon = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-go = { workspace = true }
