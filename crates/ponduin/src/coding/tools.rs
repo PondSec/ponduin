@@ -12,6 +12,7 @@ use crate::coding::patch::{
 use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner};
 use crate::coding::project::ProjectDiscovery;
 use crate::coding::search::{SearchLimits, TextSearchRequest};
+use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
     CodingWorkflow, WorkflowLimits, WorkflowPlan, WorkflowReport, WorkflowStatus,
 };
@@ -58,6 +59,7 @@ pub const WORKFLOW_SET_PLAN_TOOL_NAME: &str = "coding__workflow_set_plan";
 pub const WORKFLOW_TRANSITION_TOOL_NAME: &str = "coding__workflow_transition";
 pub const WORKFLOW_STATUS_TOOL_NAME: &str = "coding__workflow_status";
 pub const WORKFLOW_COMPLETE_TOOL_NAME: &str = "coding__workflow_complete";
+pub const RUN_VALIDATION_TOOL_NAME: &str = "coding__run_validation";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -474,6 +476,25 @@ impl CodingToolState {
         Ok(())
     }
 
+    fn record_validation_execution(
+        &self,
+        workspace_root: &Path,
+        execution: &ValidationExecution,
+    ) -> Result<(), ErrorData> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(result) = self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow
+                .record_validation_execution(execution)
+                .map_err(|error| internal_error(error.to_string()))
+        }) {
+            result?;
+        }
+        Ok(())
+    }
+
     fn mutation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
         self.mutation_lock
             .lock()
@@ -614,6 +635,7 @@ pub fn definitions() -> Vec<Tool> {
         workflow_transition_tool(),
         workflow_status_tool(),
         workflow_complete_tool(),
+        run_validation_tool(),
     ]
 }
 
@@ -653,6 +675,7 @@ pub(crate) fn is_async_tool(name: &str) -> bool {
             | GIT_COMMIT_OWNED_TOOL_NAME
             | GIT_CREATE_BRANCH_TOOL_NAME
             | GIT_PUSH_OWNED_TOOL_NAME
+            | RUN_VALIDATION_TOOL_NAME
     )
 }
 
@@ -814,6 +837,39 @@ pub(crate) async fn execute_async(
                 .await
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&result, config.output_limit)
+        }
+        RUN_VALIDATION_TOOL_NAME => {
+            let params: RunValidationParams = parse_arguments(&tool_call)?;
+            if params.max_files == 0 || params.max_files > MAX_REPOSITORY_FILE_LIMIT {
+                return Err(invalid_arguments(format!(
+                    "max_files must be between 1 and {MAX_REPOSITORY_FILE_LIMIT}"
+                )));
+            }
+            let timeout = params
+                .timeout_seconds
+                .map(Duration::from_secs)
+                .unwrap_or(config.shell_timeout);
+            if timeout.is_zero() || timeout > config.shell_timeout {
+                return Err(invalid_arguments(format!(
+                    "timeout_seconds must be between 1 and the configured coding shell timeout of {}",
+                    config.shell_timeout.as_secs()
+                )));
+            }
+            let capabilities = ProjectDiscovery::discover(&workspace, params.max_files)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let execution = ValidationService::run(
+                &workspace,
+                &capabilities,
+                &params.command_id,
+                ProcessLimits {
+                    timeout,
+                    output_limit: config.output_limit,
+                },
+            )
+            .await;
+            state.invalidate_intelligence(workspace.root());
+            state.record_validation_execution(workspace.root(), &execution)?;
+            bounded_validation_result(execution, config.output_limit)
         }
         _ => unreachable!("async coding tool name was checked"),
     }
@@ -1091,7 +1147,8 @@ pub(crate) fn execute_with_state(
         | GIT_UNSTAGE_OWNED_TOOL_NAME
         | GIT_COMMIT_OWNED_TOOL_NAME
         | GIT_CREATE_BRANCH_TOOL_NAME
-        | GIT_PUSH_OWNED_TOOL_NAME => Err(internal_error(
+        | GIT_PUSH_OWNED_TOOL_NAME
+        | RUN_VALIDATION_TOOL_NAME => Err(internal_error(
             "asynchronous coding tools require asynchronous dispatch",
         )),
         _ => Err(invalid_arguments(format!(
@@ -1893,6 +1950,41 @@ fn workflow_complete_tool() -> Tool {
     .annotate(stateful_annotations("Complete coding workflow"))
 }
 
+fn run_validation_tool() -> Tool {
+    Tool::new(
+        RUN_VALIDATION_TOOL_NAME.to_string(),
+        "Run exactly one validation command id returned by coding__project_capabilities. The \
+         command is rediscovered before execution and runs through the bounded process policy. \
+         Results distinguish passed, failed, missing, unavailable, blocked, timed out, and \
+         incomplete checks and are automatically attached to an active testing workflow."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["command_id"],
+            "properties": {
+                "command_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Stable id from a current coding__project_capabilities result."
+                },
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_REPOSITORY_FILE_LIMIT,
+                    "default": DEFAULT_REPOSITORY_FILE_LIMIT
+                },
+                "timeout_seconds": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "default": null
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(mutation_annotations("Run discovered project validation"))
+}
+
 fn bounded_string_array_schema(min_items: usize) -> Value {
     serde_json::json!({
         "type": "array",
@@ -2141,6 +2233,55 @@ fn bounded_process_result(
     }
     Err(internal_error(
         "failed to fit coding process result within the configured output limit",
+    ))
+}
+
+fn bounded_validation_result(
+    mut execution: ValidationExecution,
+    output_limit: usize,
+) -> Result<CallToolResult, ErrorData> {
+    for _ in 0..40 {
+        let json = serialize_json(&execution)?;
+        if json.len() <= output_limit {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+        }
+        if let Some(output) = execution.output.as_mut() {
+            output.output_truncated = true;
+            if output.stdout.len() >= output.stderr.len() && !output.stdout.is_empty() {
+                let requested_len = output.stdout.len() / 2;
+                truncate_utf8(&mut output.stdout, requested_len);
+                continue;
+            }
+            if !output.stderr.is_empty() {
+                let requested_len = output.stderr.len() / 2;
+                truncate_utf8(&mut output.stderr, requested_len);
+                continue;
+            }
+        }
+        if let Some(command) = execution.command.as_mut() {
+            if !command.args.is_empty() {
+                command.args.clear();
+                continue;
+            }
+            if command.evidence.len() > 64 {
+                let requested_len = command.evidence.len() / 2;
+                truncate_utf8(&mut command.evidence, requested_len);
+                continue;
+            }
+        }
+        if let Some(reason) = execution.reason.as_mut() {
+            if reason.len() > 64 {
+                let requested_len = reason.len() / 2;
+                truncate_utf8(reason, requested_len);
+                continue;
+            }
+            execution.reason = None;
+            continue;
+        }
+        return Err(output_too_large(json.len(), output_limit));
+    }
+    Err(internal_error(
+        "failed to fit validation result within the configured output limit",
     ))
 }
 
@@ -2513,6 +2654,16 @@ struct WorkflowCompleteParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunValidationParams {
+    command_id: String,
+    #[serde(default = "default_repository_file_limit")]
+    max_files: usize,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct GitStatusParams {
     max_entries: usize,
@@ -2574,6 +2725,10 @@ fn default_max_results() -> usize {
 
 fn default_max_files() -> usize {
     SearchLimits::default().max_files
+}
+
+fn default_repository_file_limit() -> usize {
+    DEFAULT_REPOSITORY_FILE_LIMIT
 }
 
 fn default_max_file_bytes() -> usize {
@@ -2689,7 +2844,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 29);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -2705,6 +2860,7 @@ mod tests {
                     | GIT_COMMIT_OWNED_TOOL_NAME
                     | GIT_CREATE_BRANCH_TOOL_NAME
                     | GIT_PUSH_OWNED_TOOL_NAME
+                    | RUN_VALIDATION_TOOL_NAME
             );
             let stateful = matches!(
                 tool.name.as_ref(),
@@ -2917,6 +3073,26 @@ mod tests {
         assert_eq!(completed["validations"][0]["outcome"], "passed");
         assert!(completed["validations"][0].get("stdout").is_none());
         assert!(completed["validations"][0].get("stderr").is_none());
+    }
+
+    #[tokio::test]
+    async fn validation_tool_never_reports_an_unknown_command_as_passed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = execute_async(
+            &enabled_config(),
+            &CodingToolState::default(),
+            CallToolRequestParams::new(RUN_VALIDATION_TOOL_NAME).with_arguments(object!({
+                "command_id": "validation:unknown"
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert_eq!(json["status"], "not_present");
+        assert!(json["command"].is_null());
+        assert!(json["output"].is_null());
     }
 
     #[test]

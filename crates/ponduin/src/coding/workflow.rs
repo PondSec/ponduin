@@ -1,6 +1,7 @@
 use crate::coding::file::content_digest;
 use crate::coding::patch::MutationPreview;
 use crate::coding::process::ProcessOutput;
+use crate::coding::validation::{ValidationExecution, ValidationStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -202,16 +203,34 @@ impl CodingWorkflow {
         }
 
         let validation = ValidationEvidence::from_process(self.revision, program, args, output);
-        let failed = !validation.outcome.is_success();
+        self.accept_validation(validation)
+    }
+
+    pub fn record_validation_execution(
+        &mut self,
+        execution: &ValidationExecution,
+    ) -> Result<(), WorkflowError> {
+        if self.is_terminal() || self.phase != WorkflowPhase::Testing {
+            return Ok(());
+        }
+        self.accept_validation(ValidationEvidence::from_execution(self.revision, execution))
+    }
+
+    fn accept_validation(&mut self, validation: ValidationEvidence) -> Result<(), WorkflowError> {
+        let outcome = validation.outcome;
+        let failed = outcome.requires_repair();
         let diagnostic_fingerprint = validation.diagnostic_fingerprint.clone();
         let error_count = validation.error_count;
         self.validations.push(validation);
         if self.validations.len() > MAX_EVIDENCE_RECORDS {
             self.validations.remove(0);
         }
-        if !failed {
+        if outcome.is_success() {
             self.non_improving_failures = 0;
             self.last_error_count = Some(0);
+            return Ok(());
+        }
+        if !failed {
             return Ok(());
         }
 
@@ -276,7 +295,7 @@ impl CodingWorkflow {
                 }
                 if current
                     .iter()
-                    .any(|validation| !validation.outcome.is_success())
+                    .any(|validation| validation.outcome.requires_repair())
                 {
                     return Err(WorkflowError::ValidationFailed);
                 }
@@ -491,10 +510,10 @@ pub struct ChangeEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationEvidence {
     pub revision: u32,
-    pub program: String,
-    pub cwd: PathBuf,
-    pub argument_count: usize,
-    pub argument_fingerprint: String,
+    pub program: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub argument_count: Option<usize>,
+    pub argument_fingerprint: Option<String>,
     pub outcome: ValidationOutcome,
     pub exit_code: Option<i32>,
     pub duration_ms: u128,
@@ -522,15 +541,56 @@ impl ValidationEvidence {
         }
         Self {
             revision,
-            program: program.to_string(),
-            cwd: output.cwd.clone(),
-            argument_count: args.len(),
-            argument_fingerprint: content_digest(&argument_bytes),
+            program: Some(program.to_string()),
+            cwd: Some(output.cwd.clone()),
+            argument_count: Some(args.len()),
+            argument_fingerprint: Some(content_digest(&argument_bytes)),
             outcome,
             exit_code: output.exit_code,
             duration_ms: output.duration_ms,
             output_truncated: output.output_truncated,
             error_count: diagnostic_error_count(&diagnostics, output.success),
+            diagnostic_fingerprint: content_digest(diagnostics.as_bytes()),
+        }
+    }
+
+    fn from_execution(revision: u32, execution: &ValidationExecution) -> Self {
+        if let (Some(command), Some(output)) = (&execution.command, &execution.output) {
+            let mut evidence =
+                Self::from_process(revision, &command.program, &command.args, output);
+            evidence.outcome = ValidationOutcome::from(execution.status);
+            return evidence;
+        }
+
+        let (program, cwd, argument_count, argument_fingerprint) = execution
+            .command
+            .as_ref()
+            .map(|command| {
+                let mut argument_bytes = Vec::new();
+                for argument in &command.args {
+                    argument_bytes.extend_from_slice(argument.as_bytes());
+                    argument_bytes.push(0);
+                }
+                (
+                    Some(command.program.clone()),
+                    Some(command.cwd.clone()),
+                    Some(command.args.len()),
+                    Some(content_digest(&argument_bytes)),
+                )
+            })
+            .unwrap_or((None, None, None, None));
+        let diagnostics = execution.reason.as_deref().unwrap_or("");
+        Self {
+            revision,
+            program,
+            cwd,
+            argument_count,
+            argument_fingerprint,
+            outcome: ValidationOutcome::from(execution.status),
+            exit_code: None,
+            duration_ms: 0,
+            output_truncated: false,
+            error_count: 0,
             diagnostic_fingerprint: content_digest(diagnostics.as_bytes()),
         }
     }
@@ -541,6 +601,10 @@ impl ValidationEvidence {
 pub enum ValidationOutcome {
     Passed,
     Failed,
+    NotPresent,
+    NotExecutable,
+    Skipped,
+    Blocked,
     TimedOut,
     IncompleteOutput,
 }
@@ -548,6 +612,25 @@ pub enum ValidationOutcome {
 impl ValidationOutcome {
     fn is_success(self) -> bool {
         self == Self::Passed
+    }
+
+    fn requires_repair(self) -> bool {
+        self == Self::Failed
+    }
+}
+
+impl From<ValidationStatus> for ValidationOutcome {
+    fn from(status: ValidationStatus) -> Self {
+        match status {
+            ValidationStatus::Passed => Self::Passed,
+            ValidationStatus::Failed => Self::Failed,
+            ValidationStatus::NotPresent => Self::NotPresent,
+            ValidationStatus::NotExecutable => Self::NotExecutable,
+            ValidationStatus::Skipped => Self::Skipped,
+            ValidationStatus::Blocked => Self::Blocked,
+            ValidationStatus::TimedOut => Self::TimedOut,
+            ValidationStatus::IncompleteOutput => Self::IncompleteOutput,
+        }
     }
 }
 
@@ -875,5 +958,33 @@ mod tests {
 
         assert!(workflow.report().changed_files.is_empty());
         assert_eq!(workflow.phase(), WorkflowPhase::Editing);
+    }
+
+    #[test]
+    fn unavailable_validation_remains_explicitly_unverified() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change".to_string(), &preview("change"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_validation_execution(&ValidationExecution {
+                command: None,
+                status: ValidationStatus::NotPresent,
+                reason: Some("not discovered".to_string()),
+                output: None,
+            })
+            .unwrap();
+        workflow.begin_review().unwrap();
+        let report = workflow
+            .complete(
+                "implemented but validation was unavailable".to_string(),
+                vec!["validation command was not present".to_string()],
+            )
+            .unwrap();
+
+        assert!(!report.verified);
+        assert_eq!(report.validations[0].outcome, ValidationOutcome::NotPresent);
     }
 }
