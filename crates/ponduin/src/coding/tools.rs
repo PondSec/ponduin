@@ -9,6 +9,7 @@ use crate::coding::patch::{
     DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
 };
 use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner};
+use crate::coding::project::ProjectDiscovery;
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use rmcp::model::{
@@ -46,6 +47,7 @@ pub const REPOSITORY_MAP_TOOL_NAME: &str = "coding__repository_map";
 pub const SEARCH_SYMBOLS_TOOL_NAME: &str = "coding__search_symbols";
 pub const FIND_REFERENCES_TOOL_NAME: &str = "coding__find_references";
 pub const SELECT_CONTEXT_TOOL_NAME: &str = "coding__select_context";
+pub const PROJECT_CAPABILITIES_TOOL_NAME: &str = "coding__project_capabilities";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -328,6 +330,7 @@ pub fn definitions() -> Vec<Tool> {
         search_symbols_tool(),
         find_references_tool(),
         select_context_tool(),
+        project_capabilities_tool(),
     ]
 }
 
@@ -672,6 +675,17 @@ pub(crate) fn execute_with_state(
                 .context_candidates(&params.query, params.max_results)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&result, config.output_limit)
+        }
+        PROJECT_CAPABILITIES_TOOL_NAME => {
+            let params: RepositoryProfileParams = parse_arguments(&tool_call)?;
+            if params.max_files == 0 || params.max_files > MAX_REPOSITORY_FILE_LIMIT {
+                return Err(invalid_arguments(format!(
+                    "max_files must be between 1 and {MAX_REPOSITORY_FILE_LIMIT}"
+                )));
+            }
+            let capabilities = ProjectDiscovery::discover(&workspace, params.max_files)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&capabilities, config.output_limit)
         }
         RUN_PROCESS_TOOL_NAME
         | GIT_STATUS_TOOL_NAME
@@ -1259,6 +1273,29 @@ fn select_context_tool() -> Tool {
         }),
     )
     .annotate(read_only_annotations("Select repository context"))
+}
+
+fn project_capabilities_tool() -> Tool {
+    Tool::new(
+        PROJECT_CAPABILITIES_TOOL_NAME.to_string(),
+        "Detect nested polyglot projects, bounded dependency names, CI configuration, package \
+         managers, and evidence-backed build, test, lint, format, and typecheck commands. \
+         Manifests are treated as untrusted text and repository code is never executed."
+            .to_string(),
+        object!({
+            "type": "object",
+            "properties": {
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_REPOSITORY_FILE_LIMIT,
+                    "default": DEFAULT_REPOSITORY_FILE_LIMIT
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Detect project capabilities"))
 }
 
 fn intelligence_limits_schema() -> serde_json::Map<String, Value> {
@@ -1931,7 +1968,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -1966,6 +2003,41 @@ mod tests {
 
         assert_eq!(json["manifests"][0]["kind"], "cargo");
         assert_eq!(json["languages"]["rust"], 1);
+    }
+
+    #[test]
+    fn exposes_polyglot_project_capabilities_without_execution() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(temp_dir.path().join("web")).unwrap();
+        fs::write(
+            temp_dir.path().join("web/package.json"),
+            r#"{"scripts":{"test":"vitest"},"dependencies":{"react":"latest"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("web/pnpm-lock.yaml"),
+            "lockfileVersion: 9",
+        )
+        .unwrap();
+
+        let result = execute(
+            &enabled_config(),
+            CallToolRequestParams::new(PROJECT_CAPABILITIES_TOOL_NAME),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert_eq!(json["projects"][0]["ecosystem"], "node");
+        assert_eq!(json["projects"][0]["dependencies"][0], "react");
+        assert_eq!(
+            json["projects"][0]["validation_commands"][0]["program"],
+            "pnpm"
+        );
+        assert_eq!(
+            json["projects"][0]["validation_commands"][0]["args"],
+            serde_json::json!(["run", "test"])
+        );
     }
 
     #[test]
