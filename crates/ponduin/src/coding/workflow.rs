@@ -71,6 +71,12 @@ impl CodingWorkflow {
         )
     }
 
+    pub fn tracks_change(&self, change_id: &str) -> bool {
+        self.changes
+            .iter()
+            .any(|change| change.change_id == change_id && !change.rolled_back)
+    }
+
     pub fn note_repository_activity(&mut self) {
         if self.phase == WorkflowPhase::Analyzing {
             self.phase = WorkflowPhase::Searching;
