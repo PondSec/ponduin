@@ -4,11 +4,13 @@
 //! on MCP or platform-extension dispatch.
 
 pub mod config;
+pub mod instructions;
 pub mod repository;
 pub mod strategy;
 pub mod workspace;
 
 pub use config::CodingConfig;
+pub use instructions::RepositoryInstructions;
 pub use repository::RepositoryProfile;
 pub use strategy::CodingTaskMode;
 pub use workspace::CodingWorkspace;
