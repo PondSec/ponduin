@@ -2,6 +2,7 @@ use crate::coding::config::CodingConfig;
 use crate::coding::file::{
     FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
 };
+use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitRepository};
 use crate::coding::patch::{
     MutationBatch, MutationResult, PatchEngine, PatchLimits, RollbackRecord,
     DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
@@ -32,6 +33,9 @@ pub const PREVIEW_CHANGES_TOOL_NAME: &str = "coding__preview_changes";
 pub const APPLY_CHANGES_TOOL_NAME: &str = "coding__apply_changes";
 pub const ROLLBACK_CHANGES_TOOL_NAME: &str = "coding__rollback_changes";
 pub const RUN_PROCESS_TOOL_NAME: &str = "coding__run_process";
+pub const GIT_STATUS_TOOL_NAME: &str = "coding__git_status";
+pub const GIT_DIFF_TOOL_NAME: &str = "coding__git_diff";
+pub const GIT_HISTORY_TOOL_NAME: &str = "coding__git_history";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -89,6 +93,9 @@ pub fn definitions() -> Vec<Tool> {
         apply_changes_tool(),
         rollback_changes_tool(),
         run_process_tool(),
+        git_status_tool(),
+        git_diff_tool(),
+        git_history_tool(),
     ]
 }
 
@@ -96,11 +103,14 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with(CODING_TOOL_PREFIX)
 }
 
-pub fn is_process_tool(name: &str) -> bool {
-    name == RUN_PROCESS_TOOL_NAME
+pub fn is_async_tool(name: &str) -> bool {
+    matches!(
+        name,
+        RUN_PROCESS_TOOL_NAME | GIT_STATUS_TOOL_NAME | GIT_DIFF_TOOL_NAME | GIT_HISTORY_TOOL_NAME
+    )
 }
 
-pub async fn execute_process(
+pub async fn execute_async(
     config: &CodingConfig,
     tool_call: CallToolRequestParams,
     working_dir: &Path,
@@ -110,42 +120,81 @@ pub async fn execute_process(
             "internal coding tools are disabled for this task",
         ));
     }
-    if !is_process_tool(&tool_call.name) {
+    if !is_async_tool(&tool_call.name) {
         return Err(invalid_arguments(format!(
-            "`{}` is not an internal coding process tool",
+            "`{}` is not an asynchronous internal coding tool",
             tool_call.name
         )));
     }
 
     let workspace = CodingWorkspace::new(working_dir).map_err(invalid_workspace)?;
-    let params: RunProcessParams = parse_arguments(&tool_call)?;
-    let timeout = params
-        .timeout_seconds
-        .map(Duration::from_secs)
-        .unwrap_or(config.shell_timeout);
-    if timeout.is_zero() || timeout > config.shell_timeout {
-        return Err(invalid_arguments(format!(
-            "timeout_seconds must be between 1 and the configured coding shell timeout of {}",
-            config.shell_timeout.as_secs()
-        )));
+    match tool_call.name.as_ref() {
+        RUN_PROCESS_TOOL_NAME => {
+            let params: RunProcessParams = parse_arguments(&tool_call)?;
+            let timeout = params
+                .timeout_seconds
+                .map(Duration::from_secs)
+                .unwrap_or(config.shell_timeout);
+            if timeout.is_zero() || timeout > config.shell_timeout {
+                return Err(invalid_arguments(format!(
+                    "timeout_seconds must be between 1 and the configured coding shell timeout of {}",
+                    config.shell_timeout.as_secs()
+                )));
+            }
+            let request = ProcessRequest {
+                program: params.program,
+                args: params.args,
+                cwd: params.cwd,
+                environment: params.environment,
+            };
+            let output = ProcessRunner::new(
+                &workspace,
+                ProcessLimits {
+                    timeout,
+                    output_limit: config.output_limit,
+                },
+            )
+            .run(request)
+            .await
+            .map_err(|error| invalid_arguments(error.to_string()))?;
+            bounded_process_result(output, config.output_limit)
+        }
+        GIT_STATUS_TOOL_NAME => {
+            let params: GitStatusParams = parse_arguments(&tool_call)?;
+            let repository =
+                GitRepository::open(&workspace, git_limits(config, params.max_entries))
+                    .await
+                    .map_err(|error| invalid_arguments(error.to_string()))?;
+            let status = repository
+                .status()
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&status, config.output_limit)
+        }
+        GIT_DIFF_TOOL_NAME => {
+            let request: GitDiffRequest = parse_arguments(&tool_call)?;
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let diff = repository
+                .diff(request)
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            bounded_git_diff_result(diff, config.output_limit)
+        }
+        GIT_HISTORY_TOOL_NAME => {
+            let params: GitHistoryParams = parse_arguments(&tool_call)?;
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let history = repository
+                .history(params.max_entries)
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&history, config.output_limit)
+        }
+        _ => unreachable!("async coding tool name was checked"),
     }
-    let request = ProcessRequest {
-        program: params.program,
-        args: params.args,
-        cwd: params.cwd,
-        environment: params.environment,
-    };
-    let output = ProcessRunner::new(
-        &workspace,
-        ProcessLimits {
-            timeout,
-            output_limit: config.output_limit,
-        },
-    )
-    .run(request)
-    .await
-    .map_err(|error| invalid_arguments(error.to_string()))?;
-    bounded_process_result(output, config.output_limit)
 }
 
 #[cfg(test)]
@@ -280,8 +329,11 @@ pub(crate) fn execute_with_state(
             state.forget(&params.rollback_id);
             json_result(&result, config.output_limit)
         }
-        RUN_PROCESS_TOOL_NAME => Err(internal_error(
-            "coding process tools require asynchronous dispatch",
+        RUN_PROCESS_TOOL_NAME
+        | GIT_STATUS_TOOL_NAME
+        | GIT_DIFF_TOOL_NAME
+        | GIT_HISTORY_TOOL_NAME => Err(internal_error(
+            "asynchronous coding tools require asynchronous dispatch",
         )),
         _ => Err(invalid_arguments(format!(
             "unknown internal coding tool `{}`",
@@ -572,6 +624,84 @@ fn run_process_tool() -> Tool {
     .annotate(mutation_annotations("Run bounded coding process"))
 }
 
+fn git_status_tool() -> Tool {
+    Tool::new(
+        GIT_STATUS_TOOL_NAME.to_string(),
+        "Read the current Git branch, HEAD, upstream divergence, staged and unstaged status, \
+         conflicts, and untracked files. Repository roots outside the workspace are rejected. \
+         Configured executable content filters and fsmonitor hooks are disabled."
+            .to_string(),
+        object!({
+            "type": "object",
+            "properties": {
+                "max_entries": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100000,
+                    "default": 2000
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Inspect Git status"))
+}
+
+fn git_diff_tool() -> Tool {
+    Tool::new(
+        GIT_DIFF_TOOL_NAME.to_string(),
+        "Read a bounded unstaged or staged Git patch without external diff drivers, textconv, \
+         content filters, or submodule traversal. Sensitive files are omitted and reported. \
+         Optional paths are treated as literal workspace-relative paths."
+            .to_string(),
+        object!({
+            "type": "object",
+            "properties": {
+                "staged": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "maxItems": 200,
+                    "default": []
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000,
+                    "default": 3
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Read safe Git diff"))
+}
+
+fn git_history_tool() -> Tool {
+    Tool::new(
+        GIT_HISTORY_TOOL_NAME.to_string(),
+        "Read bounded local Git commit history with commit ids, author, timestamp, and subject. \
+         Does not contact remotes or execute repository hooks."
+            .to_string(),
+        object!({
+            "type": "object",
+            "properties": {
+                "max_entries": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Read Git history"))
+}
+
 fn mutation_batch_schema() -> serde_json::Map<String, Value> {
     object!({
         "type": "object",
@@ -682,6 +812,14 @@ fn patch_limits(config: &CodingConfig) -> PatchLimits {
     }
 }
 
+fn git_limits(config: &CodingConfig, max_status_entries: usize) -> GitLimits {
+    GitLimits {
+        timeout: config.shell_timeout,
+        output_limit: config.output_limit,
+        max_status_entries,
+    }
+}
+
 fn parse_arguments<T>(tool_call: &CallToolRequestParams) -> Result<T, ErrorData>
 where
     T: DeserializeOwned,
@@ -736,6 +874,27 @@ fn bounded_process_result(
     }
     Err(internal_error(
         "failed to fit coding process result within the configured output limit",
+    ))
+}
+
+fn bounded_git_diff_result(
+    mut diff: GitDiff,
+    output_limit: usize,
+) -> Result<CallToolResult, ErrorData> {
+    for _ in 0..32 {
+        let json = serialize_json(&diff)?;
+        if json.len() <= output_limit {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+        }
+        if diff.patch.is_empty() {
+            return Err(output_too_large(json.len(), output_limit));
+        }
+        diff.truncated = true;
+        let requested_len = diff.patch.len() / 2;
+        truncate_utf8(&mut diff.patch, requested_len);
+    }
+    Err(internal_error(
+        "failed to fit Git diff within the configured output limit",
     ))
 }
 
@@ -878,6 +1037,30 @@ struct RunProcessParams {
     timeout_seconds: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GitStatusParams {
+    max_entries: usize,
+}
+
+impl Default for GitStatusParams {
+    fn default() -> Self {
+        Self { max_entries: 2_000 }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GitHistoryParams {
+    max_entries: usize,
+}
+
+impl Default for GitHistoryParams {
+    fn default() -> Self {
+        Self { max_entries: 20 }
+    }
+}
+
 fn default_path() -> PathBuf {
     PathBuf::from(".")
 }
@@ -907,6 +1090,7 @@ mod tests {
     use super::*;
     use crate::coding::CodingTaskMode;
     use std::fs;
+    use std::process::Command;
 
     fn enabled_config() -> CodingConfig {
         CodingConfig {
@@ -925,10 +1109,25 @@ mod tests {
             .clone()
     }
 
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 12);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -1130,7 +1329,7 @@ mod tests {
             "timeout_seconds": 2
         }));
 
-        let result = execute_process(&enabled_config(), call, temp_dir.path())
+        let result = execute_async(&enabled_config(), call, temp_dir.path())
             .await
             .unwrap();
         let json: Value = serde_json::from_str(&result_text(result)).unwrap();
@@ -1155,10 +1354,10 @@ mod tests {
             "timeout_seconds": 121
         }));
 
-        let blocked_error = execute_process(&enabled_config(), blocked, temp_dir.path())
+        let blocked_error = execute_async(&enabled_config(), blocked, temp_dir.path())
             .await
             .unwrap_err();
-        let timeout_error = execute_process(&enabled_config(), excessive, temp_dir.path())
+        let timeout_error = execute_async(&enabled_config(), excessive, temp_dir.path())
             .await
             .unwrap_err();
 
@@ -1192,5 +1391,59 @@ mod tests {
 
         assert!(text.len() <= 1_024);
         assert_eq!(json["output_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn exposes_safe_git_status_diff_and_history_tools() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        run_git(temp_dir.path(), &["init"]);
+        run_git(temp_dir.path(), &["config", "user.name", "Test User"]);
+        run_git(
+            temp_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        fs::write(temp_dir.path().join("app.txt"), "before\n").unwrap();
+        run_git(temp_dir.path(), &["add", "--", "app.txt"]);
+        run_git(temp_dir.path(), &["commit", "-m", "initial"]);
+        fs::write(temp_dir.path().join("app.txt"), "after\n").unwrap();
+
+        let status = execute_async(
+            &enabled_config(),
+            CallToolRequestParams::new(GIT_STATUS_TOOL_NAME),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let status_json: Value = serde_json::from_str(&result_text(status)).unwrap();
+        assert!(status_json["changes"]
+            .as_array()
+            .is_some_and(|changes| changes.iter().any(|change| change["path"] == "app.txt")));
+
+        let diff = execute_async(
+            &enabled_config(),
+            CallToolRequestParams::new(GIT_DIFF_TOOL_NAME).with_arguments(object!({
+                "paths": ["app.txt"],
+                "context_lines": 1
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let diff_json: Value = serde_json::from_str(&result_text(diff)).unwrap();
+        assert!(diff_json["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("+after")));
+
+        let history = execute_async(
+            &enabled_config(),
+            CallToolRequestParams::new(GIT_HISTORY_TOOL_NAME).with_arguments(object!({
+                "max_entries": 5
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let history_json: Value = serde_json::from_str(&result_text(history)).unwrap();
+        assert_eq!(history_json["commits"][0]["subject"], "initial");
     }
 }

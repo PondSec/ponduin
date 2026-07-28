@@ -72,8 +72,8 @@ impl CodingAgent {
                 None,
             ));
         }
-        if tools::is_process_tool(&tool_call.name) {
-            return tools::execute_process(&self.config, tool_call, working_dir).await;
+        if tools::is_async_tool(&tool_call.name) {
+            return tools::execute_async(&self.config, tool_call, working_dir).await;
         }
 
         let config = self.config.clone();
@@ -118,9 +118,9 @@ mod tests {
         let agent = enabled_agent();
 
         assert!(agent.tools(PonduinMode::Chat).is_empty());
-        assert_eq!(agent.tool_count(PonduinMode::Auto), 9);
-        assert_eq!(agent.tool_count(PonduinMode::Approve), 9);
-        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 9);
+        assert_eq!(agent.tool_count(PonduinMode::Auto), 12);
+        assert_eq!(agent.tool_count(PonduinMode::Approve), 12);
+        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 12);
     }
 
     #[test]
