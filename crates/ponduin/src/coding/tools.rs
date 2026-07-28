@@ -1,5 +1,6 @@
 use crate::coding::config::CodingConfig;
-use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile};
+use crate::coding::search::{SearchLimits, TextSearchRequest};
+use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool,
     ToolAnnotations,
@@ -13,12 +14,19 @@ use std::path::{Path, PathBuf};
 pub const CODING_TOOL_PREFIX: &str = "coding__";
 pub const REPOSITORY_PROFILE_TOOL_NAME: &str = "coding__repository_profile";
 pub const REPOSITORY_INSTRUCTIONS_TOOL_NAME: &str = "coding__repository_instructions";
+pub const FIND_FILES_TOOL_NAME: &str = "coding__find_files";
+pub const SEARCH_TEXT_TOOL_NAME: &str = "coding__search_text";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
 
 pub fn definitions() -> Vec<Tool> {
-    vec![repository_profile_tool(), repository_instructions_tool()]
+    vec![
+        repository_profile_tool(),
+        repository_instructions_tool(),
+        find_files_tool(),
+        search_text_tool(),
+    ]
 }
 
 pub fn is_reserved_name(name: &str) -> bool {
@@ -54,6 +62,38 @@ pub fn execute(
             let instructions = RepositoryInstructions::load_for_path(&workspace, params.path)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&instructions)
+        }
+        FIND_FILES_TOOL_NAME => {
+            let params: FindFilesParams = parse_arguments(&tool_call)?;
+            let limits = SearchLimits {
+                max_results: params.max_results,
+                max_files: params.max_files,
+                ..SearchLimits::default()
+            };
+            let result = RepositorySearch::new(&workspace)
+                .find_files(&params.query, params.scope, limits)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&result)
+        }
+        SEARCH_TEXT_TOOL_NAME => {
+            let params: SearchTextParams = parse_arguments(&tool_call)?;
+            let limits = SearchLimits {
+                max_results: params.max_results,
+                max_files: params.max_files,
+                max_file_bytes: params.max_file_bytes,
+                max_line_bytes: params.max_line_bytes,
+            };
+            let request = TextSearchRequest {
+                pattern: params.pattern,
+                scope: params.scope,
+                regex: params.regex,
+                case_sensitive: params.case_sensitive,
+                include: params.include,
+            };
+            let result = RepositorySearch::new(&workspace)
+                .search_text(&request, limits)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&result)
         }
         _ => Err(invalid_arguments(format!(
             "unknown internal coding tool `{}`",
@@ -107,6 +147,109 @@ fn repository_instructions_tool() -> Tool {
     .annotate(read_only_annotations("Read repository coding instructions"))
 }
 
+fn find_files_tool() -> Tool {
+    Tool::new(
+        FIND_FILES_TOOL_NAME.to_string(),
+        "Find workspace-relative file paths by a case-insensitive substring. Respects repository \
+         ignore files, does not follow symlinks, and returns explicit scan and truncation state."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Case-insensitive substring to match against relative paths."
+                },
+                "scope": {
+                    "type": "string",
+                    "default": ".",
+                    "description": "Existing workspace-relative file or directory."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 200
+                },
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100000,
+                    "default": 50000
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Find coding files"))
+}
+
+fn search_text_tool() -> Tool {
+    Tool::new(
+        SEARCH_TEXT_TOOL_NAME.to_string(),
+        "Search bounded UTF-8 source text inside the workspace using a literal or Rust regular \
+         expression. Respects ignore files, skips binary, oversized, and sensitive files, and \
+         returns line, column, matched text, line text, and truncation evidence."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["pattern"],
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "scope": {
+                    "type": "string",
+                    "default": "."
+                },
+                "regex": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "include": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                    "description": "Optional glob patterns matched against workspace-relative paths."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 200
+                },
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100000,
+                    "default": 50000
+                },
+                "max_file_bytes": {
+                    "type": "integer",
+                    "minimum": 8192,
+                    "maximum": 10485760,
+                    "default": 2097152
+                },
+                "max_line_bytes": {
+                    "type": "integer",
+                    "minimum": 128,
+                    "maximum": 65536,
+                    "default": 4096
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Search coding text"))
+}
+
 fn read_only_annotations(title: &str) -> ToolAnnotations {
     ToolAnnotations::with_title(title.to_string())
         .read_only(true)
@@ -117,13 +260,12 @@ fn read_only_annotations(title: &str) -> ToolAnnotations {
 
 fn parse_arguments<T>(tool_call: &CallToolRequestParams) -> Result<T, ErrorData>
 where
-    T: DeserializeOwned + Default,
+    T: DeserializeOwned,
 {
-    match tool_call.arguments.clone() {
-        Some(arguments) => serde_json::from_value(Value::Object(arguments))
-            .map_err(|error| invalid_arguments(error.to_string())),
-        None => Ok(T::default()),
-    }
+    serde_json::from_value(Value::Object(
+        tool_call.arguments.clone().unwrap_or_default(),
+    ))
+    .map_err(|error| invalid_arguments(error.to_string()))
 }
 
 fn json_result(value: &impl serde::Serialize) -> Result<CallToolResult, ErrorData> {
@@ -176,6 +318,60 @@ impl Default for RepositoryInstructionsParams {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindFilesParams {
+    query: String,
+    #[serde(default = "default_path")]
+    scope: PathBuf,
+    #[serde(default = "default_max_results")]
+    max_results: usize,
+    #[serde(default = "default_max_files")]
+    max_files: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchTextParams {
+    pattern: String,
+    #[serde(default = "default_path")]
+    scope: PathBuf,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default)]
+    include: Vec<String>,
+    #[serde(default = "default_max_results")]
+    max_results: usize,
+    #[serde(default = "default_max_files")]
+    max_files: usize,
+    #[serde(default = "default_max_file_bytes")]
+    max_file_bytes: usize,
+    #[serde(default = "default_max_line_bytes")]
+    max_line_bytes: usize,
+}
+
+fn default_path() -> PathBuf {
+    PathBuf::from(".")
+}
+
+fn default_max_results() -> usize {
+    SearchLimits::default().max_results
+}
+
+fn default_max_files() -> usize {
+    SearchLimits::default().max_files
+}
+
+fn default_max_file_bytes() -> usize {
+    SearchLimits::default().max_file_bytes
+}
+
+fn default_max_line_bytes() -> usize {
+    SearchLimits::default().max_line_bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,7 +398,7 @@ mod tests {
     #[test]
     fn definitions_are_internal_read_only_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 4);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -251,5 +447,39 @@ mod tests {
         let error = execute(&CodingConfig::default(), call, temp_dir.path()).unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    }
+
+    #[test]
+    fn executes_bounded_text_search() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(temp_dir.path().join("src")).unwrap();
+        fs::write(
+            temp_dir.path().join("src/lib.rs"),
+            "pub fn internal_agent() {}",
+        )
+        .unwrap();
+        let call = CallToolRequestParams::new(SEARCH_TEXT_TOOL_NAME).with_arguments(object!({
+            "pattern": "internal_agent",
+            "include": ["**/*.rs"],
+            "max_results": 10
+        }));
+
+        let result = execute(&enabled_config(), call, temp_dir.path()).unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert_eq!(json["matches"][0]["path"], "src/lib.rs");
+        assert_eq!(json["matches"][0]["line"], 1);
+        assert_eq!(json["truncated"], false);
+    }
+
+    #[test]
+    fn required_search_arguments_fail_closed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let call = CallToolRequestParams::new(FIND_FILES_TOOL_NAME);
+
+        let error = execute(&enabled_config(), call, temp_dir.path()).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("missing field `query`"));
     }
 }
