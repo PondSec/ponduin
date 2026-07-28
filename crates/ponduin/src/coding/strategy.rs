@@ -45,6 +45,48 @@ impl CodingTaskMode {
     pub const fn enables_coding_tools(self) -> bool {
         !matches!(self, Self::General)
     }
+
+    pub const fn prompt_guidance(self) -> &'static str {
+        match self {
+            Self::General => "Use the general agent workflow.",
+            Self::Coding => {
+                "Implement the requested behavior in small coherent patches, follow existing \
+                 architecture and style, add meaningful regression coverage, and validate the \
+                 narrowest relevant checks after each step."
+            }
+            Self::Debugging => {
+                "Separate symptoms from causes. Parse diagnostics, locate related symbols and \
+                 callers, state a falsifiable hypothesis, test it with the smallest targeted \
+                 check, and change code only when evidence supports the hypothesis."
+            }
+            Self::Refactoring => {
+                "Establish behavior-preserving baseline checks before editing, keep public APIs \
+                 compatible unless explicitly requested, make reversible structural steps, and \
+                 rerun the same checks after every step."
+            }
+            Self::RepositoryAnalysis => {
+                "Remain read-only unless the user explicitly requests implementation. Map \
+                 components, entry points, dependencies, call relationships, build and test \
+                 paths, risks, and unknowns with file-backed evidence."
+            }
+            Self::TestGeneration => {
+                "Detect and reuse the repository's existing test framework and conventions. Add \
+                 behavior-focused success, boundary, failure, and regression cases without \
+                 introducing a competing test architecture or tests tied only to implementation \
+                 details."
+            }
+            Self::Documentation => {
+                "Verify names, commands, configuration keys, and examples against repository \
+                 sources. Match the existing documentation structure and do not claim behavior \
+                 that has not been implemented and tested."
+            }
+            Self::Review => {
+                "Do not edit by default. Inspect local diffs and relevant surrounding code, then \
+                 report only actionable findings ordered by severity with exact file and line, \
+                 impact, and a concise remediation; explicitly say when no finding is proven."
+            }
+        }
+    }
 }
 
 impl fmt::Display for CodingTaskMode {
@@ -91,5 +133,21 @@ mod tests {
             .into_iter()
             .filter(|mode| mode.enables_coding_tools())
             .all(|mode| mode != CodingTaskMode::General));
+    }
+
+    #[test]
+    fn every_coding_mode_has_specific_nonempty_guidance() {
+        let guidance = CodingTaskMode::ALL
+            .into_iter()
+            .map(CodingTaskMode::prompt_guidance)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(guidance.len(), CodingTaskMode::ALL.len());
+        assert!(CodingTaskMode::Debugging
+            .prompt_guidance()
+            .contains("hypothesis"));
+        assert!(CodingTaskMode::Review
+            .prompt_guidance()
+            .contains("file and line"));
     }
 }

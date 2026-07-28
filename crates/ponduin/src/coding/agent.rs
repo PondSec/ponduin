@@ -62,9 +62,10 @@ impl CodingAgent {
              require the internal workflow: start, inspect/search, set a complete plan, begin \
              editing, apply bounded changes, begin validation, run actual checks, begin review, \
              then complete with the evidence-backed report. Never claim a check passed from model \
-             text; process results are recorded automatically. {}",
+             text; process results are recorded automatically. Mode-specific strategy: {} {}",
             self.config.task_mode,
             self.config.plan_file_threshold,
+            self.config.task_mode.prompt_guidance(),
             capabilities.prompt_guidance()
         ))
     }
@@ -151,6 +152,7 @@ mod tests {
         assert!(prompt.contains("hard security denials still apply"));
         assert!(prompt.contains("evidence-backed report"));
         assert!(prompt.contains("Never claim a check passed"));
+        assert!(prompt.contains("Mode-specific strategy"));
         assert!(prompt.contains("Model capability profile"));
     }
 
