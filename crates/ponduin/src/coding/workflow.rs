@@ -539,6 +539,15 @@ impl ValidationEvidence {
             argument_bytes.extend_from_slice(argument.as_bytes());
             argument_bytes.push(0);
         }
+        let error_count = output
+            .diagnostics
+            .error_count
+            .max(diagnostic_error_count(&diagnostics, output.success));
+        let diagnostic_fingerprint = if output.diagnostics.diagnostics.is_empty() {
+            content_digest(diagnostics.as_bytes())
+        } else {
+            output.diagnostics.fingerprint.clone()
+        };
         Self {
             revision,
             program: Some(program.to_string()),
@@ -549,8 +558,8 @@ impl ValidationEvidence {
             exit_code: output.exit_code,
             duration_ms: output.duration_ms,
             output_truncated: output.output_truncated,
-            error_count: diagnostic_error_count(&diagnostics, output.success),
-            diagnostic_fingerprint: content_digest(diagnostics.as_bytes()),
+            error_count,
+            diagnostic_fingerprint,
         }
     }
 
@@ -836,6 +845,7 @@ mod tests {
             output_truncated: false,
             background_process_detected: false,
             output_collection_error: None,
+            diagnostics: crate::coding::diagnostic::DiagnosticReport::default(),
             duration_ms: 5,
         }
     }

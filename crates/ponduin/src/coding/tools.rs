@@ -2224,6 +2224,10 @@ fn bounded_process_result(
             } else {
                 output.output_collection_error = None;
             }
+        } else if !output.diagnostics.diagnostics.is_empty() {
+            output.diagnostics.truncated = true;
+            let retained = output.diagnostics.diagnostics.len() / 2;
+            output.diagnostics.diagnostics.truncate(retained);
         } else if !output.program.is_empty() || output.cwd != Path::new(".") {
             output.program.clear();
             output.cwd = PathBuf::from(".");
@@ -2255,6 +2259,12 @@ fn bounded_validation_result(
             if !output.stderr.is_empty() {
                 let requested_len = output.stderr.len() / 2;
                 truncate_utf8(&mut output.stderr, requested_len);
+                continue;
+            }
+            if !output.diagnostics.diagnostics.is_empty() {
+                output.diagnostics.truncated = true;
+                let retained = output.diagnostics.diagnostics.len() / 2;
+                output.diagnostics.diagnostics.truncate(retained);
                 continue;
             }
         }
@@ -3457,6 +3467,7 @@ mod tests {
             output_truncated: false,
             background_process_detected: false,
             output_collection_error: None,
+            diagnostics: crate::coding::diagnostic::DiagnosticReport::default(),
             duration_ms: 1,
         };
 

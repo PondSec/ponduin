@@ -1,3 +1,4 @@
+use crate::coding::diagnostic::{DiagnosticAnalyzer, DiagnosticReport};
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
 use crate::subprocess::configure_subprocess;
 use serde::{Deserialize, Serialize};
@@ -144,14 +145,17 @@ impl<'workspace> ProcessRunner<'workspace> {
             && !timed_out
             && output_collection_error.is_empty();
 
+        let stdout_text = String::from_utf8_lossy(&stdout.bytes).into_owned();
+        let stderr_text = String::from_utf8_lossy(&stderr.bytes).into_owned();
+        let diagnostics = DiagnosticAnalyzer::analyze(self.workspace, &stdout_text, &stderr_text);
         Ok(ProcessOutput {
             program: validated.display_program,
             cwd: validated.relative_cwd,
             exit_code: status.as_ref().and_then(ExitStatus::code),
             success,
             timed_out,
-            stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+            stdout: stdout_text,
+            stderr: stderr_text,
             stdout_lossy: std::str::from_utf8(&stdout.bytes).is_err(),
             stderr_lossy: std::str::from_utf8(&stderr.bytes).is_err(),
             output_truncated: stdout.truncated || stderr.truncated,
@@ -161,6 +165,7 @@ impl<'workspace> ProcessRunner<'workspace> {
             } else {
                 Some(output_collection_error.join("; "))
             },
+            diagnostics,
             duration_ms: started.elapsed().as_millis(),
         })
     }
@@ -259,6 +264,8 @@ pub struct ProcessOutput {
     pub output_truncated: bool,
     pub background_process_detected: bool,
     pub output_collection_error: Option<String>,
+    #[serde(default)]
+    pub diagnostics: DiagnosticReport,
     pub duration_ms: u128,
 }
 
@@ -717,6 +724,25 @@ mod tests {
             cwd: PathBuf::from("."),
             environment: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn attaches_structured_diagnostics_to_process_output() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+
+        let output = runner(&workspace, Duration::from_secs(5), 16 * 1_024)
+            .run(request("rustc", &["--definitely-not-a-valid-rustc-option"]))
+            .await
+            .unwrap();
+
+        assert!(!output.success);
+        assert!(output.diagnostics.error_count >= 1);
+        assert!(output
+            .diagnostics
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.is_empty()));
     }
 
     #[cfg(not(windows))]
