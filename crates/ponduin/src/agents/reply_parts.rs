@@ -267,6 +267,10 @@ impl Agent {
             .with_hints(working_dir)
             .with_ponduin_mode(ponduin_mode)
             .build();
+        if let Some(coding_prompt) = self.coding_agent.system_prompt(ponduin_mode) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&coding_prompt);
+        }
 
         // Handle toolshim if enabled
         let mut toolshim_tools = vec![];

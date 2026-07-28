@@ -27,6 +27,7 @@ use crate::agents::platform_tools::PLATFORM_MANAGE_SCHEDULE_TOOL_NAME;
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::types::{FrontendTool, SessionConfig, SharedProvider, ToolResultReceiver};
+use crate::coding::{CodingAgent, CodingConfig};
 use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
 use crate::config::{get_enabled_extensions, Config, PonduinMode};
@@ -186,6 +187,7 @@ pub struct AgentConfig {
     pub mcp_host_info: Option<PonduinMcpHostInfo>,
     pub session_name_update_tx: Option<mpsc::UnboundedSender<SessionNameUpdate>>,
     pub use_login_shell_path: Option<bool>,
+    pub coding_config: Option<CodingConfig>,
 }
 
 impl AgentConfig {
@@ -207,6 +209,7 @@ impl AgentConfig {
             mcp_host_info: None,
             session_name_update_tx: None,
             use_login_shell_path: None,
+            coding_config: None,
         }
     }
 
@@ -228,6 +231,11 @@ impl AgentConfig {
         self
     }
 
+    pub fn with_coding_config(mut self, coding_config: CodingConfig) -> Self {
+        self.coding_config = Some(coding_config);
+        self
+    }
+
     fn resolve_use_login_shell_path(&self) -> bool {
         resolve_use_login_shell_path(self.use_login_shell_path, &self.ponduin_platform)
     }
@@ -242,6 +250,7 @@ pub struct Agent {
     pub(super) provider: SharedProvider,
     pub config: AgentConfig,
     pub(super) current_ponduin_mode: Mutex<PonduinMode>,
+    pub(super) coding_agent: CodingAgent,
 
     pub extension_manager: Arc<ExtensionManager>,
     pub(super) final_output_tool: Arc<Mutex<Option<FinalOutputTool>>>,
@@ -386,10 +395,17 @@ impl Agent {
         let inspection_session_manager = Arc::clone(&config.session_manager);
         let permission_manager = Arc::clone(&config.permission_manager);
         let use_login_shell_path = config.resolve_use_login_shell_path();
+        let coding_config = config.coding_config.clone().unwrap_or_else(|| {
+            CodingConfig::from_config(Config::global()).unwrap_or_else(|error| {
+                warn!("Invalid internal coding-agent configuration: {error}");
+                CodingConfig::default()
+            })
+        });
         Self {
             provider: provider.clone(),
             config,
             current_ponduin_mode: Mutex::new(initial_mode),
+            coding_agent: CodingAgent::new(coding_config),
             extension_manager: Arc::new(ExtensionManager::new(
                 provider.clone(),
                 session_manager,
@@ -1030,7 +1046,11 @@ impl Agent {
 
         (
             extension_count + self.frontend_extensions.lock().await.len(),
-            tool_count + self.frontend_tools.lock().await.len(),
+            tool_count
+                + self.frontend_tools.lock().await.len()
+                + self
+                    .coding_agent
+                    .tool_count(*self.current_ponduin_mode.lock().await),
         )
     }
 
@@ -1156,6 +1176,21 @@ impl Agent {
                     )),
                 )
             };
+        }
+
+        if crate::coding::tools::is_reserved_name(&tool_call.name) {
+            let result = self
+                .coding_agent
+                .execute(
+                    session.ponduin_mode,
+                    tool_call.clone(),
+                    &session.working_dir,
+                )
+                .await;
+            return (
+                request_id,
+                Ok(self.with_post_tool_hook(ToolCallResult::from(result), &tool_call, session)),
+            );
         }
 
         let ctx = super::tool_execution::ToolCallContext::new(
@@ -1469,6 +1504,10 @@ impl Agent {
         }
 
         if extension_name.is_none() {
+            prefixed_tools.extend(
+                self.coding_agent
+                    .tools(*self.current_ponduin_mode.lock().await),
+            );
             if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
                 prefixed_tools.push(final_output_tool.tool());
             }
@@ -3493,6 +3532,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::CodingTaskMode;
     use crate::permission::permission_confirmation::PrincipalType;
     use crate::plugins::discovery::{DiscoveredPlugin, PluginScope};
     use crate::providers::base::{stream_from_single_message, MessageStream, PermissionRouting};
@@ -4259,6 +4299,87 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         let final_output_tool_system_prompt =
             final_output_tool_ref.as_ref().unwrap().system_prompt();
         assert!(system_prompt.contains(&final_output_tool_system_prompt));
+        Ok(())
+    }
+
+    fn coding_test_config(
+        temp_dir: &TempDir,
+        mode: PonduinMode,
+    ) -> (AgentConfig, Arc<SessionManager>) {
+        let session_manager = Arc::new(SessionManager::new(temp_dir.path().join("data")));
+        let permission_manager = Arc::new(PermissionManager::new(temp_dir.path().join("config")));
+        let coding_config = CodingConfig {
+            enabled: true,
+            task_mode: CodingTaskMode::Coding,
+            ..CodingConfig::default()
+        };
+        (
+            AgentConfig::new(
+                session_manager.clone(),
+                permission_manager,
+                None,
+                mode,
+                false,
+                PonduinPlatform::PonduinCli,
+            )
+            .with_coding_config(coding_config),
+            session_manager,
+        )
+    }
+
+    #[tokio::test]
+    async fn internal_coding_tools_are_listed_without_an_extension() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let (config, _) = coding_test_config(&temp_dir, PonduinMode::Auto);
+        let agent = Agent::with_config(config);
+
+        let all_tools = agent.list_tools("test-session", None).await;
+        let extension_tools = agent
+            .list_tools("test-session", Some("coding".to_string()))
+            .await;
+
+        assert!(all_tools
+            .iter()
+            .any(|tool| tool.name == crate::coding::tools::REPOSITORY_PROFILE_TOOL_NAME));
+        assert!(
+            extension_tools.is_empty(),
+            "internal coding tools must not appear as an extension"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn internal_coding_tool_dispatch_bypasses_extension_resolution() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]")?;
+        let (config, session_manager) = coding_test_config(&temp_dir, PonduinMode::Auto);
+        let agent = Agent::with_config(config);
+        let session = session_manager
+            .create_session(
+                workspace,
+                "coding dispatch".to_string(),
+                SessionType::User,
+                PonduinMode::Auto,
+            )
+            .await?;
+
+        let (request_id, result) = agent
+            .dispatch_tool_call(
+                CallToolRequestParams::new(crate::coding::tools::REPOSITORY_PROFILE_TOOL_NAME),
+                "coding-request".to_string(),
+                None,
+                &session,
+            )
+            .await;
+        let result = result?.result.await?;
+        let text = result.content[0]
+            .as_text()
+            .expect("coding profile should return JSON text");
+
+        assert_eq!(request_id, "coding-request");
+        assert!(text.text.contains("\"kind\": \"cargo\""));
         Ok(())
     }
 
