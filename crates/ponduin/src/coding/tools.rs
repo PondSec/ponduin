@@ -6,6 +6,7 @@ use crate::coding::patch::{
     MutationBatch, MutationResult, PatchEngine, PatchLimits, RollbackRecord,
     DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
 };
+use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use rmcp::model::{
@@ -19,6 +20,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 pub const CODING_TOOL_PREFIX: &str = "coding__";
 pub const REPOSITORY_PROFILE_TOOL_NAME: &str = "coding__repository_profile";
@@ -29,6 +31,7 @@ pub const READ_FILE_TOOL_NAME: &str = "coding__read_file";
 pub const PREVIEW_CHANGES_TOOL_NAME: &str = "coding__preview_changes";
 pub const APPLY_CHANGES_TOOL_NAME: &str = "coding__apply_changes";
 pub const ROLLBACK_CHANGES_TOOL_NAME: &str = "coding__rollback_changes";
+pub const RUN_PROCESS_TOOL_NAME: &str = "coding__run_process";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -85,11 +88,64 @@ pub fn definitions() -> Vec<Tool> {
         preview_changes_tool(),
         apply_changes_tool(),
         rollback_changes_tool(),
+        run_process_tool(),
     ]
 }
 
 pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with(CODING_TOOL_PREFIX)
+}
+
+pub fn is_process_tool(name: &str) -> bool {
+    name == RUN_PROCESS_TOOL_NAME
+}
+
+pub async fn execute_process(
+    config: &CodingConfig,
+    tool_call: CallToolRequestParams,
+    working_dir: &Path,
+) -> Result<CallToolResult, ErrorData> {
+    if !config.tools_enabled() {
+        return Err(tool_unavailable(
+            "internal coding tools are disabled for this task",
+        ));
+    }
+    if !is_process_tool(&tool_call.name) {
+        return Err(invalid_arguments(format!(
+            "`{}` is not an internal coding process tool",
+            tool_call.name
+        )));
+    }
+
+    let workspace = CodingWorkspace::new(working_dir).map_err(invalid_workspace)?;
+    let params: RunProcessParams = parse_arguments(&tool_call)?;
+    let timeout = params
+        .timeout_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(config.shell_timeout);
+    if timeout.is_zero() || timeout > config.shell_timeout {
+        return Err(invalid_arguments(format!(
+            "timeout_seconds must be between 1 and the configured coding shell timeout of {}",
+            config.shell_timeout.as_secs()
+        )));
+    }
+    let request = ProcessRequest {
+        program: params.program,
+        args: params.args,
+        cwd: params.cwd,
+        environment: params.environment,
+    };
+    let output = ProcessRunner::new(
+        &workspace,
+        ProcessLimits {
+            timeout,
+            output_limit: config.output_limit,
+        },
+    )
+    .run(request)
+    .await
+    .map_err(|error| invalid_arguments(error.to_string()))?;
+    bounded_process_result(output, config.output_limit)
 }
 
 #[cfg(test)]
@@ -224,6 +280,9 @@ pub(crate) fn execute_with_state(
             state.forget(&params.rollback_id);
             json_result(&result, config.output_limit)
         }
+        RUN_PROCESS_TOOL_NAME => Err(internal_error(
+            "coding process tools require asynchronous dispatch",
+        )),
         _ => Err(invalid_arguments(format!(
             "unknown internal coding tool `{}`",
             tool_call.name
@@ -462,6 +521,57 @@ fn rollback_changes_tool() -> Tool {
     .annotate(mutation_annotations("Roll back coding changes"))
 }
 
+fn run_process_tool() -> Tool {
+    Tool::new(
+        RUN_PROCESS_TOOL_NAME.to_string(),
+        "Run one bounded, non-interactive development process in the workspace using an executable \
+         plus a literal argument array. Shell syntax is never evaluated. The environment is \
+         cleared and rebuilt from a small safe baseline plus allowlisted overrides. Git, shells, \
+         recursive deletion, privilege escalation, network clients, deployment tools, and host \
+         administration commands are blocked in favor of dedicated safer workflows. Captures \
+         stdout and stderr separately, enforces timeout and combined output limits, and terminates \
+         lingering process groups."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["program"],
+            "properties": {
+                "program": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Executable name from PATH or an existing workspace-relative executable path."
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 256,
+                    "default": [],
+                    "description": "Literal argv entries. Do not use shell quoting, pipes, redirects, substitutions, or chaining."
+                },
+                "cwd": {
+                    "type": "string",
+                    "default": ".",
+                    "description": "Existing workspace-relative working directory."
+                },
+                "environment": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "maxProperties": 32,
+                    "default": {},
+                    "description": "Optional neutral allowlisted overrides; secrets and execution-control variables are rejected."
+                },
+                "timeout_seconds": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Optional shorter timeout; cannot exceed the configured coding shell timeout."
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(mutation_annotations("Run bounded coding process"))
+}
+
 fn mutation_batch_schema() -> serde_json::Map<String, Value> {
     object!({
         "type": "object",
@@ -593,6 +703,50 @@ fn json_result(
     Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
+fn bounded_process_result(
+    mut output: ProcessOutput,
+    output_limit: usize,
+) -> Result<CallToolResult, ErrorData> {
+    for _ in 0..32 {
+        let json = serialize_json(&output)?;
+        if json.len() <= output_limit {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+        }
+
+        output.output_truncated = true;
+        if output.stdout.len() >= output.stderr.len() && !output.stdout.is_empty() {
+            let requested_len = output.stdout.len() / 2;
+            truncate_utf8(&mut output.stdout, requested_len);
+        } else if !output.stderr.is_empty() {
+            let requested_len = output.stderr.len() / 2;
+            truncate_utf8(&mut output.stderr, requested_len);
+        } else if let Some(error) = output.output_collection_error.as_mut() {
+            if error.len() > 64 {
+                let requested_len = error.len() / 2;
+                truncate_utf8(error, requested_len);
+            } else {
+                output.output_collection_error = None;
+            }
+        } else if !output.program.is_empty() || output.cwd != Path::new(".") {
+            output.program.clear();
+            output.cwd = PathBuf::from(".");
+        } else {
+            return Err(output_too_large(json.len(), output_limit));
+        }
+    }
+    Err(internal_error(
+        "failed to fit coding process result within the configured output limit",
+    ))
+}
+
+fn truncate_utf8(value: &mut String, requested_len: usize) {
+    let mut boundary = requested_len.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
 fn ensure_json_fits(value: &impl serde::Serialize, output_limit: usize) -> Result<(), ErrorData> {
     let json = serialize_json(value)?;
     if json.len() > output_limit {
@@ -710,6 +864,20 @@ struct RollbackChangesParams {
     rollback_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunProcessParams {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_path")]
+    cwd: PathBuf,
+    #[serde(default)]
+    environment: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
 fn default_path() -> PathBuf {
     PathBuf::from(".")
 }
@@ -760,7 +928,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -768,7 +936,7 @@ mod tests {
             let annotations = tool.annotations.as_ref().unwrap();
             let mutating = matches!(
                 tool.name.as_ref(),
-                APPLY_CHANGES_TOOL_NAME | ROLLBACK_CHANGES_TOOL_NAME
+                APPLY_CHANGES_TOOL_NAME | ROLLBACK_CHANGES_TOOL_NAME | RUN_PROCESS_TOOL_NAME
             );
             assert_eq!(annotations.read_only_hint, Some(!mutating));
             assert_eq!(annotations.destructive_hint, Some(mutating));
@@ -947,5 +1115,82 @@ mod tests {
 
         assert!(error.message.contains("configured output limit is 1024"));
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn runs_a_bounded_process_through_direct_async_dispatch() {
+        let program = if cfg!(windows) { "python" } else { "python3" };
+        if which::which(program).is_err() {
+            return;
+        }
+        let temp_dir = tempfile::tempdir().unwrap();
+        let call = CallToolRequestParams::new(RUN_PROCESS_TOOL_NAME).with_arguments(object!({
+            "program": program,
+            "args": ["-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+            "timeout_seconds": 2
+        }));
+
+        let result = execute_process(&enabled_config(), call, temp_dir.path())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert_eq!(json["success"], true);
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["stdout"].as_str().unwrap().trim(), "out");
+        assert_eq!(json["stderr"].as_str().unwrap().trim(), "err");
+        assert_eq!(json["timed_out"], false);
+    }
+
+    #[tokio::test]
+    async fn process_tool_rejects_blocked_commands_and_excessive_timeouts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blocked = CallToolRequestParams::new(RUN_PROCESS_TOOL_NAME).with_arguments(object!({
+            "program": "sh",
+            "args": ["-c", "echo unsafe"]
+        }));
+        let excessive = CallToolRequestParams::new(RUN_PROCESS_TOOL_NAME).with_arguments(object!({
+            "program": "rustc",
+            "args": ["--version"],
+            "timeout_seconds": 121
+        }));
+
+        let blocked_error = execute_process(&enabled_config(), blocked, temp_dir.path())
+            .await
+            .unwrap_err();
+        let timeout_error = execute_process(&enabled_config(), excessive, temp_dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(blocked_error.message.contains("blocked command"));
+        assert!(timeout_error
+            .message
+            .contains("configured coding shell timeout of 120"));
+    }
+
+    #[test]
+    fn process_results_are_truncated_to_the_serialized_output_limit() {
+        let output = ProcessOutput {
+            program: "python3".to_string(),
+            cwd: PathBuf::from("."),
+            exit_code: Some(0),
+            success: true,
+            timed_out: false,
+            stdout: "\u{1}".repeat(10_000),
+            stderr: String::new(),
+            stdout_lossy: false,
+            stderr_lossy: false,
+            output_truncated: false,
+            background_process_detected: false,
+            output_collection_error: None,
+            duration_ms: 1,
+        };
+
+        let result = bounded_process_result(output, 1_024).unwrap();
+        let text = result_text(result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert!(text.len() <= 1_024);
+        assert_eq!(json["output_truncated"], true);
     }
 }

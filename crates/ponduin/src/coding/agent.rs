@@ -72,6 +72,9 @@ impl CodingAgent {
                 None,
             ));
         }
+        if tools::is_process_tool(&tool_call.name) {
+            return tools::execute_process(&self.config, tool_call, working_dir).await;
+        }
 
         let config = self.config.clone();
         let tool_state = Arc::clone(&self.tool_state);
@@ -115,9 +118,9 @@ mod tests {
         let agent = enabled_agent();
 
         assert!(agent.tools(PonduinMode::Chat).is_empty());
-        assert_eq!(agent.tool_count(PonduinMode::Auto), 8);
-        assert_eq!(agent.tool_count(PonduinMode::Approve), 8);
-        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 8);
+        assert_eq!(agent.tool_count(PonduinMode::Auto), 9);
+        assert_eq!(agent.tool_count(PonduinMode::Approve), 9);
+        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 9);
     }
 
     #[test]
@@ -170,5 +173,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read_to_string(path).unwrap(), "before\n");
+
+        let process =
+            CallToolRequestParams::new(tools::RUN_PROCESS_TOOL_NAME).with_arguments(object!({
+                "program": "rustc",
+                "args": ["--version"],
+                "timeout_seconds": 5
+            }));
+        let process_result = agent
+            .execute(PonduinMode::Auto, process, temp_dir.path())
+            .await
+            .unwrap();
+        let process_json: Value = serde_json::from_str(
+            &process_result.content[0]
+                .as_text()
+                .expect("expected text result")
+                .text,
+        )
+        .unwrap();
+        assert_eq!(process_json["success"], true);
+        assert!(process_json["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.starts_with("rustc ")));
     }
 }
