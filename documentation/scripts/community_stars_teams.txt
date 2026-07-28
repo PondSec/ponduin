@@ -1,0 +1,16 @@
+# Community Stars Team Lists
+# One GitHub username per line under the appropriate section.
+
+# Ponduin Maintainers (excluded from rankings)
+
+# PondSec, non-Ponduin (eligible for Team Stars)
+
+# External, ponduin (excluded from rankings)
+
+# Bots
+dependabot
+dependabot[bot]
+github-actions
+github-actions[bot]
+renovate
+renovate[bot]

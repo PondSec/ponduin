@@ -1,0 +1,28 @@
+{
+  "name": "@pondsec/ponduin-binary-linux-x64",
+  "version": "0.20.2",
+  "description": "Ponduin binary for Linux x64",
+  "license": "SEE LICENSE IN ../../../LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PondSec/ponduin.git"
+  },
+  "bin": {
+    "ponduin": "bin/ponduin"
+  },
+  "keywords": [
+    "ponduin",
+    "ai",
+    "agent",
+    "binary"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/ponduin"
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "name": "@pondsec/ponduin-sdk",
+  "version": "0.20.2",
+  "description": "Agent Client Protocol (ACP) SDK for Ponduin AI agent",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PondSec/ponduin.git"
+  },
+  "keywords": [
+    "ponduin",
+    "ai",
+    "agent",
+    "acp",
+    "agent-client-protocol"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/resolve-binary.d.ts",
+      "default": "./dist/resolve-binary.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "npm run generate && npm run build:ts",
+    "build:ts": "tsc",
+    "build:native": "tsx scripts/build-native.ts",
+    "build:native:all": "tsx scripts/build-native.ts --all",
+    "generate": "tsx generate-schema.ts",
+    "lint": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck:test": "tsc -p tsconfig.test.json --noEmit",
+    "format": "prettier --write src/",
+    "check:compat": "node scripts/check-binary-compat.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^0.3.1",
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "zod": "^3.25.76"
+  },
+  "peerDependencies": {
+    "@agentclientprotocol/sdk": "^0.19.0"
+  },
+  "optionalDependencies": {
+    "@pondsec/ponduin-binary-darwin-arm64": "workspace:*",
+    "@pondsec/ponduin-binary-darwin-x64": "workspace:*",
+    "@pondsec/ponduin-binary-linux-arm64": "workspace:*",
+    "@pondsec/ponduin-binary-linux-x64": "workspace:*",
+    "@pondsec/ponduin-binary-win32-x64": "workspace:*"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "^0.19.0",
+    "@hey-api/openapi-ts": "^0.92.3",
+    "@types/node": "^20.0.0",
+    "prettier": "^3.8.1",
+    "tsx": "^4.21.0",
+    "typescript": "~5.9.3"
+  }
+}

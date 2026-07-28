@@ -1,0 +1,4 @@
+provider: github
+owner: PondSec
+repo: ponduin
+updaterCacheDirName: ponduin-updater

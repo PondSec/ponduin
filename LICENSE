@@ -1,0 +1,87 @@
+PONDSEC PONDUIN SOFTWARE LICENSE AGREEMENT
+Version 0.1
+
+Applies to Ponduin version 1.44.0 and later.
+
+Copyright (c) 2026 Joshua Dean Pond, PondSec and Ponduin.
+All rights reserved.
+
+IMPORTANT SCOPE NOTICE
+
+This agreement applies only to software, source code, documentation, graphics,
+and other materials for which PondSec or Ponduin owns or controls the necessary
+rights ("PondSec Materials").
+
+Ponduin also contains third-party components governed by separate licenses.
+Those components remain subject to their respective license terms, as
+identified in THIRD_PARTY_NOTICES.md. Nothing in this agreement limits rights
+granted under those separate licenses.
+
+1. OWNERSHIP
+
+The PondSec Materials, including the associated source code, graphics,
+documentation, product identity, and trademarks, are the intellectual property
+of Joshua Dean Pond, PondSec and Ponduin (the "Licensor"). All rights not
+expressly granted by this agreement are reserved by the Licensor.
+
+2. LIMITED USE LICENSE
+
+Subject to this agreement, the Licensor grants the user a non-exclusive,
+non-transferable, revocable right to install and use the PondSec Materials
+solely for the user's own internal purposes.
+
+3. RESTRICTIONS
+
+Except where expressly authorized in writing by the Licensor, where permitted
+by a separate third-party license, or where applicable law does not allow the
+restriction, the user may not:
+
+- modify, adapt, translate, or create derivative works of the PondSec Materials;
+- reverse engineer, decompile, disassemble, decrypt, or otherwise attempt to
+  derive source code or implementation details from the PondSec Materials;
+- sell, rent, lease, sublicense, distribute, publish, or otherwise make the
+  PondSec Materials available to another person or entity; or
+- remove or alter proprietary notices, trademarks, or attribution notices.
+
+4. EXCLUSIVE RIGHTS
+
+The rights to modify, develop, reproduce, market, license, and sell the PondSec
+Materials remain exclusively with the Licensor, except for rights expressly
+granted by this agreement or by an applicable third-party license.
+
+5. TERMINATION
+
+This license terminates automatically if the user materially breaches this
+agreement. Upon termination, the user must stop using and delete all copies of
+the PondSec Materials in the user's possession or control. Rights granted under
+separate third-party licenses are not terminated by this section.
+
+6. NO WARRANTY
+
+THE PONDSEC MATERIALS ARE PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT
+WARRANTIES OF ANY KIND, WHETHER EXPRESS, IMPLIED, OR STATUTORY, INCLUDING
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+NON-INFRINGEMENT, TO THE MAXIMUM EXTENT PERMITTED BY LAW.
+
+7. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR WILL NOT BE LIABLE FOR ANY
+INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES,
+OR FOR LOSS OF DATA, PROFITS, REVENUE, BUSINESS, OR GOODWILL ARISING FROM OR
+RELATED TO THE PONDSEC MATERIALS OR THIS AGREEMENT.
+
+8. ENFORCEMENT
+
+Unauthorized use immediately ends the rights granted under this agreement and
+may result in civil or criminal remedies where provided by applicable law.
+
+9. SEVERABILITY
+
+If any provision of this agreement is held unenforceable, the remaining
+provisions remain in effect to the fullest extent permitted by law.
+
+10. LEGAL REVIEW
+
+This is the repository license text prepared for the Ponduin rebranding. It
+must be reviewed and finalized by PondSec's legal counsel before any public or
+commercial distribution.

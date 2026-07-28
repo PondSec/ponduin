@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">Ponduin</title>
+  <rect width="1024" height="1024" rx="192" fill="#f7f7f5"/>
+  <image href="ponduin-logo.png" x="192" y="32" width="640" height="960" preserveAspectRatio="xMidYMid meet"/>
+</svg>
