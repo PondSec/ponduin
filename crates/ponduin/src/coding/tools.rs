@@ -1,4 +1,7 @@
 use crate::coding::config::CodingConfig;
+use crate::coding::file::{
+    FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
+};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use rmcp::model::{
@@ -16,6 +19,7 @@ pub const REPOSITORY_PROFILE_TOOL_NAME: &str = "coding__repository_profile";
 pub const REPOSITORY_INSTRUCTIONS_TOOL_NAME: &str = "coding__repository_instructions";
 pub const FIND_FILES_TOOL_NAME: &str = "coding__find_files";
 pub const SEARCH_TEXT_TOOL_NAME: &str = "coding__search_text";
+pub const READ_FILE_TOOL_NAME: &str = "coding__read_file";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -26,6 +30,7 @@ pub fn definitions() -> Vec<Tool> {
         repository_instructions_tool(),
         find_files_tool(),
         search_text_tool(),
+        read_file_tool(),
     ]
 }
 
@@ -94,6 +99,26 @@ pub fn execute(
                 .search_text(&request, limits)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&result)
+        }
+        READ_FILE_TOOL_NAME => {
+            let params: ReadFileParams = parse_arguments(&tool_call)?;
+            if params.max_bytes > config.output_limit {
+                return Err(invalid_arguments(format!(
+                    "max_bytes cannot exceed the configured coding output limit of {}",
+                    config.output_limit
+                )));
+            }
+            let snapshot = FileSnapshot::read(
+                &workspace,
+                params.path,
+                FileReadOptions {
+                    max_bytes: params.max_bytes,
+                    start_line: params.start_line,
+                    end_line: params.end_line,
+                },
+            )
+            .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&snapshot)
         }
         _ => Err(invalid_arguments(format!(
             "unknown internal coding tool `{}`",
@@ -250,6 +275,42 @@ fn search_text_tool() -> Tool {
     .annotate(read_only_annotations("Search coding text"))
 }
 
+fn read_file_tool() -> Tool {
+    Tool::new(
+        READ_FILE_TOOL_NAME.to_string(),
+        "Read a bounded UTF-8 file inside the workspace and return a BLAKE3 digest of the complete \
+         file. Optional line bounds reduce returned content without changing the digest. Sensitive, \
+         binary, oversized, external, and symlink-escaping files are rejected."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Existing workspace-relative file path."
+                },
+                "start_line": {
+                    "type": ["integer", "null"],
+                    "minimum": 1
+                },
+                "end_line": {
+                    "type": ["integer", "null"],
+                    "minimum": 1
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": MIN_READ_LIMIT,
+                    "maximum": MAX_READ_LIMIT,
+                    "default": DEFAULT_READ_LIMIT
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Read versioned coding file"))
+}
+
 fn read_only_annotations(title: &str) -> ToolAnnotations {
     ToolAnnotations::with_title(title.to_string())
         .read_only(true)
@@ -352,6 +413,18 @@ struct SearchTextParams {
     max_line_bytes: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadFileParams {
+    path: PathBuf,
+    #[serde(default)]
+    start_line: Option<usize>,
+    #[serde(default)]
+    end_line: Option<usize>,
+    #[serde(default = "default_read_limit")]
+    max_bytes: usize,
+}
+
 fn default_path() -> PathBuf {
     PathBuf::from(".")
 }
@@ -370,6 +443,10 @@ fn default_max_file_bytes() -> usize {
 
 fn default_max_line_bytes() -> usize {
     SearchLimits::default().max_line_bytes
+}
+
+fn default_read_limit() -> usize {
+    DEFAULT_READ_LIMIT
 }
 
 #[cfg(test)]
@@ -398,7 +475,7 @@ mod tests {
     #[test]
     fn definitions_are_internal_read_only_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -481,5 +558,26 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         assert!(error.message.contains("missing field `query`"));
+    }
+
+    #[test]
+    fn reads_versioned_line_ranges_through_internal_tool() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("app.py"), "one\ntwo\nthree\n").unwrap();
+        let call = CallToolRequestParams::new(READ_FILE_TOOL_NAME).with_arguments(object!({
+            "path": "app.py",
+            "start_line": 2,
+            "end_line": 2
+        }));
+
+        let result = execute(&enabled_config(), call, temp_dir.path()).unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert_eq!(json["path"], "app.py");
+        assert_eq!(json["content"], "two\n");
+        assert_eq!(json["total_lines"], 3);
+        assert!(json["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("blake3:")));
     }
 }
