@@ -26,7 +26,9 @@ pub mod workflow;
 pub mod workspace;
 
 pub use agent::CodingAgent;
-pub use capabilities::ModelCapabilityProfile;
+pub use capabilities::{
+    CapabilitySupport, CodingSuitability, ModelCapabilityProfile, PerformanceClass, ResourceClass,
+};
 pub use config::CodingConfig;
 pub use context::ContextPlanner;
 pub use diagnostic::DiagnosticAnalyzer;

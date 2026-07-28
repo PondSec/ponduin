@@ -1,3 +1,6 @@
+use crate::coding::capabilities::{
+    CapabilitySupport, CodingSuitability, PerformanceClass, ResourceClass,
+};
 use crate::coding::strategy::CodingTaskMode;
 use crate::config::{Config, ConfigError};
 use serde::de::DeserializeOwned;
@@ -18,6 +21,13 @@ pub const CODING_TREE_SITTER_KEY: &str = "PONDUIN_CODING_TREE_SITTER";
 pub const CODING_EMBEDDINGS_KEY: &str = "PONDUIN_CODING_EMBEDDINGS";
 pub const CODING_SHELL_TIMEOUT_KEY: &str = "PONDUIN_CODING_SHELL_TIMEOUT";
 pub const CODING_OUTPUT_LIMIT_KEY: &str = "PONDUIN_CODING_OUTPUT_LIMIT";
+pub const CODING_MODEL_TOOL_CALLING_KEY: &str = "PONDUIN_CODING_MODEL_TOOL_CALLING";
+pub const CODING_MODEL_STRUCTURED_OUTPUT_KEY: &str = "PONDUIN_CODING_MODEL_STRUCTURED_OUTPUT";
+pub const CODING_MODEL_CODING_SUITABILITY_KEY: &str = "PONDUIN_CODING_MODEL_CODING_SUITABILITY";
+pub const CODING_MODEL_MULTIMODALITY_KEY: &str = "PONDUIN_CODING_MODEL_MULTIMODALITY";
+pub const CODING_MODEL_EMBEDDING_SUPPORT_KEY: &str = "PONDUIN_CODING_MODEL_EMBEDDING_SUPPORT";
+pub const CODING_MODEL_SPEED_KEY: &str = "PONDUIN_CODING_MODEL_SPEED";
+pub const CODING_MODEL_RESOURCE_DEMAND_KEY: &str = "PONDUIN_CODING_MODEL_RESOURCE_DEMAND";
 
 const MIN_CONTEXT_TOKENS: usize = 1_024;
 const MAX_CONTEXT_TOKENS: usize = 1_000_000;
@@ -52,6 +62,13 @@ pub struct CodingConfig {
     pub embeddings: bool,
     pub shell_timeout: Duration,
     pub output_limit: usize,
+    pub model_tool_calling: CapabilitySupport,
+    pub model_structured_output: CapabilitySupport,
+    pub model_coding_suitability: CodingSuitability,
+    pub model_multimodality: CapabilitySupport,
+    pub model_embedding_support: CapabilitySupport,
+    pub model_speed: PerformanceClass,
+    pub model_resource_demand: ResourceClass,
 }
 
 impl Default for CodingConfig {
@@ -72,6 +89,13 @@ impl Default for CodingConfig {
             embeddings: false,
             shell_timeout: Duration::from_secs(120),
             output_limit: 2 * 1_024 * 1_024,
+            model_tool_calling: CapabilitySupport::Unknown,
+            model_structured_output: CapabilitySupport::Unknown,
+            model_coding_suitability: CodingSuitability::Unknown,
+            model_multimodality: CapabilitySupport::Unknown,
+            model_embedding_support: CapabilitySupport::Unknown,
+            model_speed: PerformanceClass::Unknown,
+            model_resource_demand: ResourceClass::Unknown,
         }
     }
 }
@@ -118,6 +142,37 @@ impl CodingConfig {
             embeddings: optional(config, CODING_EMBEDDINGS_KEY, defaults.embeddings)?,
             shell_timeout: Duration::from_secs(shell_timeout_seconds),
             output_limit: optional(config, CODING_OUTPUT_LIMIT_KEY, defaults.output_limit)?,
+            model_tool_calling: optional(
+                config,
+                CODING_MODEL_TOOL_CALLING_KEY,
+                defaults.model_tool_calling,
+            )?,
+            model_structured_output: optional(
+                config,
+                CODING_MODEL_STRUCTURED_OUTPUT_KEY,
+                defaults.model_structured_output,
+            )?,
+            model_coding_suitability: optional(
+                config,
+                CODING_MODEL_CODING_SUITABILITY_KEY,
+                defaults.model_coding_suitability,
+            )?,
+            model_multimodality: optional(
+                config,
+                CODING_MODEL_MULTIMODALITY_KEY,
+                defaults.model_multimodality,
+            )?,
+            model_embedding_support: optional(
+                config,
+                CODING_MODEL_EMBEDDING_SUPPORT_KEY,
+                defaults.model_embedding_support,
+            )?,
+            model_speed: optional(config, CODING_MODEL_SPEED_KEY, defaults.model_speed)?,
+            model_resource_demand: optional(
+                config,
+                CODING_MODEL_RESOURCE_DEMAND_KEY,
+                defaults.model_resource_demand,
+            )?,
         };
 
         resolved.validate()?;
@@ -244,6 +299,11 @@ mod tests {
         assert!(defaults.tree_sitter);
         assert!(!defaults.embeddings);
         assert!(!defaults.lsp);
+        assert_eq!(defaults.model_tool_calling, CapabilitySupport::Unknown);
+        assert_eq!(
+            defaults.model_coding_suitability,
+            CodingSuitability::Unknown
+        );
     }
 
     #[test]
@@ -256,6 +316,24 @@ mod tests {
             .unwrap();
         config.set_param(CODING_MAX_ITERATIONS_KEY, 12).unwrap();
         config.set_param(CODING_SHELL_TIMEOUT_KEY, 45).unwrap();
+        config
+            .set_param(
+                CODING_MODEL_STRUCTURED_OUTPUT_KEY,
+                CapabilitySupport::Supported,
+            )
+            .unwrap();
+        config
+            .set_param(
+                CODING_MODEL_CODING_SUITABILITY_KEY,
+                CodingSuitability::Strong,
+            )
+            .unwrap();
+        config
+            .set_param(CODING_MODEL_SPEED_KEY, PerformanceClass::Fast)
+            .unwrap();
+        config
+            .set_param(CODING_MODEL_RESOURCE_DEMAND_KEY, ResourceClass::Low)
+            .unwrap();
 
         let resolved = CodingConfig::from_config(&config).unwrap();
 
@@ -263,6 +341,13 @@ mod tests {
         assert_eq!(resolved.task_mode, CodingTaskMode::Debugging);
         assert_eq!(resolved.max_iterations, 12);
         assert_eq!(resolved.shell_timeout, Duration::from_secs(45));
+        assert_eq!(
+            resolved.model_structured_output,
+            CapabilitySupport::Supported
+        );
+        assert_eq!(resolved.model_coding_suitability, CodingSuitability::Strong);
+        assert_eq!(resolved.model_speed, PerformanceClass::Fast);
+        assert_eq!(resolved.model_resource_demand, ResourceClass::Low);
     }
 
     #[test]
