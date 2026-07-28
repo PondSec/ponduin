@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod context;
 pub mod file;
 pub mod git;
 pub mod instructions;
@@ -21,6 +22,7 @@ pub mod workspace;
 
 pub use agent::CodingAgent;
 pub use config::CodingConfig;
+pub use context::ContextPlanner;
 pub use file::FileSnapshot;
 pub use git::GitRepository;
 pub use instructions::RepositoryInstructions;
