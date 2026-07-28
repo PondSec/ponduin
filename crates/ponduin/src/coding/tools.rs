@@ -11,6 +11,7 @@ use crate::coding::patch::{
 };
 use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner};
 use crate::coding::project::ProjectDiscovery;
+use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
@@ -60,6 +61,7 @@ pub const WORKFLOW_TRANSITION_TOOL_NAME: &str = "coding__workflow_transition";
 pub const WORKFLOW_STATUS_TOOL_NAME: &str = "coding__workflow_status";
 pub const WORKFLOW_COMPLETE_TOOL_NAME: &str = "coding__workflow_complete";
 pub const RUN_VALIDATION_TOOL_NAME: &str = "coding__run_validation";
+pub const REVIEW_CHANGES_TOOL_NAME: &str = "coding__review_changes";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -636,6 +638,7 @@ pub fn definitions() -> Vec<Tool> {
         workflow_status_tool(),
         workflow_complete_tool(),
         run_validation_tool(),
+        review_changes_tool(),
     ]
 }
 
@@ -660,6 +663,7 @@ fn is_repository_activity(name: &str) -> bool {
             | SELECT_CONTEXT_TOOL_NAME
             | PROJECT_CAPABILITIES_TOOL_NAME
             | PREPARE_CONTEXT_TOOL_NAME
+            | REVIEW_CHANGES_TOOL_NAME
     )
 }
 
@@ -676,6 +680,7 @@ pub(crate) fn is_async_tool(name: &str) -> bool {
             | GIT_CREATE_BRANCH_TOOL_NAME
             | GIT_PUSH_OWNED_TOOL_NAME
             | RUN_VALIDATION_TOOL_NAME
+            | REVIEW_CHANGES_TOOL_NAME
     )
 }
 
@@ -837,6 +842,17 @@ pub(crate) async fn execute_async(
                 .await
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&result, config.output_limit)
+        }
+        REVIEW_CHANGES_TOOL_NAME => {
+            let request: GitDiffRequest = parse_arguments(&tool_call)?;
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let diff = repository
+                .diff(request)
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            bounded_review_result(ReviewAnalyzer::analyze(&diff), config.output_limit)
         }
         RUN_VALIDATION_TOOL_NAME => {
             let params: RunValidationParams = parse_arguments(&tool_call)?;
@@ -1148,7 +1164,8 @@ pub(crate) fn execute_with_state(
         | GIT_COMMIT_OWNED_TOOL_NAME
         | GIT_CREATE_BRANCH_TOOL_NAME
         | GIT_PUSH_OWNED_TOOL_NAME
-        | RUN_VALIDATION_TOOL_NAME => Err(internal_error(
+        | RUN_VALIDATION_TOOL_NAME
+        | REVIEW_CHANGES_TOOL_NAME => Err(internal_error(
             "asynchronous coding tools require asynchronous dispatch",
         )),
         _ => Err(invalid_arguments(format!(
@@ -1985,6 +2002,42 @@ fn run_validation_tool() -> Tool {
     .annotate(mutation_annotations("Run discovered project validation"))
 }
 
+fn review_changes_tool() -> Tool {
+    Tool::new(
+        REVIEW_CHANGES_TOOL_NAME.to_string(),
+        "Review bounded staged or unstaged local Git changes without executing repository code. \
+         Reports conservative security, reliability, error-handling, maintainability, and debug \
+         findings with exact paths and added-line numbers. Sensitive files and secret values are \
+         omitted."
+            .to_string(),
+        object!({
+            "type": "object",
+            "properties": {
+                "staged": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "paths": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000,
+                    "default": 3
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Review local coding changes"))
+}
+
 fn bounded_string_array_schema(min_items: usize) -> Value {
     serde_json::json!({
         "type": "array",
@@ -2292,6 +2345,34 @@ fn bounded_validation_result(
     }
     Err(internal_error(
         "failed to fit validation result within the configured output limit",
+    ))
+}
+
+fn bounded_review_result(
+    mut report: ReviewReport,
+    output_limit: usize,
+) -> Result<CallToolResult, ErrorData> {
+    for _ in 0..64 {
+        let json = serialize_json(&report)?;
+        if json.len() <= output_limit {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+        }
+        report.truncated = true;
+        if !report.findings.is_empty() {
+            let retained = report.findings.len() / 2;
+            report.findings.truncate(retained);
+        } else if !report.files.is_empty() {
+            let retained = report.files.len() / 2;
+            report.files.truncate(retained);
+        } else if !report.skipped_sensitive.is_empty() {
+            let retained = report.skipped_sensitive.len() / 2;
+            report.skipped_sensitive.truncate(retained);
+        } else {
+            return Err(output_too_large(json.len(), output_limit));
+        }
+    }
+    Err(internal_error(
+        "failed to fit review result within the configured output limit",
     ))
 }
 
@@ -2854,7 +2935,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 30);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -3534,6 +3615,45 @@ mod tests {
         .unwrap();
         let history_json: Value = serde_json::from_str(&result_text(history)).unwrap();
         assert_eq!(history_json["commits"][0]["subject"], "initial");
+    }
+
+    #[tokio::test]
+    async fn reviews_local_added_lines_without_returning_secret_values() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        run_git(temp_dir.path(), &["init"]);
+        run_git(temp_dir.path(), &["config", "user.name", "Test User"]);
+        run_git(
+            temp_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        fs::create_dir(temp_dir.path().join("src")).unwrap();
+        fs::write(temp_dir.path().join("src/app.rs"), "fn main() {}\n").unwrap();
+        run_git(temp_dir.path(), &["add", "--", "src/app.rs"]);
+        run_git(temp_dir.path(), &["commit", "-m", "initial"]);
+        fs::write(
+            temp_dir.path().join("src/app.rs"),
+            "const API_KEY: &str = \"abcdefgh\";\nfn main() {}\n",
+        )
+        .unwrap();
+
+        let result = execute_async(
+            &enabled_config(),
+            &CodingToolState::default(),
+            CallToolRequestParams::new(REVIEW_CHANGES_TOOL_NAME).with_arguments(object!({
+                "paths": ["src/app.rs"],
+                "context_lines": 1
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let text = result_text(result);
+        let report: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(report["findings"][0]["severity"], "critical");
+        assert_eq!(report["findings"][0]["path"], "src/app.rs");
+        assert_eq!(report["findings"][0]["line"], 1);
+        assert!(!text.contains("abcdefgh"));
     }
 
     #[tokio::test]
