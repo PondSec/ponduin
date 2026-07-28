@@ -1,3 +1,4 @@
+use crate::coding::file::{content_digest, FileReadOptions, FileSnapshot, MAX_READ_LIMIT};
 use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRunner};
 use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
@@ -6,10 +7,12 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-const MAX_DIFF_PATHS: usize = 200;
+const MAX_DIFF_PATHS: usize = 100;
 const MAX_DIFF_CONTEXT: u32 = 1_000;
 const MAX_HISTORY_ENTRIES: usize = 100;
-const MAX_FILTER_OVERRIDES: usize = 100;
+const MAX_FILTER_OVERRIDES: usize = 20;
+const MAX_WRITE_PATHS: usize = 50;
+const MAX_COMMIT_MESSAGE_BYTES: usize = 4 * 1_024;
 
 #[derive(Debug)]
 pub struct GitRepository<'workspace> {
@@ -258,6 +261,270 @@ impl<'workspace> GitRepository<'workspace> {
         })
     }
 
+    pub async fn stage_owned(&self, paths: &[GitOwnedPath]) -> Result<GitStageResult, GitError> {
+        let paths = validate_owned_paths(paths)?;
+        for owned in &paths {
+            self.verify_owned_worktree(owned)?;
+            let index = self.index_entry(&owned.path).await?;
+            let head = self.head_entry(&owned.path).await?;
+            if index.as_ref().map(|entry| &entry.oid) != head.as_ref().map(|entry| &entry.oid) {
+                return Err(GitError::PreexistingStagedChange(owned.path.clone()));
+            }
+            match (&owned.original_digest, &index) {
+                (Some(expected), Some(entry)) => {
+                    let actual = self.index_digest(entry).await?;
+                    if &actual != expected {
+                        return Err(GitError::OriginalDoesNotMatchIndex {
+                            path: owned.path.clone(),
+                            expected: expected.clone(),
+                            actual,
+                        });
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(GitError::OriginalIndexStateMismatch(owned.path.clone())),
+            }
+        }
+
+        let mut args = vec!["add".to_string(), "-A".to_string(), "--".to_string()];
+        args.extend(paths.iter().map(|owned| literal_pathspec(&owned.path)));
+        let output = self.run_with_filters_disabled(args).await?;
+        require_success(&output, "stage owned files")?;
+
+        for owned in &paths {
+            self.verify_index_matches_applied(owned).await?;
+        }
+        Ok(GitStageResult {
+            staged_files: paths.into_iter().map(|owned| owned.path).collect(),
+        })
+    }
+
+    pub async fn commit_owned(
+        &self,
+        message: &str,
+        paths: &[GitOwnedPath],
+    ) -> Result<GitCommitResult, GitError> {
+        validate_commit_message(message)?;
+        let paths = validate_owned_paths(paths)?;
+        for owned in &paths {
+            self.verify_index_matches_applied(owned).await?;
+        }
+
+        let expected = paths
+            .iter()
+            .map(|owned| owned.path.clone())
+            .collect::<BTreeSet<_>>();
+        let staged = self
+            .staged_paths()
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if staged != expected {
+            return Err(GitError::StagedPathsMismatch {
+                expected: expected.into_iter().collect(),
+                actual: staged.into_iter().collect(),
+            });
+        }
+
+        let hooks_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let output = self
+            .run(vec![
+                "-c".to_string(),
+                format!("core.hooksPath={hooks_path}"),
+                "-c".to_string(),
+                "commit.gpgSign=false".to_string(),
+                "commit".to_string(),
+                "--no-verify".to_string(),
+                "--no-gpg-sign".to_string(),
+                "-m".to_string(),
+                message.to_string(),
+            ])
+            .await?;
+        require_success(&output, "commit owned files")?;
+        let oid = self
+            .optional_stdout(["rev-parse", "--verify", "HEAD"])
+            .await?
+            .ok_or(GitError::MalformedOutput("commit oid"))?;
+
+        Ok(GitCommitResult {
+            oid,
+            committed_files: paths.into_iter().map(|owned| owned.path).collect(),
+        })
+    }
+
+    pub async fn create_branch(
+        &self,
+        name: &str,
+        start_point: Option<&str>,
+    ) -> Result<GitBranchResult, GitError> {
+        validate_revision_text(name, "branch name")?;
+        let checked = self.run(["check-ref-format", "--branch", name]).await?;
+        require_success(&checked, "validate branch name")?;
+        let start = start_point.unwrap_or("HEAD");
+        validate_revision_text(start, "branch start point")?;
+        let resolved = self
+            .run(vec![
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                format!("{start}^{{commit}}"),
+            ])
+            .await?;
+        require_success(&resolved, "resolve branch start point")?;
+        let start_oid = resolved.stdout.trim().to_string();
+        let created = self
+            .run(["branch", "--no-track", "--", name, start_oid.as_str()])
+            .await?;
+        require_success(&created, "create branch")?;
+
+        Ok(GitBranchResult {
+            name: name.to_string(),
+            start_oid,
+        })
+    }
+
+    fn verify_owned_worktree(&self, owned: &GitOwnedPath) -> Result<(), GitError> {
+        if is_sensitive_path(&owned.path) {
+            return Err(GitError::SensitivePath(owned.path.clone()));
+        }
+        match &owned.applied_digest {
+            Some(expected) => {
+                let snapshot = FileSnapshot::read(
+                    self.workspace,
+                    &owned.path,
+                    FileReadOptions {
+                        max_bytes: self.limits.output_limit.min(MAX_READ_LIMIT),
+                        start_line: None,
+                        end_line: None,
+                    },
+                )
+                .map_err(|error| GitError::OwnedWorktreeUnavailable {
+                    path: owned.path.clone(),
+                    reason: error.to_string(),
+                })?;
+                if &snapshot.digest == expected {
+                    Ok(())
+                } else {
+                    Err(GitError::AppliedDigestMismatch {
+                        path: owned.path.clone(),
+                        expected: expected.clone(),
+                        actual: Some(snapshot.digest),
+                    })
+                }
+            }
+            None => {
+                let resolved = self.workspace.resolve_for_write(&owned.path)?;
+                match resolved.symlink_metadata() {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(GitError::OwnedWorktreeUnavailable {
+                        path: owned.path.clone(),
+                        reason: error.to_string(),
+                    }),
+                    Ok(_) => Err(GitError::AppliedDigestMismatch {
+                        path: owned.path.clone(),
+                        expected: "absent".to_string(),
+                        actual: Some("present".to_string()),
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn verify_index_matches_applied(&self, owned: &GitOwnedPath) -> Result<(), GitError> {
+        let index = self.index_entry(&owned.path).await?;
+        match (&owned.applied_digest, index) {
+            (Some(expected), Some(entry)) => {
+                let actual = self.index_digest(&entry).await?;
+                if &actual == expected {
+                    Ok(())
+                } else {
+                    Err(GitError::AppliedDigestMismatch {
+                        path: owned.path.clone(),
+                        expected: expected.clone(),
+                        actual: Some(actual),
+                    })
+                }
+            }
+            (None, None) => Ok(()),
+            (expected, actual) => Err(GitError::AppliedDigestMismatch {
+                path: owned.path.clone(),
+                expected: expected.clone().unwrap_or_else(|| "absent".to_string()),
+                actual: actual.map(|entry| entry.oid),
+            }),
+        }
+    }
+
+    async fn index_digest(&self, entry: &GitIndexEntry) -> Result<String, GitError> {
+        let output = self.run(["cat-file", "blob", entry.oid.as_str()]).await?;
+        require_success(&output, "read index blob")?;
+        if output.output_truncated || output.stdout_lossy {
+            return Err(GitError::IndexBlobUnavailable(entry.oid.clone()));
+        }
+        Ok(content_digest(output.stdout.as_bytes()))
+    }
+
+    async fn index_entry(&self, path: &Path) -> Result<Option<GitIndexEntry>, GitError> {
+        let output = self
+            .run(vec![
+                "ls-files".to_string(),
+                "--stage".to_string(),
+                "-z".to_string(),
+                "--".to_string(),
+                literal_pathspec(path),
+            ])
+            .await?;
+        require_success(&output, "read index entry")?;
+        if output.output_truncated {
+            return Err(GitError::MalformedOutput("truncated index entry"));
+        }
+        parse_index_entry(&output.stdout)
+    }
+
+    async fn head_entry(&self, path: &Path) -> Result<Option<GitIndexEntry>, GitError> {
+        let output = self
+            .run(vec![
+                "ls-tree".to_string(),
+                "-z".to_string(),
+                "HEAD".to_string(),
+                "--".to_string(),
+                literal_pathspec(path),
+            ])
+            .await?;
+        if output.exit_code == Some(128) && output.stderr.contains("Not a valid object name") {
+            return Ok(None);
+        }
+        require_success(&output, "read HEAD entry")?;
+        if output.output_truncated {
+            return Err(GitError::MalformedOutput("truncated HEAD entry"));
+        }
+        parse_tree_entry(&output.stdout)
+    }
+
+    async fn staged_paths(&self) -> Result<Vec<PathBuf>, GitError> {
+        let output = self
+            .run([
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=all",
+                "--name-only",
+                "-z",
+                "--",
+            ])
+            .await?;
+        require_success(&output, "list staged files")?;
+        if output.output_truncated {
+            return Err(GitError::ChangedPathOutputTruncated);
+        }
+        output
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .map(validate_relative_path)
+            .collect()
+    }
+
     async fn changed_paths(&self, staged: bool) -> Result<Vec<PathBuf>, GitError> {
         let mut args = vec![
             "diff".to_string(),
@@ -493,6 +760,35 @@ pub struct GitCommit {
     pub subject: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOwnedPath {
+    pub path: PathBuf,
+    pub original_digest: Option<String>,
+    pub applied_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStageResult {
+    pub staged_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitResult {
+    pub oid: String,
+    pub committed_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBranchResult {
+    pub name: String,
+    pub start_oid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitIndexEntry {
+    oid: String,
+}
+
 fn require_success(output: &ProcessOutput, operation: &'static str) -> Result<(), GitError> {
     if output.timed_out {
         Err(GitError::TimedOut(operation))
@@ -532,6 +828,103 @@ fn validate_relative_path(path: PathBuf) -> Result<PathBuf, GitError> {
     } else {
         Ok(normalized)
     }
+}
+
+fn validate_owned_paths(paths: &[GitOwnedPath]) -> Result<Vec<GitOwnedPath>, GitError> {
+    if paths.is_empty() {
+        return Err(GitError::EmptyOwnedPaths);
+    }
+    if paths.len() > MAX_WRITE_PATHS {
+        return Err(GitError::TooManyPaths {
+            count: paths.len(),
+            limit: MAX_WRITE_PATHS,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    let mut validated = Vec::with_capacity(paths.len());
+    for owned in paths {
+        let path = validate_relative_path(owned.path.clone())?;
+        if path.to_string_lossy().starts_with('-') {
+            return Err(GitError::InvalidPath(path));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(GitError::DuplicateOwnedPath(path));
+        }
+        validated.push(GitOwnedPath {
+            path,
+            original_digest: owned.original_digest.clone(),
+            applied_digest: owned.applied_digest.clone(),
+        });
+    }
+    Ok(validated)
+}
+
+fn validate_commit_message(message: &str) -> Result<(), GitError> {
+    if message.trim().is_empty()
+        || message.len() > MAX_COMMIT_MESSAGE_BYTES
+        || message.contains('\0')
+        || message
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        Err(GitError::InvalidCommitMessage)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_revision_text(value: &str, kind: &'static str) -> Result<(), GitError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.starts_with('-')
+        || value.chars().any(char::is_control)
+    {
+        Err(GitError::InvalidRevision { kind })
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_index_entry(output: &str) -> Result<Option<GitIndexEntry>, GitError> {
+    let records = output
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Ok(None);
+    }
+    if records.len() != 1 {
+        return Err(GitError::ConflictedIndexEntry);
+    }
+    let metadata = records[0]
+        .split_once('\t')
+        .ok_or(GitError::MalformedOutput("index entry"))?
+        .0;
+    let fields = metadata.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[2] != "0" {
+        return Err(GitError::ConflictedIndexEntry);
+    }
+    Ok(Some(GitIndexEntry {
+        oid: fields[1].to_string(),
+    }))
+}
+
+fn parse_tree_entry(output: &str) -> Result<Option<GitIndexEntry>, GitError> {
+    let record = output.split('\0').find(|record| !record.is_empty());
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let metadata = record
+        .split_once('\t')
+        .ok_or(GitError::MalformedOutput("HEAD entry"))?
+        .0;
+    let fields = metadata.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[1] != "blob" {
+        return Err(GitError::MalformedOutput("HEAD entry"));
+    }
+    Ok(Some(GitIndexEntry {
+        oid: fields[2].to_string(),
+    }))
 }
 
 fn literal_pathspec(path: &Path) -> String {
@@ -595,6 +988,45 @@ pub enum GitError {
     TooManyFilterOverrides { count: usize, limit: usize },
     #[error("invalid git content-filter configuration key: {0}")]
     InvalidFilterConfiguration(String),
+    #[error("owned Git path list must not be empty")]
+    EmptyOwnedPaths,
+    #[error("duplicate owned Git path: {0}")]
+    DuplicateOwnedPath(PathBuf),
+    #[error("sensitive file cannot be staged by the coding agent: {0}")]
+    SensitivePath(PathBuf),
+    #[error("owned worktree file is unavailable at {path}: {reason}")]
+    OwnedWorktreeUnavailable { path: PathBuf, reason: String },
+    #[error(
+        "file changed after the agent mutation for {path}: expected {expected}, current {actual:?}"
+    )]
+    AppliedDigestMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: Option<String>,
+    },
+    #[error("file already had staged changes before the agent mutation: {0}")]
+    PreexistingStagedChange(PathBuf),
+    #[error("agent mutation origin does not match the Git index state: {0}")]
+    OriginalIndexStateMismatch(PathBuf),
+    #[error("original content for {path} does not match the Git index: expected {expected}, index {actual}")]
+    OriginalDoesNotMatchIndex {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("could not read complete UTF-8 Git index blob {0}")]
+    IndexBlobUnavailable(String),
+    #[error("Git index entry is conflicted")]
+    ConflictedIndexEntry,
+    #[error("staged paths do not exactly match agent-owned paths; expected {expected:?}, actual {actual:?}")]
+    StagedPathsMismatch {
+        expected: Vec<PathBuf>,
+        actual: Vec<PathBuf>,
+    },
+    #[error("commit message is empty, too large, or contains unsupported control characters")]
+    InvalidCommitMessage,
+    #[error("invalid Git {kind}")]
+    InvalidRevision { kind: &'static str },
 }
 
 #[cfg(test)]
@@ -627,8 +1059,12 @@ mod tests {
             &["config", "user.email", "test@example.com"],
         );
         fs::write(temp_dir.path().join("app.txt"), "before\n").unwrap();
+        fs::write(temp_dir.path().join("other.txt"), "other\n").unwrap();
         fs::write(temp_dir.path().join(".env"), "TOKEN=before\n").unwrap();
-        git(temp_dir.path(), &["add", "--", "app.txt", ".env"]);
+        git(
+            temp_dir.path(),
+            &["add", "--", "app.txt", "other.txt", ".env"],
+        );
         git(temp_dir.path(), &["commit", "-m", "initial"]);
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
         (temp_dir, workspace)
@@ -745,6 +1181,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stages_and_commits_only_digest_owned_agent_changes() {
+        let (_temp_dir, workspace) = fixture();
+        let app = workspace.root().join("app.txt");
+        let original_digest = content_digest(&fs::read(&app).unwrap());
+        fs::write(&app, "after\n").unwrap();
+        let applied_digest = content_digest(&fs::read(&app).unwrap());
+        let owned = GitOwnedPath {
+            path: PathBuf::from("app.txt"),
+            original_digest: Some(original_digest),
+            applied_digest: Some(applied_digest),
+        };
+        let repository = GitRepository::open(&workspace, GitLimits::default())
+            .await
+            .unwrap();
+
+        let staged = repository
+            .stage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+        assert_eq!(staged.staged_files, vec![PathBuf::from("app.txt")]);
+        assert!(repository
+            .diff(GitDiffRequest {
+                staged: true,
+                paths: vec![PathBuf::from("app.txt")],
+                context_lines: 3,
+            })
+            .await
+            .unwrap()
+            .patch
+            .contains("+after"));
+
+        let committed = repository
+            .commit_owned("agent change", std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+        assert_eq!(committed.committed_files, vec![PathBuf::from("app.txt")]);
+        assert_eq!(committed.oid.len(), 40);
+        assert!(repository.status().await.unwrap().changes.is_empty());
+        assert_eq!(
+            repository.history(1).await.unwrap().commits[0].subject,
+            "agent change"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_stage_changes_that_started_from_a_dirty_user_file() {
+        let (_temp_dir, workspace) = fixture();
+        let app = workspace.root().join("app.txt");
+        fs::write(&app, "user change\n").unwrap();
+        let user_digest = content_digest(&fs::read(&app).unwrap());
+        fs::write(&app, "user change plus agent\n").unwrap();
+        let agent_digest = content_digest(&fs::read(&app).unwrap());
+        let repository = GitRepository::open(&workspace, GitLimits::default())
+            .await
+            .unwrap();
+
+        let error = repository
+            .stage_owned(&[GitOwnedPath {
+                path: PathBuf::from("app.txt"),
+                original_digest: Some(user_digest),
+                applied_digest: Some(agent_digest),
+            }])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GitError::OriginalDoesNotMatchIndex { .. }));
+        let status = repository.status().await.unwrap();
+        assert!(status
+            .changes
+            .iter()
+            .any(|change| change.path == Path::new("app.txt") && change.index_status == ' '));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_commit_when_any_foreign_path_is_staged() {
+        let (_temp_dir, workspace) = fixture();
+        fs::write(workspace.root().join("other.txt"), "user staged\n").unwrap();
+        git(workspace.root(), &["add", "--", "other.txt"]);
+        let app = workspace.root().join("app.txt");
+        let original_digest = content_digest(&fs::read(&app).unwrap());
+        fs::write(&app, "agent\n").unwrap();
+        let applied_digest = content_digest(&fs::read(&app).unwrap());
+        let owned = GitOwnedPath {
+            path: PathBuf::from("app.txt"),
+            original_digest: Some(original_digest),
+            applied_digest: Some(applied_digest),
+        };
+        let repository = GitRepository::open(&workspace, GitLimits::default())
+            .await
+            .unwrap();
+        repository
+            .stage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+
+        let error = repository
+            .commit_owned("must fail", std::slice::from_ref(&owned))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GitError::StagedPathsMismatch { .. }));
+        assert_eq!(
+            repository.history(1).await.unwrap().commits[0].subject,
+            "initial"
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_a_valid_branch_without_switching_or_overwriting() {
+        let (_temp_dir, workspace) = fixture();
+        let repository = GitRepository::open(&workspace, GitLimits::default())
+            .await
+            .unwrap();
+        let current = repository.status().await.unwrap().branch.unwrap();
+
+        let created = repository
+            .create_branch("agent/topic", Some("HEAD"))
+            .await
+            .unwrap();
+
+        assert_eq!(created.name, "agent/topic");
+        assert_eq!(created.start_oid.len(), 40);
+        assert_eq!(repository.status().await.unwrap().branch.unwrap(), current);
+        assert!(matches!(
+            repository.create_branch("-invalid", None).await,
+            Err(GitError::InvalidRevision {
+                kind: "branch name"
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn reports_detached_and_unborn_repository_state() {
         let (temp_dir, workspace) = fixture();
         git(temp_dir.path(), &["checkout", "--detach"]);
@@ -779,6 +1347,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (_temp_dir, workspace) = fixture();
+        let app = workspace.root().join("app.txt");
+        let original_digest = content_digest(&fs::read(&app).unwrap());
         let filter = workspace.root().join("filter.sh");
         fs::write(&filter, "#!/bin/sh\ntouch filter-was-executed\ncat\n").unwrap();
         fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -795,7 +1365,8 @@ mod tests {
             workspace.root(),
             &["config", "filter.evil.required", "true"],
         );
-        fs::write(workspace.root().join("app.txt"), "after\n").unwrap();
+        fs::write(&app, "after\n").unwrap();
+        let applied_digest = content_digest(&fs::read(&app).unwrap());
         let repository = GitRepository::open(&workspace, GitLimits::default())
             .await
             .unwrap();
@@ -807,6 +1378,14 @@ mod tests {
                 paths: vec![PathBuf::from("app.txt")],
                 context_lines: 3,
             })
+            .await
+            .unwrap();
+        repository
+            .stage_owned(&[GitOwnedPath {
+                path: PathBuf::from("app.txt"),
+                original_digest: Some(original_digest),
+                applied_digest: Some(applied_digest),
+            }])
             .await
             .unwrap();
 
