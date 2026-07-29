@@ -1,8 +1,16 @@
+import { execFileSync } from 'node:child_process';
+import { X509Certificate } from 'node:crypto';
 import fs from 'node:fs';
+import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildLocalServeUrls, findPonduinBinaryPath, startPonduinServe } from './ponduinServe';
+import {
+  buildLocalServeUrls,
+  createPinnedHttpsReadinessFetch,
+  findPonduinBinaryPath,
+  startPonduinServe,
+} from './ponduinServe';
 
 const binaryName = process.platform === 'win32' ? 'ponduin.exe' : 'ponduin';
 const tempDirs: string[] = [];
@@ -27,6 +35,40 @@ function makeExecutable(filePath: string, contents: string): string {
   fs.writeFileSync(filePath, contents);
   fs.chmodSync(filePath, 0o755);
   return filePath;
+}
+
+function makeSelfSignedCertificate(tempDir: string): {
+  certPath: string;
+  keyPath: string;
+  fingerprint: string;
+} {
+  const keyPath = path.join(tempDir, 'key.pem');
+  const certPath = path.join(tempDir, 'cert.pem');
+  execFileSync(
+    'openssl',
+    [
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-nodes',
+      '-keyout',
+      keyPath,
+      '-out',
+      certPath,
+      '-subj',
+      '/CN=127.0.0.1',
+      '-days',
+      '1',
+    ],
+    { stdio: 'ignore' }
+  );
+
+  return {
+    certPath,
+    keyPath,
+    fingerprint: new X509Certificate(fs.readFileSync(certPath)).fingerprint256,
+  };
 }
 
 async function waitForFileLines(filePath: string): Promise<string[]> {
@@ -117,6 +159,51 @@ describe('buildLocalServeUrls', () => {
   });
 });
 
+describe('createPinnedHttpsReadinessFetch', () => {
+  it.skipIf(process.platform === 'win32')(
+    'accepts only the exact certificate emitted by a real TLS server',
+    async () => {
+      const tempDir = makeTempDir();
+      const { certPath, fingerprint, keyPath } = makeSelfSignedCertificate(tempDir);
+      const certificate = fs.readFileSync(certPath);
+      const server = https.createServer(
+        {
+          cert: certificate,
+          key: fs.readFileSync(keyPath),
+        },
+        (_request, response) => {
+          response.writeHead(200);
+          response.end('ok');
+        }
+      );
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+      try {
+        const address = server.address();
+        if (!address || typeof address === 'string') {
+          throw new Error('TLS test server did not expose a TCP port');
+        }
+        const url = `https://127.0.0.1:${address.port}/status`;
+
+        await expect(createPinnedHttpsReadinessFetch(fingerprint)(url)).resolves.toMatchObject({
+          ok: true,
+          status: 200,
+        });
+        const wrongFingerprint = `${fingerprint.startsWith('00:') ? 'FF' : '00'}${fingerprint.slice(
+          2
+        )}`;
+        await expect(createPinnedHttpsReadinessFetch(wrongFingerprint)(url)).rejects.toThrow(
+          'TLS certificate fingerprint mismatch'
+        );
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve()))
+        );
+      }
+    }
+  );
+});
+
 describe('startPonduinServe', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -157,6 +244,55 @@ describe('startPonduinServe', () => {
       await result.cleanup();
     }
   });
+
+  it.skipIf(process.platform === 'win32')(
+    'retries a pinned HTTPS probe until a delayed child server is ready',
+    async () => {
+      const tempDir = makeTempDir();
+      const { certPath, fingerprint, keyPath } = makeSelfSignedCertificate(tempDir);
+      const ponduinPath = makeExecutable(
+        path.join(tempDir, 'delayed-ponduin'),
+        [
+          '#!/usr/bin/env node',
+          "const fs = require('node:fs');",
+          "const https = require('node:https');",
+          "const portIndex = process.argv.indexOf('--port');",
+          'const port = Number(process.argv[portIndex + 1]);',
+          'console.log(`PONDUIND_CERT_FINGERPRINT=${process.env.TEST_TLS_FINGERPRINT}`);',
+          'setTimeout(() => {',
+          '  https.createServer({',
+          '    cert: fs.readFileSync(process.env.TEST_TLS_CERT),',
+          '    key: fs.readFileSync(process.env.TEST_TLS_KEY),',
+          '  }, (_request, response) => {',
+          '    response.writeHead(200);',
+          "    response.end('ok');",
+          "  }).listen(port, '127.0.0.1');",
+          '}, 300);',
+          '',
+        ].join('\n')
+      );
+      vi.stubEnv('PONDUIN_BINARY', ponduinPath);
+      const startedAt = Date.now();
+
+      const result = await startPonduinServe({
+        serverSecret: 'test-secret',
+        dir: tempDir,
+        tls: true,
+        env: {
+          TEST_TLS_CERT: certPath,
+          TEST_TLS_FINGERPRINT: fingerprint,
+          TEST_TLS_KEY: keyPath,
+        },
+      });
+
+      try {
+        expect(result.certFingerprint).toBe(fingerprint);
+        expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+      } finally {
+        await result.cleanup();
+      }
+    }
+  );
 
   it.skipIf(process.platform === 'win32')('captures the TLS fingerprint from stdout', async () => {
     const tempDir = makeTempDir();

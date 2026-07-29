@@ -1,8 +1,11 @@
 import { spawn, type ChildProcess } from 'child_process';
 import fs from 'node:fs';
+import https from 'node:https';
 import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import type { TLSSocket } from 'node:tls';
+import { normalizeCertificateFingerprint } from './certificateFingerprint';
 import {
   appendTail as appendStartupTail,
   createPonduinServeStartupDiagnostics,
@@ -141,6 +144,40 @@ interface ReadinessProbeResult {
   status?: number;
   error?: string;
 }
+
+export const createPinnedHttpsReadinessFetch = (expectedFingerprint: string): ReadinessFetch => {
+  const normalizedExpectedFingerprint = normalizeCertificateFingerprint(expectedFingerprint);
+
+  return async (input, init) =>
+    new Promise<Response>((resolve, reject) => {
+      const request = https.request(
+        input,
+        {
+          method: 'GET',
+          rejectUnauthorized: false,
+          signal: init?.signal ?? undefined,
+        },
+        (response) => {
+          const certificate = (response.socket as TLSSocket).getPeerCertificate();
+          const actualFingerprint = certificate.fingerprint256
+            ? normalizeCertificateFingerprint(certificate.fingerprint256)
+            : null;
+
+          if (!actualFingerprint || actualFingerprint !== normalizedExpectedFingerprint) {
+            response.resume();
+            reject(new Error('TLS certificate fingerprint mismatch during readiness check'));
+            return;
+          }
+
+          response.resume();
+          resolve(new Response(null, { status: response.statusCode ?? 500 }));
+        }
+      );
+
+      request.once('error', reject);
+      request.end();
+    });
+};
 
 const fetchStatus = async (
   statusUrl: string,
@@ -349,7 +386,7 @@ export const startPonduinServe = async ({
   resourcesPath,
   logger = defaultLogger,
   diagnosticsDir,
-  readinessFetch = fetch,
+  readinessFetch,
   onCertFingerprint,
 }: StartPonduinServeOptions): Promise<PonduinServeResult> => {
   const workingDir = dir || process.cwd();
@@ -592,9 +629,12 @@ export const startPonduinServe = async ({
     }
   }
 
+  const effectiveReadinessFetch =
+    readinessFetch ??
+    (tls && certFingerprint ? createPinnedHttpsReadinessFetch(certFingerprint) : fetch);
   const ready = await waitForPonduinServeReady(statusUrl, errorLog, () => exited || spawnFailed, {
     healthUrl,
-    readinessFetch,
+    readinessFetch: effectiveReadinessFetch,
     onEvent: startupTrace?.record,
   });
 

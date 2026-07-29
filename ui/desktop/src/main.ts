@@ -302,9 +302,9 @@ async function configureProxy() {
 
 if (started) app.quit();
 
-// Certificate trust for active backend leases. Renderer requests and
-// main-process net.fetch both pin to the exact cert fingerprint. Each backend
-// lease owns a trust record so old windows keep working after settings change.
+// Certificate trust for active backend leases. Renderer requests and external
+// main-process net.fetch calls pin to the exact cert fingerprint. Local startup
+// readiness uses its own pinned Node HTTPS probe in ponduinServe.ts.
 interface BackendCertificateTrust {
   hostname: string;
   fingerprint: string | null;
@@ -1156,7 +1156,6 @@ const createChat = async (
         resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
         logger: log,
         diagnosticsDir: STARTUP_LOGS_DIR,
-        readinessFetch: net.fetch as unknown as typeof globalThis.fetch,
         onCertFingerprint: (fingerprint) => {
           localCertificateTrust.trust.fingerprint = normalizeCertificateFingerprint(fingerprint);
         },
