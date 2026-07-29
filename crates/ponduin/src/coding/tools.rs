@@ -891,7 +891,6 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
                 | ROLLBACK_CHANGES_TOOL_NAME
                 | GIT_STATUS_TOOL_NAME
                 | GIT_DIFF_TOOL_NAME
-                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
                 | WORKFLOW_STATUS_TOOL_NAME
         ),
         WorkflowPhase::Testing => matches!(
@@ -2710,98 +2709,49 @@ fn mutation_batch_schema() -> serde_json::Map<String, Value> {
                 "type": "array",
                 "minItems": 1,
                 "items": {
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "required": ["operation", "path", "content"],
-                            "properties": {
-                                "operation": {"const": "create"},
-                                "path": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "description": "New path. Missing parent directories are created safely. May be workspace-relative or an absolute path resolving inside the coding workspace."
-                                },
-                                "content": {"type": "string"}
-                            },
-                            "additionalProperties": false
+                    "type": "object",
+                    "required": ["operation", "path"],
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["create", "write", "replace", "delete", "move"],
+                            "description": "create requires content; write requires expected_digest and content; replace requires expected_digest and replacements; delete requires expected_digest; move requires expected_digest and destination."
                         },
-                        {
-                            "type": "object",
-                            "required": ["operation", "path", "expected_digest", "content"],
-                            "properties": {
-                                "operation": {"const": "write"},
-                                "path": {"type": "string", "minLength": 1},
-                                "expected_digest": {
-                                    "type": "string",
-                                    "description": "Complete BLAKE3 digest returned by coding__read_file."
-                                },
-                                "content": {"type": "string"}
-                            },
-                            "additionalProperties": false
+                        "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Workspace-relative path, or an absolute path resolving inside the coding workspace. For create, missing parent directories are created safely."
                         },
-                        {
-                            "type": "object",
-                            "required": ["operation", "path", "expected_digest", "replacements"],
-                            "properties": {
-                                "operation": {"const": "replace"},
-                                "path": {"type": "string", "minLength": 1},
-                                "expected_digest": {
-                                    "type": "string",
-                                    "description": "Complete BLAKE3 digest returned by coding__read_file."
-                                },
-                                "replacements": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "items": {
-                                        "type": "object",
-                                        "required": ["old", "new"],
-                                        "properties": {
-                                            "old": {"type": "string", "minLength": 1},
-                                            "new": {"type": "string"},
-                                            "replace_all": {"type": "boolean", "default": false}
-                                        },
-                                        "additionalProperties": false
-                                    }
-                                }
-                            },
-                            "additionalProperties": false
+                        "content": {
+                            "type": "string",
+                            "description": "Complete new file content for create or write."
                         },
-                        {
-                            "type": "object",
-                            "required": ["operation", "path", "expected_digest"],
-                            "properties": {
-                                "operation": {"const": "delete"},
-                                "path": {"type": "string", "minLength": 1},
-                                "expected_digest": {
-                                    "type": "string",
-                                    "description": "Complete BLAKE3 digest returned by coding__read_file."
-                                }
-                            },
-                            "additionalProperties": false
+                        "expected_digest": {
+                            "type": "string",
+                            "description": "Complete BLAKE3 digest returned by coding__read_file; required for every operation on an existing file."
                         },
-                        {
-                            "type": "object",
-                            "required": ["operation", "path", "destination", "expected_digest"],
-                            "properties": {
-                                "operation": {"const": "move"},
-                                "path": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "description": "Existing workspace-relative source file."
+                        "destination": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Unoccupied workspace-relative destination for move."
+                        },
+                        "replacements": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "Exact conflict-safe replacements for replace.",
+                            "items": {
+                                "type": "object",
+                                "required": ["old", "new"],
+                                "properties": {
+                                    "old": {"type": "string", "minLength": 1},
+                                    "new": {"type": "string"},
+                                    "replace_all": {"type": "boolean", "default": false}
                                 },
-                                "destination": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "description": "Unoccupied workspace-relative destination whose parent exists."
-                                },
-                                "expected_digest": {
-                                    "type": "string",
-                                    "description": "Complete source BLAKE3 digest returned by coding__read_file."
-                                }
-                            },
-                            "additionalProperties": false
+                                "additionalProperties": false
+                            }
                         }
-                    ]
+                    },
+                    "additionalProperties": false
                 }
             }
         },
@@ -3730,6 +3680,31 @@ mod tests {
     }
 
     #[test]
+    fn mutation_schema_is_flat_while_runtime_validation_remains_strict() {
+        let schema = Value::Object(mutation_batch_schema());
+        let item = &schema["properties"]["changes"]["items"];
+        assert!(item.get("oneOf").is_none());
+        assert!(item.get("anyOf").is_none());
+        assert_eq!(
+            item["properties"]["operation"]["enum"],
+            serde_json::json!(["create", "write", "replace", "delete", "move"])
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let error = execute(
+            &enabled_config(),
+            CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
+                "changes": [{"operation": "create", "path": "missing-content.txt"}]
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("missing field `content`"));
+        assert!(!temp_dir.path().join("missing-content.txt").exists());
+    }
+
+    #[test]
     fn executes_repository_profile_inside_workspace() {
         let temp_dir = tempfile::tempdir().unwrap();
         fs::write(temp_dir.path().join("Cargo.toml"), "[workspace]").unwrap();
@@ -3928,6 +3903,7 @@ mod tests {
         assert!(editing_tools.contains(APPLY_CHANGES_TOOL_NAME));
         assert!(!editing_tools.contains(PREPARE_CONTEXT_TOOL_NAME));
         assert!(!editing_tools.contains(RUN_PROCESS_TOOL_NAME));
+        assert!(!editing_tools.contains(WORKFLOW_UPDATE_MEMORY_TOOL_NAME));
         assert!(!editing_tools.contains(WORKFLOW_TRANSITION_TOOL_NAME));
         let canonical_root = temp_dir.path().canonicalize().unwrap();
         assert!(state
