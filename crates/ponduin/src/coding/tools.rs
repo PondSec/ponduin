@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const CODING_TOOL_PREFIX: &str = "coding__";
+pub const ACTIVATE_AGENT_TOOL_NAME: &str = "coding__activate_agent";
 pub const REPOSITORY_PROFILE_TOOL_NAME: &str = "coding__repository_profile";
 pub const REPOSITORY_INSTRUCTIONS_TOOL_NAME: &str = "coding__repository_instructions";
 pub const FIND_FILES_TOOL_NAME: &str = "coding__find_files";
@@ -708,6 +709,26 @@ pub fn definitions() -> Vec<Tool> {
         review_changes_tool(),
         lsp_query_tool(),
     ]
+}
+
+pub(crate) fn routing_definition() -> Tool {
+    Tool::new(
+        ACTIVATE_AGENT_TOOL_NAME.to_string(),
+        "Activate ponduin's complete internal coding capability for the current user turn. The \
+         language model must decide from the complete request and conversation context, never \
+         from keywords or previous tool use. Call this as the only tool and emit no prose when \
+         the current request requires inspecting, changing, validating, debugging, reviewing, or \
+         otherwise working with a software project. Do not call it for general knowledge, \
+         conversation, explanations that require no repository work, or unrelated tasks. After \
+         activation, continue the original request automatically with the newly exposed tools."
+            .to_string(),
+        object!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Activate internal coding capability"))
 }
 
 pub fn is_reserved_name(name: &str) -> bool {
