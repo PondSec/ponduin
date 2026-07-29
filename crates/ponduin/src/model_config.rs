@@ -115,10 +115,38 @@ pub async fn complete_fast(
     messages: &[Message],
     tools: &[Tool],
 ) -> Result<(Message, ProviderUsage), ProviderError> {
+    complete_fast_with_max_tokens(
+        provider,
+        model_config,
+        session_id,
+        system,
+        messages,
+        tools,
+        None,
+    )
+    .await
+}
+
+/// Run a lightweight completion with an optional task-specific output limit.
+///
+/// The limit is applied after resolving the provider's fast model and to the
+/// main-model fallback. This keeps bounded tasks such as session naming from
+/// inheriting a large general-purpose output limit, even when
+/// `PONDUIN_FAST_MODEL` selects a different model.
+pub async fn complete_fast_with_max_tokens(
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    system: &str,
+    messages: &[Message],
+    tools: &[Tool],
+    max_tokens: Option<i32>,
+) -> Result<(Message, ProviderUsage), ProviderError> {
     let fast_model_config = get_fast_model(provider.get_name(), model_config)
         .await
         .map_err(|e| ProviderError::ExecutionError(e.to_string()))?
         .with_thinking_effort(ThinkingEffort::Off);
+    let fast_model_config = with_task_max_tokens(fast_model_config, max_tokens);
 
     match crate::session_context::with_session_id(
         Some(session_id.to_string()),
@@ -137,6 +165,7 @@ pub async fn complete_fast(
             let fallback_config = model_config
                 .clone()
                 .with_thinking_effort(ThinkingEffort::Off);
+            let fallback_config = with_task_max_tokens(fallback_config, max_tokens);
             crate::session_context::with_session_id(
                 Some(session_id.to_string()),
                 provider.complete(&fallback_config, system, messages, tools),
@@ -144,6 +173,13 @@ pub async fn complete_fast(
             .await
         }
         Err(e) => Err(e),
+    }
+}
+
+fn with_task_max_tokens(model_config: ModelConfig, max_tokens: Option<i32>) -> ModelConfig {
+    match max_tokens {
+        Some(max_tokens) => model_config.with_max_tokens(Some(max_tokens)),
+        None => model_config,
     }
 }
 
@@ -245,5 +281,28 @@ fn parse_yaml_bool_config(key: &str, value: serde_yaml::Value) -> Result<bool> {
             serde_yaml::to_string(&other).unwrap_or_else(|_| "<unprintable>".to_string()).trim()
         ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_output_limit_overrides_general_model_limit() {
+        let config = ModelConfig::new("test").with_max_tokens(Some(4096));
+
+        let config = with_task_max_tokens(config, Some(64));
+
+        assert_eq!(config.max_tokens, Some(64));
+    }
+
+    #[test]
+    fn absent_task_output_limit_preserves_general_model_limit() {
+        let config = ModelConfig::new("test").with_max_tokens(Some(4096));
+
+        let config = with_task_max_tokens(config, None);
+
+        assert_eq!(config.max_tokens, Some(4096));
     }
 }

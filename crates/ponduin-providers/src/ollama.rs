@@ -11,6 +11,7 @@ use crate::formats::ollama::{create_request, response_to_streaming_message_ollam
 use crate::images::ImageFormat;
 use crate::model::ModelConfig;
 use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
+use crate::thinking::ThinkingEffort;
 use anyhow::{Error, Result};
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -243,6 +244,13 @@ fn apply_ollama_options(payload: &mut Value, options: &OllamaOptions, model_conf
         // users on older builds should set OLLAMA_STREAM_USAGE=false.
         if !options.stream_usage {
             obj.remove("stream_options");
+        }
+
+        // Ollama's OpenAI-compatible endpoint uses `reasoning_effort: "none"`
+        // to disable thinking. The generic request builder intentionally keeps
+        // `thinking_effort` internal, so translate the unified setting here.
+        if model_config.thinking_effort() == Some(ThinkingEffort::Off) {
+            obj.insert("reasoning_effort".to_string(), json!("none"));
         }
 
         // Convert max_completion_tokens / max_tokens to Ollama's options.num_predict.
@@ -666,6 +674,29 @@ mod tests {
         let mut payload = json!({});
         apply_ollama_options(&mut payload, &options, &model_config);
         assert!(payload.get("options").is_none());
+    }
+
+    #[test]
+    fn test_apply_ollama_options_disables_thinking_for_fast_tasks() {
+        let options = OllamaOptions::default();
+        let model_config = ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Off);
+        let mut payload = json!({});
+
+        apply_ollama_options(&mut payload, &options, &model_config);
+
+        assert_eq!(payload["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn test_apply_ollama_options_does_not_override_enabled_thinking() {
+        let options = OllamaOptions::default();
+        let model_config =
+            ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Medium);
+        let mut payload = json!({});
+
+        apply_ollama_options(&mut payload, &options, &model_config);
+
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test]
