@@ -5,6 +5,9 @@ use crate::coding::file::{
 };
 use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitOwnedPath, GitRepository};
 use crate::coding::intelligence::{IntelligenceLimits, RepositoryIndex, RepositoryIntelligence};
+use crate::coding::lsp::{
+    LanguageServerClient, LanguageServerOperation, LanguageServerPosition, LanguageServerQuery,
+};
 use crate::coding::patch::{
     MutationBatch, MutationPreview, MutationResult, PatchEngine, PatchLimits, RollbackRecord,
     DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
@@ -62,6 +65,7 @@ pub const WORKFLOW_STATUS_TOOL_NAME: &str = "coding__workflow_status";
 pub const WORKFLOW_COMPLETE_TOOL_NAME: &str = "coding__workflow_complete";
 pub const RUN_VALIDATION_TOOL_NAME: &str = "coding__run_validation";
 pub const REVIEW_CHANGES_TOOL_NAME: &str = "coding__review_changes";
+pub const LSP_QUERY_TOOL_NAME: &str = "coding__lsp_query";
 
 const DEFAULT_REPOSITORY_FILE_LIMIT: usize = 50_000;
 const MAX_REPOSITORY_FILE_LIMIT: usize = 100_000;
@@ -639,6 +643,7 @@ pub fn definitions() -> Vec<Tool> {
         workflow_complete_tool(),
         run_validation_tool(),
         review_changes_tool(),
+        lsp_query_tool(),
     ]
 }
 
@@ -664,6 +669,7 @@ fn is_repository_activity(name: &str) -> bool {
             | PROJECT_CAPABILITIES_TOOL_NAME
             | PREPARE_CONTEXT_TOOL_NAME
             | REVIEW_CHANGES_TOOL_NAME
+            | LSP_QUERY_TOOL_NAME
     )
 }
 
@@ -681,6 +687,7 @@ pub(crate) fn is_async_tool(name: &str) -> bool {
             | GIT_PUSH_OWNED_TOOL_NAME
             | RUN_VALIDATION_TOOL_NAME
             | REVIEW_CHANGES_TOOL_NAME
+            | LSP_QUERY_TOOL_NAME
     )
 }
 
@@ -886,6 +893,29 @@ pub(crate) async fn execute_async(
             state.invalidate_intelligence(workspace.root());
             state.record_validation_execution(workspace.root(), &execution)?;
             bounded_validation_result(execution, config.output_limit)
+        }
+        LSP_QUERY_TOOL_NAME => {
+            if !config.lsp {
+                return Err(tool_unavailable(
+                    "Language Server Protocol support is disabled by coding configuration",
+                ));
+            }
+            let params: LspQueryParams = parse_arguments(&tool_call)?;
+            let timeout = params
+                .timeout_seconds
+                .map(Duration::from_secs)
+                .unwrap_or(config.shell_timeout);
+            if timeout.is_zero() || timeout > config.shell_timeout {
+                return Err(invalid_arguments(format!(
+                    "timeout_seconds must be between 1 and the configured coding shell timeout of {}",
+                    config.shell_timeout.as_secs()
+                )));
+            }
+            let result = LanguageServerClient::new(&workspace, timeout)
+                .query(params.into_query())
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            json_result(&result, config.output_limit)
         }
         _ => unreachable!("async coding tool name was checked"),
     }
@@ -1165,7 +1195,8 @@ pub(crate) fn execute_with_state(
         | GIT_CREATE_BRANCH_TOOL_NAME
         | GIT_PUSH_OWNED_TOOL_NAME
         | RUN_VALIDATION_TOOL_NAME
-        | REVIEW_CHANGES_TOOL_NAME => Err(internal_error(
+        | REVIEW_CHANGES_TOOL_NAME
+        | LSP_QUERY_TOOL_NAME => Err(internal_error(
             "asynchronous coding tools require asynchronous dispatch",
         )),
         _ => Err(invalid_arguments(format!(
@@ -2039,6 +2070,63 @@ fn review_changes_tool() -> Tool {
     .annotate(read_only_annotations("Review local coding changes"))
 }
 
+fn lsp_query_tool() -> Tool {
+    Tool::new(
+        LSP_QUERY_TOOL_NAME.to_string(),
+        "Query a locally installed language server for document symbols, definitions, or \
+         references. This optional feature is disabled by default and never replaces the \
+         built-in Tree-sitter fallback. The source path is workspace-confined, sensitive files \
+         and external result locations are excluded, protocol traffic is bounded, the server \
+         receives a restricted environment, and the complete process group is stopped at the \
+         configured timeout. Enabling LSP explicitly trusts the selected local executable to \
+         inspect the repository."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["path", "operation"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Workspace-relative UTF-8 source file."
+                },
+                "operation": {
+                    "type": "string",
+                    "enum": ["document_symbols", "definition", "references"]
+                },
+                "position": {
+                    "type": ["object", "null"],
+                    "default": null,
+                    "description": "Required for definition and references; values are one-based.",
+                    "required": ["line", "column"],
+                    "properties": {
+                        "line": {"type": "integer", "minimum": 1},
+                        "column": {"type": "integer", "minimum": 1}
+                    },
+                    "additionalProperties": false
+                },
+                "include_declaration": {
+                    "type": "boolean",
+                    "default": true
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 100
+                },
+                "timeout_seconds": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "default": null
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(read_only_annotations("Query local language server"))
+}
+
 fn bounded_string_array_schema(min_items: usize) -> Value {
     serde_json::json!({
         "type": "array",
@@ -2778,6 +2866,33 @@ struct RunValidationParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspQueryParams {
+    path: PathBuf,
+    operation: LanguageServerOperation,
+    #[serde(default)]
+    position: Option<LanguageServerPosition>,
+    #[serde(default = "default_include_declaration")]
+    include_declaration: bool,
+    #[serde(default = "default_symbol_results")]
+    max_results: usize,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+impl LspQueryParams {
+    fn into_query(self) -> LanguageServerQuery {
+        LanguageServerQuery {
+            path: self.path,
+            operation: self.operation,
+            position: self.position,
+            include_declaration: self.include_declaration,
+            max_results: self.max_results,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct GitStatusParams {
     max_entries: usize,
@@ -2873,6 +2988,10 @@ fn default_symbol_results() -> usize {
     100
 }
 
+fn default_include_declaration() -> bool {
+    true
+}
+
 fn default_context_results() -> usize {
     20
 }
@@ -2958,7 +3077,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 30);
+        assert_eq!(tools.len(), 31);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -3576,6 +3695,26 @@ mod tests {
         assert_eq!(json["stdout"].as_str().unwrap().trim(), "out");
         assert_eq!(json["stderr"].as_str().unwrap().trim(), "err");
         assert_eq!(json["timed_out"], false);
+    }
+
+    #[tokio::test]
+    async fn lsp_queries_fail_closed_until_explicitly_enabled() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("lib.rs"), "fn value() {}\n").unwrap();
+        let error = execute_async(
+            &enabled_config(),
+            &CodingToolState::default(),
+            CallToolRequestParams::new(LSP_QUERY_TOOL_NAME).with_arguments(object!({
+                "path": "lib.rs",
+                "operation": "document_symbols"
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert!(error.message.contains("disabled by coding configuration"));
     }
 
     #[tokio::test]
