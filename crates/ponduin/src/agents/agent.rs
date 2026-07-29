@@ -2070,7 +2070,7 @@ impl Agent {
             tool_call_cut_off,
             ponduin_mode,
             initial_messages,
-            model_config,
+            mut model_config,
         } = context;
 
         self.reset_retry_attempts().await;
@@ -2086,6 +2086,10 @@ impl Agent {
                 &cancel_token,
             )
             .await?;
+        if coding_exposure == super::reply_parts::CodingToolExposure::Active {
+            model_config = model_config
+                .with_default_thinking_effort(provider.default_coding_thinking_effort());
+        }
         let (mut tools, mut toolshim_tools, mut system_prompt, _) = self
             .prepare_tools_and_prompt_with_coding(
                 &session_config.id,
@@ -4250,6 +4254,12 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         fn get_name(&self) -> &str {
             "coding-disclosure"
         }
+
+        fn default_coding_thinking_effort(
+            &self,
+        ) -> Option<ponduin_providers::thinking::ThinkingEffort> {
+            Some(ponduin_providers::thinking::ThinkingEffort::Off)
+        }
     }
 
     impl CountingTextProvider {
@@ -4389,6 +4399,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .tools
             .iter()
             .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        assert_eq!(active.thinking_effort.as_deref(), Some("off"));
 
         let next_routing = &snapshots[3];
         assert!(next_routing.system_prompt.contains("routing pass only"));
@@ -4420,6 +4431,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .tools
             .iter()
             .all(|name| !crate::coding::tools::is_reserved_name(name)));
+        assert_eq!(inactive.thinking_effort, None);
         Ok(())
     }
 

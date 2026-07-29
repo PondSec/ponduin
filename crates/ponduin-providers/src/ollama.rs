@@ -402,6 +402,10 @@ impl Provider for OllamaProvider {
         &self.name
     }
 
+    fn default_coding_thinking_effort(&self) -> Option<ThinkingEffort> {
+        Some(ThinkingEffort::Off)
+    }
+
     fn skip_canonical_filtering(&self) -> bool {
         self.skip_canonical_filtering
     }
@@ -689,6 +693,22 @@ mod tests {
         apply_ollama_options(&mut payload, &options, &model_config);
 
         assert_eq!(payload["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn test_ollama_defaults_internal_coding_turns_to_tool_first_execution() {
+        let provider = from_declarative_config(
+            ollama_config(Some(false), vec![ModelInfo::new("qwen3:8b", 32_768)]),
+            None,
+            crate::declarative::EnvKeyResolver,
+        )
+        .expect("valid Ollama test config")
+        .build();
+
+        assert_eq!(
+            provider.default_coding_thinking_effort(),
+            Some(ThinkingEffort::Off)
+        );
     }
 
     #[test]
