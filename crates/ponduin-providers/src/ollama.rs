@@ -19,6 +19,7 @@ use futures::TryStreamExt;
 use reqwest::{Response, StatusCode};
 use rmcp::model::Tool;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::time::Duration;
 use tokio::pin;
 use tokio_stream::StreamExt;
@@ -279,6 +280,21 @@ fn apply_ollama_options(payload: &mut Value, options: &OllamaOptions, model_conf
     }
 }
 
+fn ollama_system_prompt<'a>(model_config: &ModelConfig, system: &'a str) -> Cow<'a, str> {
+    let qwen3 = model_config
+        .model_name
+        .to_ascii_lowercase()
+        .contains("qwen3");
+    if qwen3
+        && model_config.thinking_effort() == Some(ThinkingEffort::Off)
+        && !system.contains("/no_think")
+    {
+        Cow::Owned(format!("{system}\n\n/no_think"))
+    } else {
+        Cow::Borrowed(system)
+    }
+}
+
 pub fn from_declarative_config(
     config: DeclarativeProviderConfig,
     tls_config: Option<TlsConfig>,
@@ -427,9 +443,10 @@ impl Provider for OllamaProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        let system = ollama_system_prompt(model_config, system);
         let mut payload = create_request(
             model_config,
-            system,
+            &system,
             messages,
             tools,
             &ImageFormat::OpenAi,
@@ -693,6 +710,41 @@ mod tests {
         apply_ollama_options(&mut payload, &options, &model_config);
 
         assert_eq!(payload["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn test_qwen3_off_adds_native_no_think_control_to_system_prompt() {
+        let model_config = ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Off);
+
+        let system = ollama_system_prompt(&model_config, "Use tools directly.");
+
+        assert_eq!(system, "Use tools directly.\n\n/no_think");
+    }
+
+    #[test]
+    fn test_qwen3_no_think_control_is_not_duplicated() {
+        let model_config =
+            ModelConfig::new("qwen3-coder:30b").with_thinking_effort(ThinkingEffort::Off);
+
+        let system = ollama_system_prompt(&model_config, "Use tools directly.\n\n/no_think");
+
+        assert_eq!(system, "Use tools directly.\n\n/no_think");
+    }
+
+    #[test]
+    fn test_no_think_control_is_qwen3_off_specific() {
+        let enabled_qwen =
+            ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Medium);
+        let disabled_llama = ModelConfig::new("llama3.1").with_thinking_effort(ThinkingEffort::Off);
+
+        assert_eq!(
+            ollama_system_prompt(&enabled_qwen, "Use tools directly."),
+            "Use tools directly."
+        );
+        assert_eq!(
+            ollama_system_prompt(&disabled_llama, "Use tools directly."),
+            "Use tools directly."
+        );
     }
 
     #[test]
