@@ -72,12 +72,16 @@ const DEFAULT_MAX_TURNS: u32 = 1000;
 const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
 const COMPACTION_PROGRESS_TEXT: &str = "ponduin is compacting the conversation...";
 const MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
-const MAX_EMPTY_TURN_RETRIES: u32 = 3;
+const MAX_UNPRODUCTIVE_TURN_RETRIES: u32 = 3;
 const CODING_ROUTER_MAX_TOKENS: i32 = 128;
 const CODING_ROUTER_MAX_ATTEMPTS: usize = 2;
 const CODING_ROUTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
+const REASONING_ONLY_TURN_MESSAGE: &str =
+    "The model stopped after reasoning without taking an action or providing a visible response. Please resend your message to continue.";
+const UNPRODUCTIVE_TURN_CONTINUATION: &str =
+    "Continue the current task now. Reasoning alone cannot complete a turn: call the appropriate tool or provide a user-visible final answer.";
 const DEFAULT_FRONTEND_INSTRUCTIONS: &str = "The following tools are provided directly by the frontend and will be executed by the frontend when called.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2157,8 +2161,8 @@ impl Agent {
                     .unwrap_or(DEFAULT_MAX_TURNS)
             });
             let mut compaction_attempts = 0;
-            let mut empty_turn_retries = 0u32;
-            let mut retrying_after_empty_turn = false;
+            let mut unproductive_turn_retries = 0u32;
+            let mut retrying_after_unproductive_turn = false;
             let mut last_assistant_text = String::new();
             let mut goal_check_pending = false;
             let mut tool_pair_summarization_done = false;
@@ -2237,8 +2241,8 @@ impl Agent {
 
                 if retrying_after_stop_hook_denial {
                     retrying_after_stop_hook_denial = false;
-                } else if retrying_after_empty_turn {
-                    retrying_after_empty_turn = false;
+                } else if retrying_after_unproductive_turn {
+                    retrying_after_unproductive_turn = false;
                 } else {
                     turns_taken += 1;
                 }
@@ -2293,6 +2297,7 @@ impl Agent {
                 let mut exit_chat = false;
                 let mut provider_errored = false;
                 let mut provider_produced_content = false;
+                let mut provider_produced_non_reasoning_content = false;
                 let mut pending_final_output: Option<String> = None;
                 let mut pending_turn_usage: Option<ProviderUsage> = None;
 
@@ -2345,6 +2350,17 @@ impl Agent {
                                         _ => true,
                                     }
                                 });
+                                provider_produced_non_reasoning_content |=
+                                    response.content.iter().any(|content| match content {
+                                        MessageContent::Thinking(_)
+                                        | MessageContent::RedactedThinking(_) => false,
+                                        MessageContent::Text(text) => !text.text.is_empty(),
+                                        MessageContent::Image(image) => !image.data.is_empty(),
+                                        MessageContent::SystemNotification(notification) => {
+                                            !notification.msg.is_empty()
+                                        }
+                                        _ => true,
+                                    });
 
                                 let ToolCategorizeResult {
                                     frontend_requests,
@@ -2939,23 +2955,25 @@ impl Agent {
                     }
                 }
 
-                // An empty provider response — no tool calls, no text, and no error
-                // or recovery compaction that legitimately produces no assistant
-                // output — must never be persisted: strict providers reject a
-                // conversation that contains an empty assistant turn. Drop it here
-                // regardless of what the match below decides to do about the turn
-                // (final-output nudge, steer, goal/grind, retry, or fallback).
-                let empty_response = no_tools_called
+                // A provider turn is unproductive when it contains neither a tool
+                // call nor non-reasoning content. A completely empty assistant
+                // response must never be persisted because strict providers reject
+                // it. Reasoning-only content is valid provider state, but it is not
+                // a completed action and must not silently end the user turn.
+                let unproductive_response = no_tools_called
                     && !exit_chat
                     && !provider_errored
                     && !did_recovery_compact_this_iteration
-                    && !provider_produced_content
+                    && !provider_produced_non_reasoning_content
                     && last_assistant_text.is_empty();
+                let empty_response = unproductive_response && !provider_produced_content;
+                let reasoning_only_response =
+                    unproductive_response && provider_produced_content;
 
                 if empty_response {
                     messages_to_add = Conversation::default();
-                } else {
-                    empty_turn_retries = 0;
+                } else if !unproductive_response {
+                    unproductive_turn_retries = 0;
                 }
 
                 if no_tools_called && !exit_chat {
@@ -3033,23 +3051,48 @@ impl Agent {
                                     session_manager.replace_conversation(&session_config.id, &conversation).await?;
                                     yield AgentEvent::HistoryReplaced(conversation.clone());
                                 }
-                                Ok(RetryResult::Skipped) if empty_response => {
+                                Ok(RetryResult::Skipped) if unproductive_response => {
                                     // No recipe retry configured, and this empty
-                                    // turn would otherwise fall through to a
-                                    // silent exit. Retry a bounded number of
-                                    // times, then surface a visible message so
-                                    // the user is never left with no response.
-                                    if empty_turn_retries < MAX_EMPTY_TURN_RETRIES {
-                                        empty_turn_retries += 1;
-                                        retrying_after_empty_turn = true;
+                                    // or reasoning-only turn would otherwise fall
+                                    // through to a silent exit. Retry with an
+                                    // agent-visible continuation a bounded number
+                                    // of times, then surface a visible failure.
+                                    if unproductive_turn_retries
+                                        < MAX_UNPRODUCTIVE_TURN_RETRIES
+                                    {
+                                        unproductive_turn_retries += 1;
+                                        retrying_after_unproductive_turn = true;
+                                        messages_to_add.push(
+                                            Message::user()
+                                                .with_text(UNPRODUCTIVE_TURN_CONTINUATION)
+                                                .with_visibility(false, true),
+                                        );
                                         warn!(
-                                            "Provider returned an empty response; retrying ({}/{})",
-                                            empty_turn_retries, MAX_EMPTY_TURN_RETRIES
+                                            response_kind = if reasoning_only_response {
+                                                "reasoning-only"
+                                            } else {
+                                                "empty"
+                                            },
+                                            "Provider returned an unproductive response; retrying ({}/{})",
+                                            unproductive_turn_retries,
+                                            MAX_UNPRODUCTIVE_TURN_RETRIES
                                         );
                                     } else {
-                                        warn!("Provider returned an empty response after retries; ending turn");
-                                        last_assistant_text = EMPTY_TURN_MESSAGE.to_string();
-                                        let message = Message::assistant().with_text(EMPTY_TURN_MESSAGE);
+                                        let fallback = if reasoning_only_response {
+                                            REASONING_ONLY_TURN_MESSAGE
+                                        } else {
+                                            EMPTY_TURN_MESSAGE
+                                        };
+                                        warn!(
+                                            response_kind = if reasoning_only_response {
+                                                "reasoning-only"
+                                            } else {
+                                                "empty"
+                                            },
+                                            "Provider returned an unproductive response after retries; ending turn"
+                                        );
+                                        last_assistant_text = fallback.to_string();
+                                        let message = Message::assistant().with_text(fallback);
                                         messages_to_add.push(message.clone());
                                         yield AgentEvent::Message(message);
                                         exit_chat = true;
