@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use super::super::agents::Agent;
+use crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
 #[cfg(feature = "code-mode")]
 use crate::agents::platform_extensions::code_execution;
 use crate::config::{Config, PonduinMode};
@@ -200,10 +201,12 @@ impl Agent {
         let ponduin_mode = *self.current_ponduin_mode.lock().await;
         let mut tools = self.list_tools(session_id, None).await;
         if coding_exposure == CodingToolExposure::Active {
-            tools.retain(|tool| {
-                crate::coding::tools::is_reserved_name(&tool.name)
-                    || !crate::coding::tools::conflicts_with_internal_project_tools(&tool.name)
-            });
+            tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
+            tools.retain(|tool| tool.name.as_ref() == FINAL_OUTPUT_TOOL_NAME);
+            tools.extend(
+                self.coding_agent
+                    .tools_for_workspace(ponduin_mode, working_dir),
+            );
         } else {
             tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
         }
@@ -305,6 +308,12 @@ impl Agent {
         if let Some(coding_prompt) = coding_prompt {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&coding_prompt);
+        }
+        if coding_exposure == CodingToolExposure::Active {
+            if let Some(workflow_guidance) = self.coding_agent.workflow_guidance(working_dir) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&workflow_guidance);
+            }
         }
 
         // Handle toolshim if enabled
@@ -1021,10 +1030,11 @@ mod tests {
         assert!(!active_names.contains(&crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
         assert!(active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
         assert!(active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(!active_names.contains(&"frontend__a_tool"));
+        assert!(!active_names.contains(&"frontend__z_tool"));
         assert!(active_names
             .iter()
-            .all(|name| crate::coding::tools::is_reserved_name(name)
-                || !crate::coding::tools::conflicts_with_internal_project_tools(name)));
+            .all(|name| crate::coding::tools::is_reserved_name(name)));
         assert!(active_system_prompt.contains("Internal coding capabilities are active"));
         assert!(!active_system_prompt.contains("bounded semantic routing decision"));
 

@@ -2479,10 +2479,17 @@ impl Agent {
                                     // Track extension requests
                                     let mut enable_extension_request_ids = vec![];
                                     let mut coding_activation_request_ids = vec![];
+                                    let mut internal_coding_request_ids = vec![];
                                     for request in &remaining_requests {
                                         if let Ok(tool_call) = &request.tool_call {
                                             if tool_call.name == MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE {
                                                 enable_extension_request_ids.push(request.id.clone());
+                                            }
+                                            if crate::coding::tools::is_reserved_name(
+                                                &tool_call.name,
+                                            ) {
+                                                internal_coding_request_ids
+                                                    .push(request.id.clone());
                                             }
                                             if tool_call.name
                                                 == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME
@@ -2603,6 +2610,13 @@ impl Agent {
                                         && !coding_activation_request_ids.is_empty()
                                     {
                                         coding_tools_active = true;
+                                        tools_updated = true;
+                                    }
+                                    if !internal_coding_request_ids.is_empty() {
+                                        // Internal workflow actions can change the valid next
+                                        // tool set even when the call returns an error. Refresh
+                                        // progressive disclosure from machine state before the
+                                        // next provider turn.
                                         tools_updated = true;
                                     }
                                 }
