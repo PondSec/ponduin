@@ -49,6 +49,8 @@ The following settings can be configured at the root level of your config.yaml f
 | `PONDUIN_TEMPERATURE` | Model response randomness | Float between 0.0 and 1.0 | Model-specific | No |
 | `PONDUIN_MAX_TOKENS` | Maximum number of tokens for each model response (truncates longer responses) | Positive integer | Model-specific | No |
 | `PONDUIN_MODE` | [Tool execution behavior](/docs/guides/managing-tools/ponduin-permissions) | "auto", "approve", "chat", "smart_approve" | "auto" | No |
+| `PONDUIN_CODING_ENABLED` | Enable the [internal coding agent](/docs/guides/internal-coding-agent) | true/false | false | No |
+| `PONDUIN_CODING_MODE` | Internal coding workflow | "coding", "debugging", "refactoring", "repository_analysis", "test_generation", "documentation", "review", "general" | "general" | No |
 | `PONDUIN_MAX_TURNS` | [Maximum number of turns](/docs/guides/sessions/smart-context-management#maximum-turns) allowed without user input | Integer (e.g., 10, 50, 100) | 1000 | No |
 | `PONDUIN_PLANNER_PROVIDER` | Provider for [planning mode](/docs/guides/context-engineering/creating-plans) | Same as `PONDUIN_PROVIDER` options | Falls back to `PONDUIN_PROVIDER` | No |
 | `PONDUIN_PLANNER_MODEL` | Model for planning mode | Model name | Falls back to `PONDUIN_MODEL` | No |
@@ -191,7 +193,7 @@ Use the `available_tools` field to limit which tools are loaded from an extensio
 
 ## Search Path Configuration
 
-Extensions may need to execute external commands or tools. Ponduin builds the command search path from any `PONDUIN_SEARCH_PATHS` entries, built-in fallback paths, and then your system PATH. You can add additional search directories in your config file:
+Extensions may need to execute external commands or tools. ponduin builds the command search path from any `PONDUIN_SEARCH_PATHS` entries, built-in fallback paths, and then your system PATH. You can add additional search directories in your config file:
 
 ```yaml
 PONDUIN_SEARCH_PATHS:

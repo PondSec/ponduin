@@ -17,9 +17,11 @@ The ponduin CLI and desktop apps are under active and continuous development. To
   <TabItem value="mac" label="macOS" default>
     <Tabs groupId="interface">
       <TabItem value="ui" label="ponduin Desktop" default>
-        Update ponduin to the latest stable version.
+        ponduin Desktop checks the latest attested build produced by the `main` branch by default.
 
         <DesktopAutoUpdateSteps />
+
+        Set `PONDUIN_UPDATE_CHANNEL=stable` before launching the app to use the stable release channel instead.
 
         **To manually download and install updates:**
         1. <MacDesktopInstallButtons/>
@@ -38,8 +40,8 @@ The ponduin CLI and desktop apps are under active and continuous development. To
         Additional [options](/docs/guides/ponduin-cli-commands#update-options):
 
         ```sh
-        # Update to latest canary (development) version
-        ponduin update --canary
+        # Update to the latest attested build from main
+        ponduin update --main
 
         # Update and reconfigure settings
         ponduin update --reconfigure
@@ -63,9 +65,11 @@ The ponduin CLI and desktop apps are under active and continuous development. To
   <TabItem value="linux" label="Linux">
     <Tabs groupId="interface">
       <TabItem value="ui" label="ponduin Desktop" default>
-        Update ponduin to the latest stable version.
+        ponduin Desktop checks the latest attested build produced by the `main` branch by default.
 
         <DesktopAutoUpdateSteps />
+
+        Set `PONDUIN_UPDATE_CHANNEL=stable` before launching the app to use the stable release channel instead.
 
         **To manually download and install updates:**
         1. <LinuxDesktopInstallButtons/>
@@ -85,8 +89,8 @@ The ponduin CLI and desktop apps are under active and continuous development. To
         Additional [options](/docs/guides/ponduin-cli-commands#update-options):
 
         ```sh
-        # Update to latest canary (development) version
-        ponduin update --canary
+        # Update to the latest attested build from main
+        ponduin update --main
 
         # Update and reconfigure settings
         ponduin update --reconfigure
@@ -110,9 +114,11 @@ The ponduin CLI and desktop apps are under active and continuous development. To
   <TabItem value="windows" label="Windows">
     <Tabs groupId="interface">
       <TabItem value="ui" label="ponduin Desktop" default>
-        Update ponduin to the latest stable version.
+        ponduin Desktop checks the latest attested build produced by the `main` branch by default.
 
         <DesktopAutoUpdateSteps />
+
+        Set `PONDUIN_UPDATE_CHANNEL=stable` before launching the app to use the stable release channel instead.
 
         **To manually download and install updates:**
         1. <WindowsDesktopInstallButtons/>
@@ -129,8 +135,8 @@ The ponduin CLI and desktop apps are under active and continuous development. To
         Additional [options](/docs/guides/ponduin-cli-commands#update-options):
 
         ```sh
-        # Update to latest canary (development) version
-        ponduin update --canary
+        # Update to the latest attested build from main
+        ponduin update --main
 
         # Update and reconfigure settings
         ponduin update --reconfigure
@@ -162,6 +168,22 @@ The ponduin CLI and desktop apps are under active and continuous development. To
     </Tabs>
   </TabItem>
 </Tabs>
+
+## Update verification
+
+The `main` channel accepts only artifacts from the private
+`PondSec/ponduin` repository. ponduin verifies the GitHub artifact attestation,
+the exact `canary.yml` workflow identity, `refs/heads/main`, and repository
+owner. Desktop also verifies the asset size and SHA-512 digest from the
+attested manifest; CLI binds the downloaded archive's SHA-256 digest directly
+to its artifact attestation. Archive entries and download hosts are validated,
+and the final replacement is atomic.
+
+For a private repository, ponduin can reuse an existing authenticated GitHub
+CLI session. If the release, authentication, attestation, or digest cannot be
+verified, the update fails closed and the installed version is left unchanged.
+The `main` channel becomes available only after the repository's main workflow
+has published the `canary` release.
 
 :::info Updating in CI/CD
 If you're running ponduin in CI or other non-interactive environments, pin a specific version with `PONDUIN_VERSION` for reproducible installs. See [CI/CD Environments](/docs/tutorials/cicd) for a complete example and usage details.

@@ -78,7 +78,7 @@ ponduin --version
 Update the ponduin CLI to a newer version.
 
 **Options:**
-- **`--canary, -c`**: Update to the canary (development) version instead of the stable version
+- **`--canary, --main, -c`**: Update to the latest attested build produced from the `main` branch instead of the stable version
 - **`--reconfigure, -r`**: Forces ponduin to reset configuration settings during the update process
 
 **Usage:**
@@ -86,8 +86,8 @@ Update the ponduin CLI to a newer version.
 # Update to latest stable version
 ponduin update
 
-# Update to latest canary version
-ponduin update --canary
+# Update to the latest attested main build
+ponduin update --main
 
 # Update and reconfigure settings
 ponduin update --reconfigure
