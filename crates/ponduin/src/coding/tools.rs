@@ -2482,9 +2482,9 @@ fn mutation_batch_schema() -> serde_json::Map<String, Value> {
                         }
                     ]
                 }
-            },
-            "additionalProperties": false
-        }
+            }
+        },
+        "additionalProperties": false
     })
 }
 
@@ -3308,6 +3308,45 @@ mod tests {
             assert_eq!(annotations.read_only_hint, Some(!destructive && !stateful));
             assert_eq!(annotations.destructive_hint, Some(destructive));
             assert_eq!(annotations.open_world_hint, Some(false));
+        }
+    }
+
+    #[test]
+    fn definitions_use_object_schemas_for_every_property() {
+        fn visit_schema(tool_name: &str, value: &Value, path: &str) {
+            match value {
+                Value::Object(object) => {
+                    if let Some(properties) = object.get("properties") {
+                        let properties = properties.as_object().unwrap_or_else(|| {
+                            panic!("{tool_name} has non-object properties at {path}")
+                        });
+                        for (name, schema) in properties {
+                            assert!(
+                                schema.is_object(),
+                                "{tool_name} has a non-object property schema at {path}.properties.{name}: {schema}"
+                            );
+                        }
+                    }
+
+                    for (key, child) in object {
+                        visit_schema(tool_name, child, &format!("{path}.{key}"));
+                    }
+                }
+                Value::Array(array) => {
+                    for (index, child) in array.iter().enumerate() {
+                        visit_schema(tool_name, child, &format!("{path}[{index}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for tool in definitions() {
+            visit_schema(
+                &tool.name,
+                &Value::Object((*tool.input_schema).clone()),
+                "$",
+            );
         }
     }
 
