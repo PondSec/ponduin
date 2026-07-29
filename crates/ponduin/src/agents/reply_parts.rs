@@ -198,11 +198,7 @@ impl Agent {
                         // in catalog & filesystem styles, progressive search is handled
                         // by pctx, so we want to omit all non-first-class extensions
                         // from the standard tool list
-                        if crate::agents::extension_manager::get_tool_owner(&t).is_some_and(|o| {
-                            crate::agents::extension_manager::is_first_class_extension(&o)
-                        }) || crate::agents::extension_manager::get_tool_resource_uri(&t)
-                            .is_some()
-                        {
+                        if should_keep_direct_tool_in_code_mode(&t) {
                             Some(t)
                         } else {
                             None
@@ -633,6 +629,31 @@ impl Agent {
             Some(cost) => (Some(cost), Some(CostSource::Estimated)),
             None => (None, None),
         }
+    }
+}
+
+#[cfg(feature = "code-mode")]
+pub(crate) fn should_keep_direct_tool_in_code_mode(tool: &Tool) -> bool {
+    let owner = crate::agents::extension_manager::get_tool_owner(tool);
+
+    owner.is_none()
+        || owner
+            .is_some_and(|owner| crate::agents::extension_manager::is_first_class_extension(&owner))
+        || crate::agents::extension_manager::get_tool_resource_uri(tool).is_some()
+}
+
+#[cfg(all(test, feature = "code-mode"))]
+mod code_mode_tool_tests {
+    use super::should_keep_direct_tool_in_code_mode;
+
+    #[test]
+    fn keeps_host_owned_coding_tools_directly_callable() {
+        let tool = crate::coding::tools::definitions()
+            .into_iter()
+            .find(|tool| tool.name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME)
+            .expect("coding apply tool");
+
+        assert!(should_keep_direct_tool_in_code_mode(&tool));
     }
 }
 

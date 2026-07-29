@@ -4343,6 +4343,62 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         Ok(())
     }
 
+    #[cfg(feature = "code-mode")]
+    #[tokio::test]
+    async fn code_mode_keeps_internal_coding_tools_directly_exposed() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let (config, session_manager) = coding_test_config(&temp_dir, PonduinMode::Auto);
+        let agent = Agent::with_config(config);
+        let session = session_manager
+            .create_session(
+                workspace,
+                "coding with code mode".to_string(),
+                SessionType::User,
+                PonduinMode::Auto,
+            )
+            .await?;
+
+        agent
+            .add_extension(
+                ExtensionConfig::Platform {
+                    name: crate::agents::platform_extensions::code_execution::EXTENSION_NAME
+                        .to_string(),
+                    description: "Code Mode".to_string(),
+                    display_name: Some("Code Mode".to_string()),
+                    bundled: Some(true),
+                    available_tools: Vec::new(),
+                },
+                &session.id,
+            )
+            .await?;
+
+        assert!(
+            agent
+                .extension_manager
+                .is_extension_enabled(
+                    crate::agents::platform_extensions::code_execution::EXTENSION_NAME
+                )
+                .await
+        );
+        let tools = agent
+            .list_tools(&session.id, None)
+            .await
+            .into_iter()
+            .filter(crate::agents::reply_parts::should_keep_direct_tool_in_code_mode)
+            .collect::<Vec<_>>();
+
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(tools.iter().any(|tool| tool.name == "execute_typescript"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn internal_coding_tool_dispatch_bypasses_extension_resolution() -> Result<()> {
         let temp_dir = TempDir::new()?;

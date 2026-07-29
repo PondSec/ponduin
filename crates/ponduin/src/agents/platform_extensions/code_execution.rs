@@ -618,9 +618,10 @@ impl McpClientTrait for CodeExecutionClient {
 
         Some(format!(
             indoc::indoc! {r#"
-                ALWAYS batch multiple tool operations into ONE execute_typescript call.
-                - WRONG: Separate execute_typescript calls for read file, then write file
-                - RIGHT: One execute_typescript with an async run() function that reads AND writes AND logs/returns as little information as needed for the next step.
+                Use execute_typescript only for callback functions that are not presented as direct tools.
+                Call every tool shown directly in the tool list directly, including internal coding, file, and process tools.
+                Never recreate direct file or process operations with Deno, Node, browser, or other runtime APIs inside execute_typescript.
+                When execute_typescript is appropriate, batch related callback operations into one run() function and return only the information needed for the next step.
 
                 {}
             "#},
@@ -634,7 +635,7 @@ fn catalog_disclosure_moim(function_count: usize) -> String {
         "No execute_typescript callback functions are currently registered.".to_string()
     } else {
         format!(
-            "{function_count} callback functions are available only from inside execute_typescript. Do not call callback function names directly as tools. Use list_functions and get_function_details to inspect signatures before writing one execute_typescript call."
+            "{function_count} additional callback functions are available inside execute_typescript. They supplement, but never replace, directly listed tools. Use list_functions and get_function_details to inspect callback signatures before writing one execute_typescript call. Only registered callback functions are available inside the sandbox; filesystem, process, network, Deno, and Node APIs are unavailable."
         )
     }
 }
@@ -890,9 +891,11 @@ mod tests {
     fn catalog_moim_mentions_inspection_tools_without_function_names() {
         let moim = catalog_disclosure_moim(3);
 
-        assert!(moim.contains("3 callback functions"));
+        assert!(moim.contains("3 additional callback functions"));
+        assert!(moim.contains("never replace"));
         assert!(moim.contains("list_functions"));
         assert!(moim.contains("get_function_details"));
+        assert!(moim.contains("Deno"));
         assert!(!moim.contains("extract_relations"));
         assert!(!moim.contains("ask_heimdall"));
     }
