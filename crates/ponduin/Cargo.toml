@@ -250,6 +250,10 @@ libc = { version = "0.2.182", default-features = false, features = ["std"] }
 serial_test = { workspace = true }
 mockall = { version = "0.15", default-features = false }
 wiremock = { workspace = true }
+# Unit tests exercise JWT signing and verification without selecting either
+# mutually exclusive production TLS feature. Give the test graph one explicit
+# crypto backend so jsonwebtoken never falls back to its panic-only provider.
+jsonwebtoken = { version = "10.2", default-features = false, features = ["aws_lc_rs"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 dotenvy = { workspace = true }
