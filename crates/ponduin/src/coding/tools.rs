@@ -2408,7 +2408,7 @@ fn mutation_batch_schema() -> serde_json::Map<String, Value> {
                                 "path": {
                                     "type": "string",
                                     "minLength": 1,
-                                    "description": "New workspace-relative file path whose parent exists."
+                                    "description": "New path whose parent exists. May be workspace-relative or an absolute path resolving inside the coding workspace."
                                 },
                                 "content": {"type": "string"}
                             },

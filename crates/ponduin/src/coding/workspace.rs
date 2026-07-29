@@ -95,7 +95,6 @@ impl CodingWorkspace {
         } else {
             self.root.join(requested)
         };
-        self.require_inside(&candidate)?;
         Ok(candidate)
     }
 
@@ -204,6 +203,31 @@ mod tests {
         assert_eq!(
             workspace.resolve_for_write("src/new/module.rs").unwrap(),
             nested.canonicalize().unwrap().join("new/module.rs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_absolute_paths_through_an_in_workspace_root_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("workspace");
+        let alias = temp_dir.path().join("workspace-alias");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("existing.txt"), "content").unwrap();
+        symlink(&root, &alias).unwrap();
+        let workspace = CodingWorkspace::new(&alias).unwrap();
+
+        assert_eq!(
+            workspace
+                .resolve_existing(alias.join("existing.txt"))
+                .unwrap(),
+            root.canonicalize().unwrap().join("existing.txt")
+        );
+        assert_eq!(
+            workspace.resolve_for_write(alias.join("new.txt")).unwrap(),
+            root.canonicalize().unwrap().join("new.txt")
         );
     }
 
