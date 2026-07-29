@@ -74,9 +74,20 @@ impl<'workspace> PatchEngine<'workspace> {
         for change in &prepared.changes {
             verify_current(self.workspace, change, self.limits.max_file_bytes)?;
         }
-        let mut staged = stage_changes(&prepared.changes)?;
+        let mut staged = stage_changes(self.workspace, &prepared.changes)?;
+        let created_directories =
+            create_missing_parent_directories(self.workspace, &prepared.changes)?;
         for change in &prepared.changes {
-            verify_current(self.workspace, change, self.limits.max_file_bytes)?;
+            if let Err(error) = verify_current(self.workspace, change, self.limits.max_file_bytes) {
+                return match remove_created_directories(&created_directories) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(PatchError::ApplyAndRestoreFailed {
+                        path: change.relative_path.clone(),
+                        apply: error.to_string(),
+                        rollback: cleanup.to_string(),
+                    }),
+                };
+            }
         }
 
         let mut applied_indices = Vec::new();
@@ -99,15 +110,21 @@ impl<'workspace> PatchEngine<'workspace> {
                     &applied_indices,
                     &mut staged.originals,
                 );
-                return match restore_result {
-                    Ok(()) => Err(PatchError::ApplyFailed {
+                let directory_result = remove_created_directories(&created_directories);
+                return match (restore_result, directory_result) {
+                    (Ok(()), Ok(())) => Err(PatchError::ApplyFailed {
                         path: change.relative_path.clone(),
                         source,
                     }),
-                    Err(rollback) => Err(PatchError::ApplyAndRestoreFailed {
+                    (rollback, directory_cleanup) => Err(PatchError::ApplyAndRestoreFailed {
                         path: change.relative_path.clone(),
                         apply: source.to_string(),
-                        rollback: rollback.to_string(),
+                        rollback: [rollback.err(), directory_cleanup.err()]
+                            .into_iter()
+                            .flatten()
+                            .map(|error| error.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
                     }),
                 };
             }
@@ -121,6 +138,7 @@ impl<'workspace> PatchEngine<'workspace> {
                 .iter()
                 .map(RollbackEntry::from_prepared)
                 .collect(),
+            created_directories,
         };
         let result = MutationResult {
             rollback_id: rollback.id.clone(),
@@ -141,11 +159,16 @@ impl<'workspace> PatchEngine<'workspace> {
                     .original_content
                     .as_ref()
                     .map(|content| {
-                        stage_content(&entry.path, content, entry.original_permissions.clone())
-                            .map_err(|source| PatchError::RollbackIo {
-                                path: entry.relative_path.clone(),
-                                source,
-                            })
+                        stage_content(
+                            self.workspace,
+                            &entry.path,
+                            content,
+                            entry.original_permissions.clone(),
+                        )
+                        .map_err(|source| PatchError::RollbackIo {
+                            path: entry.relative_path.clone(),
+                            source,
+                        })
                     })
                     .transpose()
             })
@@ -177,6 +200,7 @@ impl<'workspace> PatchEngine<'workspace> {
                 }
             }
         }
+        remove_created_directories(&record.created_directories)?;
 
         Ok(RollbackResult {
             rollback_id: record.id,
@@ -193,7 +217,6 @@ impl<'workspace> PatchEngine<'workspace> {
                 if resolved.symlink_metadata().is_ok() {
                     return Err(PatchError::AlreadyExists(relative));
                 }
-                require_existing_parent(&resolved, &relative)?;
                 validate_content_size(&relative, content.len(), self.limits.max_file_bytes)?;
                 reject_nul(&relative, content.as_bytes())?;
                 Ok(vec![PreparedChange {
@@ -267,7 +290,6 @@ impl<'workspace> PatchEngine<'workspace> {
         if resolved.symlink_metadata().is_ok() {
             return Err(PatchError::AlreadyExists(relative));
         }
-        require_existing_parent(&resolved, &relative)?;
 
         let destination = PreparedChange {
             path: resolved,
@@ -518,6 +540,7 @@ impl PreparedChange {
 pub struct RollbackRecord {
     id: String,
     entries: Vec<RollbackEntry>,
+    created_directories: Vec<PathBuf>,
 }
 
 impl RollbackRecord {
@@ -668,7 +691,10 @@ struct StagedBatch {
     originals: Vec<Option<NamedTempFile>>,
 }
 
-fn stage_changes(changes: &[PreparedChange]) -> Result<StagedBatch, PatchError> {
+fn stage_changes(
+    workspace: &CodingWorkspace,
+    changes: &[PreparedChange],
+) -> Result<StagedBatch, PatchError> {
     let replacements = changes
         .iter()
         .map(|change| {
@@ -676,11 +702,16 @@ fn stage_changes(changes: &[PreparedChange]) -> Result<StagedBatch, PatchError> 
                 .new_content
                 .as_ref()
                 .map(|content| {
-                    stage_content(&change.path, content, change.original_permissions.clone())
-                        .map_err(|error| PatchError::StageFailed {
-                            path: change.relative_path.clone(),
-                            reason: error.to_string(),
-                        })
+                    stage_content(
+                        workspace,
+                        &change.path,
+                        content,
+                        change.original_permissions.clone(),
+                    )
+                    .map_err(|error| PatchError::StageFailed {
+                        path: change.relative_path.clone(),
+                        reason: error.to_string(),
+                    })
                 })
                 .transpose()
         })
@@ -692,11 +723,16 @@ fn stage_changes(changes: &[PreparedChange]) -> Result<StagedBatch, PatchError> 
                 .original_content
                 .as_ref()
                 .map(|content| {
-                    stage_content(&change.path, content, change.original_permissions.clone())
-                        .map_err(|error| PatchError::StageFailed {
-                            path: change.relative_path.clone(),
-                            reason: error.to_string(),
-                        })
+                    stage_content(
+                        workspace,
+                        &change.path,
+                        content,
+                        change.original_permissions.clone(),
+                    )
+                    .map_err(|error| PatchError::StageFailed {
+                        path: change.relative_path.clone(),
+                        reason: error.to_string(),
+                    })
                 })
                 .transpose()
         })
@@ -708,14 +744,20 @@ fn stage_changes(changes: &[PreparedChange]) -> Result<StagedBatch, PatchError> 
 }
 
 fn stage_content(
+    workspace: &CodingWorkspace,
     destination: &Path,
     content: &[u8],
     permissions: Option<Permissions>,
 ) -> io::Result<NamedTempFile> {
-    let parent = destination
+    let destination_parent = destination
         .parent()
         .ok_or_else(|| io::Error::other("destination has no parent"))?;
-    let mut temp = NamedTempFile::new_in(parent)?;
+    let staging_directory = if destination_parent.is_dir() {
+        destination_parent
+    } else {
+        workspace.root()
+    };
+    let mut temp = NamedTempFile::new_in(staging_directory)?;
     temp.write_all(content)?;
     temp.as_file_mut().flush()?;
     temp.as_file().sync_all()?;
@@ -793,12 +835,88 @@ fn ensure_write_path(
     }
 }
 
-fn require_existing_parent(path: &Path, relative: &Path) -> Result<(), PatchError> {
-    if path.parent().is_some_and(Path::is_dir) {
-        Ok(())
-    } else {
-        Err(PatchError::MissingParent(relative.to_path_buf()))
+fn create_missing_parent_directories(
+    workspace: &CodingWorkspace,
+    changes: &[PreparedChange],
+) -> Result<Vec<PathBuf>, PatchError> {
+    let mut created = Vec::new();
+
+    for change in changes.iter().filter(|change| change.new_content.is_some()) {
+        let Some(parent) = change.path.parent() else {
+            continue;
+        };
+        let mut cursor = parent.to_path_buf();
+        let mut missing = Vec::new();
+        while cursor != workspace.root() {
+            match cursor.symlink_metadata() {
+                Ok(metadata) => {
+                    if !metadata.is_dir() {
+                        remove_created_directories(&created)?;
+                        return Err(PatchError::MissingParent(change.relative_path.clone()));
+                    }
+                    if let Err(error) = workspace.resolve_existing(&cursor) {
+                        remove_created_directories(&created)?;
+                        return Err(error.into());
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing.push(cursor.clone());
+                    if !cursor.pop() {
+                        remove_created_directories(&created)?;
+                        return Err(PatchError::MissingParent(change.relative_path.clone()));
+                    }
+                }
+                Err(source) => {
+                    remove_created_directories(&created)?;
+                    return Err(PatchError::ParentDirectoryIo {
+                        path: change.relative_path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+
+        for directory in missing.into_iter().rev() {
+            match fs::create_dir(&directory) {
+                Ok(()) => created.push(directory.clone()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    remove_created_directories(&created)?;
+                    return Err(PatchError::ParentDirectoryIo {
+                        path: change.relative_path.clone(),
+                        source,
+                    });
+                }
+            }
+            if let Err(error) = workspace.resolve_existing(&directory) {
+                remove_created_directories(&created)?;
+                return Err(error.into());
+            }
+        }
     }
+
+    Ok(created)
+}
+
+fn remove_created_directories(directories: &[PathBuf]) -> Result<(), PatchError> {
+    for directory in directories.iter().rev() {
+        match fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(source) => {
+                return Err(PatchError::ParentDirectoryCleanup {
+                    path: directory.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reject_sensitive(path: &Path) -> Result<(), PatchError> {
@@ -881,8 +999,20 @@ pub enum PatchError {
     AlreadyExists(PathBuf),
     #[error("path is not a regular file: {0}")]
     NotFile(PathBuf),
-    #[error("parent directory does not exist: {0}")]
+    #[error("parent path cannot be used as a directory: {0}")]
     MissingParent(PathBuf),
+    #[error("could not create a parent directory for {path}: {source}")]
+    ParentDirectoryIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not clean up generated directory {path}: {source}")]
+    ParentDirectoryCleanup {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("sensitive files cannot be mutated by the coding agent: {0}")]
     Sensitive(PathBuf),
     #[error("binary or non-UTF-8 files cannot be patched: {0}")]
@@ -1027,6 +1157,91 @@ mod tests {
     }
 
     #[test]
+    fn creates_and_rolls_back_missing_parent_directories() {
+        let (_temp_dir, workspace) = fixture();
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let prepared = engine
+            .prepare(MutationBatch {
+                changes: vec![
+                    FileChange::Create {
+                        path: PathBuf::from("package/src/textslug/__init__.py"),
+                        content: "def slugify(value):\n    return value\n".to_string(),
+                    },
+                    FileChange::Create {
+                        path: PathBuf::from("package/tests/test_textslug.py"),
+                        content: "def test_placeholder():\n    assert True\n".to_string(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert!(!workspace.root().join("package").exists());
+        let applied = engine.apply(prepared).unwrap();
+        assert!(workspace
+            .root()
+            .join("package/src/textslug/__init__.py")
+            .is_file());
+        assert!(workspace
+            .root()
+            .join("package/tests/test_textslug.py")
+            .is_file());
+
+        engine.rollback(applied.rollback).unwrap();
+
+        assert!(!workspace.root().join("package").exists());
+    }
+
+    #[test]
+    fn rollback_preserves_later_content_in_generated_directories() {
+        let (_temp_dir, workspace) = fixture();
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let prepared = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Create {
+                    path: PathBuf::from("package/src/generated.py"),
+                    content: "GENERATED = True\n".to_string(),
+                }],
+            })
+            .unwrap();
+        let applied = engine.apply(prepared).unwrap();
+        fs::write(workspace.root().join("package/user.txt"), "keep\n").unwrap();
+
+        engine.rollback(applied.rollback).unwrap();
+
+        assert!(!workspace.root().join("package/src/generated.py").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("package/user.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn failed_batch_removes_parent_directories_it_created() {
+        let (_temp_dir, workspace) = fixture();
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let prepared = engine
+            .prepare(MutationBatch {
+                changes: vec![
+                    FileChange::Create {
+                        path: PathBuf::from("nested/file.txt"),
+                        content: "file\n".to_string(),
+                    },
+                    FileChange::Create {
+                        path: PathBuf::from("nested"),
+                        content: "conflict\n".to_string(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert!(matches!(
+            engine.apply(prepared),
+            Err(PatchError::AlreadyExists(path)) if path == Path::new("nested")
+        ));
+        assert!(!workspace.root().join("nested").exists());
+    }
+
+    #[test]
     fn moves_and_rolls_back_a_versioned_file_as_one_batch() {
         let (_temp_dir, workspace) = fixture();
         fs::create_dir(workspace.root().join("moved")).unwrap();
@@ -1065,6 +1280,31 @@ mod tests {
 
         assert!(fs::read_to_string(source).unwrap().contains("before"));
         assert!(!workspace.root().join("moved/app.py").exists());
+    }
+
+    #[test]
+    fn moves_into_and_rolls_back_missing_parent_directories() {
+        let (_temp_dir, workspace) = fixture();
+        let source = workspace.root().join("app.py");
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let prepared = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Move {
+                    path: PathBuf::from("app.py"),
+                    destination: PathBuf::from("package/src/app.py"),
+                    expected_digest: digest(&source),
+                }],
+            })
+            .unwrap();
+
+        let applied = engine.apply(prepared).unwrap();
+        assert!(!source.exists());
+        assert!(workspace.root().join("package/src/app.py").is_file());
+
+        engine.rollback(applied.rollback).unwrap();
+
+        assert!(source.is_file());
+        assert!(!workspace.root().join("package").exists());
     }
 
     #[test]
@@ -1260,8 +1500,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_sensitive_missing_parent_and_external_paths() {
-        let (temp_dir, workspace) = fixture();
+    fn rejects_duplicate_sensitive_and_external_paths() {
+        let (_temp_dir, workspace) = fixture();
+        let external = tempfile::tempdir().unwrap();
         let engine = PatchEngine::new(&workspace, PatchLimits::default());
         let duplicate = MutationBatch {
             changes: vec![
@@ -1292,16 +1533,7 @@ mod tests {
         assert!(matches!(
             engine.prepare(MutationBatch {
                 changes: vec![FileChange::Create {
-                    path: PathBuf::from("missing/file.txt"),
-                    content: "content".to_string(),
-                }]
-            }),
-            Err(PatchError::MissingParent(_))
-        ));
-        assert!(matches!(
-            engine.prepare(MutationBatch {
-                changes: vec![FileChange::Create {
-                    path: temp_dir.path().join("outside.txt"),
+                    path: external.path().join("outside.txt"),
                     content: "outside".to_string(),
                 }]
             }),
@@ -1401,6 +1633,37 @@ mod tests {
             fs::read_to_string(root.join("moved-source/app.py")).unwrap(),
             "original\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_future_parent_replaced_by_an_escaping_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("workspace");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let workspace = CodingWorkspace::new(&root).unwrap();
+        let engine = PatchEngine::new(&workspace, PatchLimits::default());
+        let prepared = engine
+            .prepare(MutationBatch {
+                changes: vec![FileChange::Create {
+                    path: PathBuf::from("future/file.txt"),
+                    content: "inside\n".to_string(),
+                }],
+            })
+            .unwrap();
+
+        symlink(&outside, root.join("future")).unwrap();
+        let error = engine.apply(prepared).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PatchError::Workspace(WorkspaceError::OutsideWorkspace(_))
+        ));
+        assert!(!outside.join("file.txt").exists());
     }
 
     #[cfg(unix)]

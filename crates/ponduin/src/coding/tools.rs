@@ -2408,7 +2408,7 @@ fn mutation_batch_schema() -> serde_json::Map<String, Value> {
                                 "path": {
                                     "type": "string",
                                     "minLength": 1,
-                                    "description": "New path whose parent exists. May be workspace-relative or an absolute path resolving inside the coding workspace."
+                                    "description": "New path. Missing parent directories are created safely. May be workspace-relative or an absolute path resolving inside the coding workspace."
                                 },
                                 "content": {"type": "string"}
                             },
@@ -3907,6 +3907,55 @@ mod tests {
         let error =
             execute_with_state(&enabled_config(), &state, repeated, temp_dir.path()).unwrap_err();
         assert!(error.message.contains("unknown or expired rollback_id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applies_nested_absolute_paths_through_a_workspace_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        let alias = temp_dir.path().join("workspace-alias");
+        fs::create_dir(&workspace).unwrap();
+        symlink(&workspace, &alias).unwrap();
+        let state = CodingToolState::default();
+        let nested = alias.join("package/src/textslug/__init__.py");
+        let arguments = object!({
+            "changes": [{
+                "operation": "create",
+                "path": nested,
+                "content": "def slugify(value):\n    return value\n"
+            }]
+        });
+
+        let applied = execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(arguments),
+            &alias,
+        )
+        .unwrap();
+        let applied: Value = serde_json::from_str(&result_text(applied)).unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join("package/src/textslug/__init__.py")).unwrap(),
+            "def slugify(value):\n    return value\n"
+        );
+        assert_eq!(
+            applied["preview"]["files"][0]["path"],
+            "package/src/textslug/__init__.py"
+        );
+
+        execute_with_state(
+            &enabled_config(),
+            &state,
+            CallToolRequestParams::new(ROLLBACK_CHANGES_TOOL_NAME).with_arguments(object!({
+                "rollback_id": applied["rollback_id"].as_str().unwrap()
+            })),
+            &alias,
+        )
+        .unwrap();
+        assert!(!workspace.join("package").exists());
     }
 
     #[test]
