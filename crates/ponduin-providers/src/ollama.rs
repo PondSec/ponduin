@@ -247,9 +247,13 @@ fn apply_ollama_options(payload: &mut Value, options: &OllamaOptions, model_conf
         }
 
         // Ollama's OpenAI-compatible endpoint uses `reasoning_effort: "none"`
-        // to disable thinking. The generic request builder intentionally keeps
-        // `thinking_effort` internal, so translate the unified setting here.
-        if model_config.thinking_effort() == Some(ThinkingEffort::Off) {
+        // to disable thinking. Honor an explicit off setting and also the
+        // canonical non-reasoning model capability when the user did not select
+        // an effort. An explicit enabled effort always wins.
+        let thinking_effort = model_config.thinking_effort();
+        if thinking_effort == Some(ThinkingEffort::Off)
+            || (thinking_effort.is_none() && model_config.reasoning == Some(false))
+        {
             obj.insert("reasoning_effort".to_string(), json!("none"));
         }
 
@@ -688,10 +692,23 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_ollama_options_disables_thinking_for_non_reasoning_models() {
+        let options = OllamaOptions::default();
+        let mut model_config = ModelConfig::new("qwen3:8b");
+        model_config.reasoning = Some(false);
+        let mut payload = json!({});
+
+        apply_ollama_options(&mut payload, &options, &model_config);
+
+        assert_eq!(payload["reasoning_effort"], "none");
+    }
+
+    #[test]
     fn test_apply_ollama_options_does_not_override_enabled_thinking() {
         let options = OllamaOptions::default();
-        let model_config =
+        let mut model_config =
             ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Medium);
+        model_config.reasoning = Some(false);
         let mut payload = json!({});
 
         apply_ollama_options(&mut payload, &options, &model_config);
