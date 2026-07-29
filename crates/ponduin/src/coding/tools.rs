@@ -19,7 +19,7 @@ use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
-    CodingWorkflow, WorkflowLimits, WorkflowPlan, WorkflowReport, WorkflowStatus,
+    CodingWorkflow, WorkflowLimits, WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowStatus,
 };
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use rmcp::model::{
@@ -115,7 +115,100 @@ struct WorkspaceWorkflow {
     workflow: CodingWorkflow,
 }
 
+#[derive(Debug, Clone)]
+struct WorkflowToolContext {
+    status: WorkflowStatus,
+    review_ready: bool,
+}
+
 impl CodingToolState {
+    pub(crate) fn definitions_for_workspace(&self, workspace_root: &Path) -> Vec<Tool> {
+        let context = self.workflow_tool_context(workspace_root);
+        definitions_for_workflow(context.as_ref())
+    }
+
+    pub(crate) fn workflow_guidance_for_workspace(&self, workspace_root: &Path) -> Option<String> {
+        let context = self.workflow_tool_context(workspace_root)?;
+        let status = &context.status;
+        let guidance = match status.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching => {
+                "Inspect only the repository context needed for the objective, then call \
+                 coding__workflow_set_plan. Editing and execution tools remain withheld until \
+                 the plan is accepted."
+                    .to_string()
+            }
+            WorkflowPhase::Planning => {
+                "The plan is accepted. Call coding__workflow_transition exactly once with \
+                 begin_editing; do not repeat a completed transition."
+                    .to_string()
+            }
+            WorkflowPhase::Editing if status.changed_files.is_empty() => {
+                "The workflow is in Editing with no retained change. Call \
+                 coding__apply_changes now. Phase-transition tools are intentionally withheld \
+                 until a real change exists."
+                    .to_string()
+            }
+            WorkflowPhase::Editing if context.review_ready => {
+                "The planned change is retained and the plan requires no validation. Call \
+                 coding__workflow_transition with begin_review."
+                    .to_string()
+            }
+            WorkflowPhase::Editing => {
+                "The planned change is retained. Call coding__workflow_transition with \
+                 begin_validation before executing checks."
+                    .to_string()
+            }
+            WorkflowPhase::Testing if context.review_ready => {
+                "Current-revision validation evidence is acceptable. Call \
+                 coding__workflow_transition with begin_review."
+                    .to_string()
+            }
+            WorkflowPhase::Testing => {
+                "Run an actual discovered validation or bounded process now. The review \
+                 transition remains withheld until current-revision evidence exists."
+                    .to_string()
+            }
+            WorkflowPhase::Debugging => {
+                "A validation failure is recorded. Inspect its evidence, then call \
+                 coding__workflow_transition exactly once with begin_repair before applying a \
+                 corrective change."
+                    .to_string()
+            }
+            WorkflowPhase::Reviewing => {
+                "Review the retained changes and captured evidence, then call \
+                 coding__workflow_complete with an evidence-backed summary and remaining risks."
+                    .to_string()
+            }
+            WorkflowPhase::Completed => {
+                "The workflow is complete. Return its evidence-backed result to the user without \
+                 starting another workflow."
+                    .to_string()
+            }
+            WorkflowPhase::Blocked | WorkflowPhase::Failed => {
+                "The workflow reached a terminal stop condition. Report the machine-detected \
+                 stop reason and do not claim completion."
+                    .to_string()
+            }
+        };
+        Some(format!(
+            "Current internal workflow phase: {:?}. {guidance}",
+            status.phase
+        ))
+    }
+
+    fn workflow_tool_context(&self, workspace_root: &Path) -> Option<WorkflowToolContext> {
+        self.workflows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|entry| entry.workspace_root == workspace_root)
+            .map(|entry| WorkflowToolContext {
+                status: entry.workflow.status(),
+                review_ready: entry.workflow.can_begin_review(),
+            })
+    }
+
     fn remember(&self, workspace_root: &Path, record: RollbackRecord, preview: &MutationPreview) {
         let mut journal = self
             .rollback_journal
@@ -710,6 +803,184 @@ pub fn definitions() -> Vec<Tool> {
         review_changes_tool(),
         lsp_query_tool(),
     ]
+}
+
+fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> {
+    let Some(context) = context else {
+        return definitions()
+            .into_iter()
+            .filter(|tool| {
+                !matches!(
+                    tool.name.as_ref(),
+                    WORKFLOW_SET_PLAN_TOOL_NAME
+                        | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                        | WORKFLOW_TRANSITION_TOOL_NAME
+                        | WORKFLOW_STATUS_TOOL_NAME
+                        | WORKFLOW_COMPLETE_TOOL_NAME
+                )
+            })
+            .collect();
+    };
+
+    let status = &context.status;
+    if matches!(
+        status.phase,
+        WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+    ) {
+        return definitions()
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.name.as_ref(),
+                    REPOSITORY_PROFILE_TOOL_NAME
+                        | REPOSITORY_INSTRUCTIONS_TOOL_NAME
+                        | FIND_FILES_TOOL_NAME
+                        | SEARCH_TEXT_TOOL_NAME
+                        | READ_FILE_TOOL_NAME
+                        | GIT_STATUS_TOOL_NAME
+                        | GIT_DIFF_TOOL_NAME
+                        | GIT_HISTORY_TOOL_NAME
+                        | WORKFLOW_START_TOOL_NAME
+                        | WORKFLOW_STATUS_TOOL_NAME
+                )
+            })
+            .collect();
+    }
+
+    let phase_allows = |name: &str| match status.phase {
+        WorkflowPhase::Analyzing | WorkflowPhase::Searching => matches!(
+            name,
+            REPOSITORY_PROFILE_TOOL_NAME
+                | REPOSITORY_INSTRUCTIONS_TOOL_NAME
+                | FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | GIT_STATUS_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | GIT_HISTORY_TOOL_NAME
+                | REPOSITORY_MAP_TOOL_NAME
+                | SEARCH_SYMBOLS_TOOL_NAME
+                | FIND_REFERENCES_TOOL_NAME
+                | SELECT_CONTEXT_TOOL_NAME
+                | PROJECT_CAPABILITIES_TOOL_NAME
+                | PREPARE_CONTEXT_TOOL_NAME
+                | WORKFLOW_SET_PLAN_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | LSP_QUERY_TOOL_NAME
+        ),
+        WorkflowPhase::Planning => matches!(
+            name,
+            FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | GIT_STATUS_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | REPOSITORY_MAP_TOOL_NAME
+                | SELECT_CONTEXT_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+        ),
+        WorkflowPhase::Editing => matches!(
+            name,
+            FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | PREVIEW_CHANGES_TOOL_NAME
+                | APPLY_CHANGES_TOOL_NAME
+                | ROLLBACK_CHANGES_TOOL_NAME
+                | GIT_STATUS_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+        ),
+        WorkflowPhase::Testing => matches!(
+            name,
+            FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | PROJECT_CAPABILITIES_TOOL_NAME
+                | RUN_PROCESS_TOOL_NAME
+                | RUN_VALIDATION_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+        ),
+        WorkflowPhase::Debugging => matches!(
+            name,
+            FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | REPOSITORY_MAP_TOOL_NAME
+                | SEARCH_SYMBOLS_TOOL_NAME
+                | FIND_REFERENCES_TOOL_NAME
+                | SELECT_CONTEXT_TOOL_NAME
+                | PREPARE_CONTEXT_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | LSP_QUERY_TOOL_NAME
+        ),
+        WorkflowPhase::Reviewing => matches!(
+            name,
+            SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | GIT_STATUS_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | GIT_HISTORY_TOOL_NAME
+                | GIT_STAGE_OWNED_TOOL_NAME
+                | GIT_UNSTAGE_OWNED_TOOL_NAME
+                | GIT_COMMIT_OWNED_TOOL_NAME
+                | GIT_REVERT_OWNED_TOOL_NAME
+                | GIT_CREATE_BRANCH_TOOL_NAME
+                | GIT_PUSH_OWNED_TOOL_NAME
+                | REVIEW_CHANGES_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | WORKFLOW_COMPLETE_TOOL_NAME
+        ),
+        WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed => false,
+    };
+
+    let mut tools = definitions()
+        .into_iter()
+        .filter(|tool| {
+            tool.name.as_ref() != WORKFLOW_START_TOOL_NAME
+                && tool.name.as_ref() != WORKFLOW_TRANSITION_TOOL_NAME
+                && phase_allows(tool.name.as_ref())
+        })
+        .collect::<Vec<_>>();
+
+    let next_transition = match status.phase {
+        WorkflowPhase::Planning => Some((
+            "begin_editing",
+            "The accepted plan makes begin_editing the only valid next workflow transition.",
+        )),
+        WorkflowPhase::Editing if context.review_ready => Some((
+            "begin_review",
+            "The retained change requires no validation, so begin_review is the only valid next \
+             workflow transition.",
+        )),
+        WorkflowPhase::Editing if !status.changed_files.is_empty() => Some((
+            "begin_validation",
+            "A retained change exists, so begin_validation is the only valid next workflow \
+             transition.",
+        )),
+        WorkflowPhase::Testing if context.review_ready => Some((
+            "begin_review",
+            "Current-revision validation evidence is acceptable, so begin_review is the only \
+             valid next workflow transition.",
+        )),
+        WorkflowPhase::Debugging => Some((
+            "begin_repair",
+            "Recorded failure evidence makes begin_repair the only valid next workflow transition.",
+        )),
+        _ => None,
+    };
+    if let Some((transition, description)) = next_transition {
+        tools.push(workflow_transition_tool_for(transition, description));
+    }
+    tools
 }
 
 pub(crate) fn routing_definitions() -> Vec<Tool> {
@@ -2153,12 +2424,27 @@ fn workflow_update_memory_tool() -> Tool {
 }
 
 fn workflow_transition_tool() -> Tool {
-    Tool::new(
-        WORKFLOW_TRANSITION_TOOL_NAME.to_string(),
+    workflow_transition_tool_with_values(
+        &[
+            "begin_editing",
+            "begin_validation",
+            "begin_repair",
+            "begin_review",
+        ],
         "Move the current coding workflow through a validated transition. Editing requires a \
          complete plan; validation requires a retained change; repair and review require actual \
-         prior process evidence and obey configured attempt limits."
-            .to_string(),
+         prior process evidence and obey configured attempt limits.",
+    )
+}
+
+fn workflow_transition_tool_for(transition: &str, description: &str) -> Tool {
+    workflow_transition_tool_with_values(&[transition], description)
+}
+
+fn workflow_transition_tool_with_values(transitions: &[&str], description: &str) -> Tool {
+    Tool::new(
+        WORKFLOW_TRANSITION_TOOL_NAME.to_string(),
+        description.to_string(),
         object!({
             "type": "object",
             "required": ["workflow_id", "transition"],
@@ -2166,12 +2452,7 @@ fn workflow_transition_tool() -> Tool {
                 "workflow_id": {"type": "string", "minLength": 1},
                 "transition": {
                     "type": "string",
-                    "enum": [
-                        "begin_editing",
-                        "begin_validation",
-                        "begin_repair",
-                        "begin_review"
-                    ]
+                    "enum": transitions
                 }
             },
             "additionalProperties": false
@@ -3293,6 +3574,30 @@ mod tests {
         );
     }
 
+    fn exposed_tool_names(state: &CodingToolState, root: &Path) -> BTreeSet<String> {
+        let root = root.canonicalize().expect("canonical test workspace");
+        state
+            .definitions_for_workspace(&root)
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
+    }
+
+    fn exposed_transition_values(state: &CodingToolState, root: &Path) -> Vec<String> {
+        let root = root.canonicalize().expect("canonical test workspace");
+        let tool = state
+            .definitions_for_workspace(&root)
+            .into_iter()
+            .find(|tool| tool.name == WORKFLOW_TRANSITION_TOOL_NAME)
+            .expect("expected a phase-specific workflow transition tool");
+        Value::Object((*tool.input_schema).clone())["properties"]["transition"]["enum"]
+            .as_array()
+            .expect("transition enum")
+            .iter()
+            .map(|value| value.as_str().expect("string transition").to_string())
+            .collect()
+    }
+
     fn transition(
         config: &CodingConfig,
         state: &CodingToolState,
@@ -3500,6 +3805,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = enabled_config();
         let state = CodingToolState::default();
+        let initial_tools = exposed_tool_names(&state, temp_dir.path());
+        assert!(initial_tools.contains(WORKFLOW_START_TOOL_NAME));
+        assert!(initial_tools.contains(APPLY_CHANGES_TOOL_NAME));
+        assert!(initial_tools.contains(RUN_PROCESS_TOOL_NAME));
+        assert!(!initial_tools.contains(WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(!initial_tools.contains(WORKFLOW_TRANSITION_TOOL_NAME));
         fs::write(
             temp_dir.path().join("context.rs"),
             "pub fn fixture_context() {}\n",
@@ -3530,6 +3841,12 @@ mod tests {
         let started: Value = serde_json::from_str(&result_text(started)).unwrap();
         let workflow_id = started["id"].as_str().unwrap().to_string();
         assert_eq!(started["phase"], "analyzing");
+        let analyzing_tools = exposed_tool_names(&state, temp_dir.path());
+        assert!(analyzing_tools.contains(WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(analyzing_tools.contains(PREPARE_CONTEXT_TOOL_NAME));
+        assert!(!analyzing_tools.contains(APPLY_CHANGES_TOOL_NAME));
+        assert!(!analyzing_tools.contains(RUN_PROCESS_TOOL_NAME));
+        assert!(!analyzing_tools.contains(WORKFLOW_TRANSITION_TOOL_NAME));
 
         execute_with_state(
             &config,
@@ -3583,6 +3900,11 @@ mod tests {
         let planned = execute_with_state(&config, &state, plan, temp_dir.path()).unwrap();
         let planned: Value = serde_json::from_str(&result_text(planned)).unwrap();
         assert_eq!(planned["phase"], "planning");
+        assert_eq!(
+            exposed_transition_values(&state, temp_dir.path()),
+            ["begin_editing"]
+        );
+        assert!(!exposed_tool_names(&state, temp_dir.path()).contains(APPLY_CHANGES_TOOL_NAME));
 
         transition(
             &config,
@@ -3591,6 +3913,15 @@ mod tests {
             &workflow_id,
             "begin_editing",
         );
+        let editing_tools = exposed_tool_names(&state, temp_dir.path());
+        assert!(editing_tools.contains(APPLY_CHANGES_TOOL_NAME));
+        assert!(!editing_tools.contains(PREPARE_CONTEXT_TOOL_NAME));
+        assert!(!editing_tools.contains(RUN_PROCESS_TOOL_NAME));
+        assert!(!editing_tools.contains(WORKFLOW_TRANSITION_TOOL_NAME));
+        let canonical_root = temp_dir.path().canonicalize().unwrap();
+        assert!(state
+            .workflow_guidance_for_workspace(&canonical_root)
+            .is_some_and(|guidance| guidance.contains("Call coding__apply_changes now")));
         let apply = CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
             "changes": [
                 {"operation": "create", "path": "one.txt", "content": "one\n"},
@@ -3600,6 +3931,10 @@ mod tests {
             ]
         }));
         execute_with_state(&config, &state, apply, temp_dir.path()).unwrap();
+        assert_eq!(
+            exposed_transition_values(&state, temp_dir.path()),
+            ["begin_validation"]
+        );
         transition(
             &config,
             &state,
@@ -3607,6 +3942,11 @@ mod tests {
             &workflow_id,
             "begin_validation",
         );
+        let testing_tools = exposed_tool_names(&state, temp_dir.path());
+        assert!(testing_tools.contains(RUN_PROCESS_TOOL_NAME));
+        assert!(testing_tools.contains(RUN_VALIDATION_TOOL_NAME));
+        assert!(!testing_tools.contains(APPLY_CHANGES_TOOL_NAME));
+        assert!(!testing_tools.contains(WORKFLOW_TRANSITION_TOOL_NAME));
 
         execute_async(
             &config,
@@ -3619,6 +3959,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            exposed_transition_values(&state, temp_dir.path()),
+            ["begin_review"]
+        );
         transition(
             &config,
             &state,
@@ -3626,6 +3970,10 @@ mod tests {
             &workflow_id,
             "begin_review",
         );
+        let reviewing_tools = exposed_tool_names(&state, temp_dir.path());
+        assert!(reviewing_tools.contains(REVIEW_CHANGES_TOOL_NAME));
+        assert!(reviewing_tools.contains(WORKFLOW_COMPLETE_TOOL_NAME));
+        assert!(!reviewing_tools.contains(APPLY_CHANGES_TOOL_NAME));
         let completed = execute_with_state(
             &config,
             &state,
@@ -3661,6 +4009,10 @@ mod tests {
         assert!(completed["memory"]["executed_commands"][0]
             .get("args")
             .is_none());
+        let terminal_tools = exposed_tool_names(&state, temp_dir.path());
+        assert!(terminal_tools.contains(WORKFLOW_START_TOOL_NAME));
+        assert!(terminal_tools.contains(WORKFLOW_STATUS_TOOL_NAME));
+        assert!(!terminal_tools.contains(WORKFLOW_COMPLETE_TOOL_NAME));
     }
 
     #[tokio::test]

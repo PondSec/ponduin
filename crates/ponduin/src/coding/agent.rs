@@ -1,7 +1,7 @@
 use crate::coding::config::CodingConfig;
 use crate::coding::strategy::MODEL_ROUTING_GUIDANCE;
 use crate::coding::tools;
-use crate::coding::ModelCapabilityProfile;
+use crate::coding::{CodingWorkspace, ModelCapabilityProfile};
 use crate::config::PonduinMode;
 use ponduin_providers::model::ModelConfig;
 use rmcp::model::{
@@ -35,6 +35,22 @@ impl CodingAgent {
         } else {
             Vec::new()
         }
+    }
+
+    pub fn tools_for_workspace(&self, ponduin_mode: PonduinMode, working_dir: &Path) -> Vec<Tool> {
+        if !self.available(ponduin_mode) {
+            return Vec::new();
+        }
+        let Ok(workspace) = CodingWorkspace::new(working_dir) else {
+            return tools::definitions();
+        };
+        self.tool_state.definitions_for_workspace(workspace.root())
+    }
+
+    pub fn workflow_guidance(&self, working_dir: &Path) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        self.tool_state
+            .workflow_guidance_for_workspace(workspace.root())
     }
 
     pub fn routing_tools(&self, ponduin_mode: PonduinMode) -> Vec<Tool> {

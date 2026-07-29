@@ -400,6 +400,11 @@ impl CodingWorkflow {
         Ok(())
     }
 
+    pub fn can_begin_review(&self) -> bool {
+        let mut candidate = self.clone();
+        candidate.begin_review().is_ok()
+    }
+
     pub fn complete(
         &mut self,
         summary: String,
