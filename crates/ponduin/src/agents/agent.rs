@@ -44,6 +44,7 @@ use crate::permission::permission_inspector::PermissionInspector;
 use crate::permission::permission_judge::PermissionCheckResult;
 use crate::permission::PermissionConfirmation;
 use crate::providers::base::{PermissionRouting, Provider};
+use crate::providers::toolshim::modify_system_prompt_for_tool_json;
 use crate::recipe::{Author, Recipe, Response, Settings};
 use crate::scheduler_trait::SchedulerTrait;
 use crate::security::adversary_inspector::AdversaryInspector;
@@ -72,6 +73,9 @@ const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
 const COMPACTION_PROGRESS_TEXT: &str = "ponduin is compacting the conversation...";
 const MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
+const CODING_ROUTER_MAX_TOKENS: i32 = 128;
+const CODING_ROUTER_MAX_ATTEMPTS: usize = 2;
+const CODING_ROUTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 const DEFAULT_FRONTEND_INSTRUCTIONS: &str = "The following tools are provided directly by the frontend and will be executed by the frontend when called.";
@@ -82,6 +86,36 @@ enum ToolCategory {
     Read,
     Write,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum CodingRouteDecision {
+    Activate,
+    ContinueWithoutAgent,
+}
+
+fn collect_coding_route_decisions(
+    message: &Message,
+    decisions: &mut std::collections::HashSet<CodingRouteDecision>,
+) -> bool {
+    let mut invalid_tool_request = false;
+    for content in &message.content {
+        let MessageContent::ToolRequest(request) = content else {
+            continue;
+        };
+        match &request.tool_call {
+            Ok(tool_call) if tool_call.name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME => {
+                decisions.insert(CodingRouteDecision::Activate);
+            }
+            Ok(tool_call)
+                if tool_call.name == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME =>
+            {
+                decisions.insert(CodingRouteDecision::ContinueWithoutAgent);
+            }
+            Ok(_) | Err(_) => invalid_tool_request = true,
+        }
+    }
+    invalid_tool_request
 }
 
 fn categorize_tool(tool_name: &str) -> ToolCategory {
@@ -138,9 +172,6 @@ fn stop_hook_block_cap_warning(plugin: &str, cap: u32) -> Message {
 /// Context needed for the reply function
 pub struct ReplyContext {
     pub conversation: Conversation,
-    pub tools: Vec<Tool>,
-    pub toolshim_tools: Vec<Tool>,
-    pub system_prompt: String,
     pub ponduin_mode: PonduinMode,
     pub tool_call_cut_off: usize,
     pub initial_messages: Vec<Message>,
@@ -751,7 +782,6 @@ impl Agent {
         &self,
         session_id: &str,
         unfixed_conversation: Conversation,
-        working_dir: &std::path::Path,
     ) -> Result<ReplyContext> {
         let unfixed_messages = unfixed_conversation.messages().clone();
         let (conversation, issues) = fix_conversation(unfixed_conversation.clone());
@@ -767,9 +797,7 @@ impl Agent {
         }
         let initial_messages = conversation.messages().clone();
 
-        let (tools, toolshim_tools, system_prompt, model_config) = self
-            .prepare_tools_and_prompt(session_id, working_dir)
-            .await?;
+        let model_config = self.model_config_for_session(session_id).await?;
 
         let ponduin_mode = *self.current_ponduin_mode.lock().await;
 
@@ -794,9 +822,6 @@ impl Agent {
 
         Ok(ReplyContext {
             conversation,
-            tools,
-            toolshim_tools,
-            system_prompt,
             ponduin_mode,
             tool_call_cut_off,
             initial_messages,
@@ -1884,6 +1909,131 @@ impl Agent {
         }))
     }
 
+    async fn decide_coding_tool_exposure(
+        &self,
+        provider: Arc<dyn Provider>,
+        model_config: &ponduin_providers::model::ModelConfig,
+        session_config: &SessionConfig,
+        conversation: &Conversation,
+        ponduin_mode: PonduinMode,
+        cancel_token: &Option<CancellationToken>,
+    ) -> Result<super::reply_parts::CodingToolExposure> {
+        let routing_tools = self.coding_agent.routing_tools(ponduin_mode);
+        let Some(base_prompt) = self.coding_agent.routing_system_prompt(ponduin_mode) else {
+            return Ok(super::reply_parts::CodingToolExposure::Inactive);
+        };
+        if routing_tools.is_empty() {
+            return Ok(super::reply_parts::CodingToolExposure::Inactive);
+        }
+
+        let routing_model_config = model_config
+            .clone()
+            .with_max_tokens(Some(CODING_ROUTER_MAX_TOKENS))
+            .with_thinking_effort(ThinkingEffort::Off);
+
+        for attempt in 0..CODING_ROUTER_MAX_ATTEMPTS {
+            if is_token_cancelled(cancel_token) {
+                return Ok(super::reply_parts::CodingToolExposure::Inactive);
+            }
+
+            let mut routing_prompt = base_prompt.clone();
+            if attempt > 0 {
+                routing_prompt.push_str(
+                    "\n\nYour previous routing output was invalid. Call exactly one of the two \
+                     disclosed routing tools now. Emit no prose and do not solve or plan the \
+                     original request.",
+                );
+            }
+
+            let (provider_tools, toolshim_tools) = if routing_model_config.toolshim {
+                routing_prompt =
+                    modify_system_prompt_for_tool_json(&routing_prompt, &routing_tools);
+                (Vec::new(), routing_tools.clone())
+            } else {
+                (routing_tools.clone(), Vec::new())
+            };
+
+            let attempt_result = tokio::time::timeout(CODING_ROUTER_TIMEOUT, async {
+                let mut stream = Self::stream_response_from_provider(
+                    provider.clone(),
+                    routing_model_config.clone(),
+                    &session_config.id,
+                    &routing_prompt,
+                    conversation.messages(),
+                    &provider_tools,
+                    &toolshim_tools,
+                )
+                .await?;
+                let mut decisions = std::collections::HashSet::new();
+                let mut invalid_tool_request = false;
+
+                while let Some(item) = stream.next().await {
+                    if is_token_cancelled(cancel_token) {
+                        break;
+                    }
+                    let (response, usage) = item?;
+                    if let Some(usage) = usage {
+                        self.update_session_metrics(
+                            &session_config.id,
+                            session_config.schedule_id.clone(),
+                            &usage,
+                            None,
+                        )
+                        .await?;
+                    }
+                    if let Some(response) = response {
+                        invalid_tool_request |=
+                            collect_coding_route_decisions(&response, &mut decisions);
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((decisions, invalid_tool_request))
+            })
+            .await;
+
+            match attempt_result {
+                Ok(Ok((decisions, false))) if decisions.len() == 1 => {
+                    let decision = *decisions.iter().next().expect("one routing decision");
+                    let exposure = match decision {
+                        CodingRouteDecision::Activate => {
+                            super::reply_parts::CodingToolExposure::Active
+                        }
+                        CodingRouteDecision::ContinueWithoutAgent => {
+                            super::reply_parts::CodingToolExposure::Inactive
+                        }
+                    };
+                    info!(
+                        decision = ?decision,
+                        attempt = attempt + 1,
+                        "model selected coding tool exposure"
+                    );
+                    return Ok(exposure);
+                }
+                Ok(Ok((decisions, invalid_tool_request))) => {
+                    warn!(
+                        decision_count = decisions.len(),
+                        invalid_tool_request,
+                        attempt = attempt + 1,
+                        "model returned an invalid coding routing decision"
+                    );
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    warn!(
+                        timeout_seconds = CODING_ROUTER_TIMEOUT.as_secs(),
+                        attempt = attempt + 1,
+                        "coding routing decision timed out"
+                    );
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "The selected model did not return exactly one valid semantic coding-routing \
+             decision after {CODING_ROUTER_MAX_ATTEMPTS} bounded attempts."
+        ))
+    }
+
     async fn reply_internal(
         &self,
         conversation: Conversation,
@@ -1892,26 +2042,41 @@ impl Agent {
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
         let context = self
-            .prepare_reply_context(&session.id, conversation, session.working_dir.as_path())
+            .prepare_reply_context(&session.id, conversation)
             .await?;
         let ReplyContext {
             mut conversation,
-            mut tools,
-            mut toolshim_tools,
-            mut system_prompt,
             tool_call_cut_off,
             ponduin_mode,
             initial_messages,
             model_config,
         } = context;
 
+        self.reset_retry_attempts().await;
+
+        let provider = self.provider().await?;
+        let coding_exposure = self
+            .decide_coding_tool_exposure(
+                provider.clone(),
+                &model_config,
+                &session_config,
+                &conversation,
+                ponduin_mode,
+                &cancel_token,
+            )
+            .await?;
+        let (mut tools, mut toolshim_tools, mut system_prompt, _) = self
+            .prepare_tools_and_prompt_with_coding(
+                &session_config.id,
+                &session.working_dir,
+                coding_exposure,
+            )
+            .await?;
+
         if let Some(project_addendum) = self.load_project_instructions(&session).await {
             system_prompt = format!("{system_prompt}\n\n{project_addendum}");
         }
 
-        self.reset_retry_attempts().await;
-
-        let provider = self.provider().await?;
         let provider_name = provider.get_name().to_string();
         let requested_model = model_config.model_name.clone();
         let inference = provider
@@ -1985,7 +2150,8 @@ impl Agent {
             let mut consecutive_stop_hook_blocks = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
             let mut can_drain_pending_steers = false;
-            let mut coding_tools_active = false;
+            let mut coding_tools_active =
+                coding_exposure == super::reply_parts::CodingToolExposure::Active;
 
             loop {
                 if is_token_cancelled(&cancel_token) {
@@ -2720,16 +2886,16 @@ impl Agent {
                 can_drain_pending_steers = true;
 
                 if tools_updated {
-                    let coding_exposure = if coding_tools_active {
+                    let refreshed_coding_exposure = if coding_tools_active {
                         super::reply_parts::CodingToolExposure::Active
                     } else {
-                        super::reply_parts::CodingToolExposure::Routed
+                        coding_exposure
                     };
                     (tools, toolshim_tools, system_prompt, _) =
                         self.prepare_tools_and_prompt_with_coding(
                             &session_config.id,
                             &session.working_dir,
-                            coding_exposure,
+                            refreshed_coding_exposure,
                         )
                         .await?;
                 }
@@ -2741,16 +2907,16 @@ impl Agent {
                         .await
                         .load_subdirectory_hints(&working_dir);
                     if has_new_hints && !tools_updated {
-                        let coding_exposure = if coding_tools_active {
+                        let refreshed_coding_exposure = if coding_tools_active {
                             super::reply_parts::CodingToolExposure::Active
                         } else {
-                            super::reply_parts::CodingToolExposure::Routed
+                            coding_exposure
                         };
                         (tools, toolshim_tools, system_prompt, _) =
                             self.prepare_tools_and_prompt_with_coding(
                                 &session_config.id,
                                 &session.working_dir,
-                                coding_exposure,
+                                refreshed_coding_exposure,
                             )
                             .await?;
                     }
@@ -3905,15 +4071,63 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         call_count: AtomicUsize,
     }
 
+    struct CodingDisclosureSnapshot {
+        system_prompt: String,
+        tools: Vec<String>,
+        max_tokens: Option<i32>,
+        thinking_effort: Option<String>,
+    }
+
     struct CodingDisclosureProvider {
-        call_count: AtomicUsize,
-        snapshots: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        route_count: AtomicUsize,
+        snapshots: std::sync::Mutex<Vec<CodingDisclosureSnapshot>>,
+    }
+
+    struct ContinueWithoutCodingRoutingProvider {
+        inner: Arc<dyn crate::providers::base::Provider>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for ContinueWithoutCodingRoutingProvider {
+        async fn stream(
+            &self,
+            model_config: &ponduin_providers::model::ModelConfig,
+            system_prompt: &str,
+            messages: &[Message],
+            tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let routing_request = tools
+                .iter()
+                .any(|tool| tool.name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+                && tools.iter().any(|tool| {
+                    tool.name == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME
+                });
+            if routing_request {
+                let message = Message::assistant().with_tool_request(
+                    "test-continue-without-coding",
+                    Ok(CallToolRequestParams::new(
+                        crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME,
+                    )
+                    .with_arguments(serde_json::Map::new())),
+                );
+                let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+                Ok(stream_from_single_message(message, usage))
+            } else {
+                self.inner
+                    .stream(model_config, system_prompt, messages, tools)
+                    .await
+            }
+        }
+
+        fn get_name(&self) -> &str {
+            self.inner.get_name()
+        }
     }
 
     impl CodingDisclosureProvider {
         fn new() -> Self {
             Self {
-                call_count: AtomicUsize::new(0),
+                route_count: AtomicUsize::new(0),
                 snapshots: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -3923,26 +4137,49 @@ echo start >> "$PLUGIN_ROOT/hook.log"
     impl crate::providers::base::Provider for CodingDisclosureProvider {
         async fn stream(
             &self,
-            _model_config: &ponduin_providers::model::ModelConfig,
+            model_config: &ponduin_providers::model::ModelConfig,
             system_prompt: &str,
             _messages: &[Message],
             tools: &[Tool],
         ) -> Result<MessageStream, ProviderError> {
-            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
-            self.snapshots.lock().unwrap().push((
-                system_prompt.to_string(),
-                tools.iter().map(|tool| tool.name.to_string()).collect(),
-            ));
-            let message = if call == 0 {
-                Message::assistant().with_tool_request(
-                    "activate-coding",
-                    Ok(
-                        CallToolRequestParams::new(crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
-                            .with_arguments(serde_json::Map::new()),
-                    ),
-                )
+            let tool_names = tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>();
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push(CodingDisclosureSnapshot {
+                    system_prompt: system_prompt.to_string(),
+                    tools: tool_names.clone(),
+                    max_tokens: model_config.max_tokens,
+                    thinking_effort: model_config
+                        .thinking_effort()
+                        .map(|effort| effort.to_string()),
+                });
+            let routing_request = tool_names
+                .iter()
+                .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+                && tool_names
+                    .iter()
+                    .any(|name| name == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME);
+            let message = if routing_request {
+                let route = self.route_count.fetch_add(1, Ordering::SeqCst);
+                if route == 0 {
+                    Message::assistant().with_text("invalid unstructured routing output")
+                } else {
+                    let name = if route == 1 {
+                        crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME
+                    } else {
+                        crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME
+                    };
+                    Message::assistant().with_tool_request(
+                        format!("routing-{route}"),
+                        Ok(CallToolRequestParams::new(name).with_arguments(serde_json::Map::new())),
+                    )
+                }
             } else {
-                Message::assistant().with_text(format!("provider response {call}"))
+                Message::assistant().with_text("provider response")
             };
             let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
             Ok(stream_from_single_message(message, usage))
@@ -3985,46 +4222,129 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         }
     }
 
+    #[test]
+    fn coding_route_collector_rejects_unknown_and_conflicting_tools() {
+        let mut decisions = std::collections::HashSet::new();
+        let activation = Message::assistant().with_tool_request(
+            "activate",
+            Ok(
+                CallToolRequestParams::new(crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+                    .with_arguments(serde_json::Map::new()),
+            ),
+        );
+        assert!(!collect_coding_route_decisions(&activation, &mut decisions));
+        assert_eq!(
+            decisions,
+            std::collections::HashSet::from([CodingRouteDecision::Activate])
+        );
+
+        let conflicting = Message::assistant().with_tool_request(
+            "continue",
+            Ok(
+                CallToolRequestParams::new(crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME)
+                    .with_arguments(serde_json::Map::new()),
+            ),
+        );
+        assert!(!collect_coding_route_decisions(
+            &conflicting,
+            &mut decisions
+        ));
+        assert_eq!(decisions.len(), 2);
+
+        let unknown = Message::assistant().with_tool_request(
+            "unknown",
+            Ok(CallToolRequestParams::new("unknown__route").with_arguments(serde_json::Map::new())),
+        );
+        assert!(collect_coding_route_decisions(&unknown, &mut decisions));
+    }
+
     #[tokio::test]
     async fn coding_tools_are_disclosed_after_activation_and_reset_next_reply() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let provider = Arc::new(CodingDisclosureProvider::new());
         let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
-        let (agent, session_id) =
-            create_test_agent(temp_dir.path().join("data"), hook_manager, provider.clone()).await?;
+        let (agent, session_id) = create_test_agent_inner(
+            temp_dir.path().join("data"),
+            hook_manager,
+            provider.clone(),
+            false,
+        )
+        .await?;
 
-        run_stop_hook_test_turn(&agent, &session_id, "Implement the requested change").await?;
-        run_stop_hook_test_turn(&agent, &session_id, "Now answer without project work").await?;
+        let first_turn =
+            run_stop_hook_test_turn(&agent, &session_id, "Implement the requested change").await?;
+        let second_turn =
+            run_stop_hook_test_turn(&agent, &session_id, "Now answer without project work").await?;
+        assert!(first_turn
+            .iter()
+            .chain(second_turn.iter())
+            .all(|message| !message
+                .as_concat_text()
+                .contains("invalid unstructured routing output")));
 
         let snapshots = provider.snapshots.lock().unwrap();
-        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots.len(), 5);
 
-        let (routing_prompt, routing_tools) = &snapshots[0];
-        assert!(routing_prompt.contains("disclosed on demand"));
-        assert!(routing_tools
+        let routing = &snapshots[0];
+        assert!(routing.system_prompt.contains("routing pass only"));
+        assert_eq!(routing.max_tokens, Some(CODING_ROUTER_MAX_TOKENS));
+        assert_eq!(routing.thinking_effort.as_deref(), Some("off"));
+        assert_eq!(routing.tools.len(), 2);
+        assert!(routing
+            .tools
             .iter()
             .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
-        assert!(!routing_tools
+        assert!(routing
+            .tools
+            .iter()
+            .any(|name| { name == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME }));
+        assert!(!routing
+            .tools
             .iter()
             .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
 
-        let (active_prompt, active_tools) = &snapshots[1];
-        assert!(active_prompt.contains("Internal coding capabilities are active"));
-        assert!(!active_tools
+        let routing_retry = &snapshots[1];
+        assert!(routing_retry
+            .system_prompt
+            .contains("previous routing output was invalid"));
+        assert_eq!(routing_retry.tools.len(), 2);
+
+        let active = &snapshots[2];
+        assert!(active
+            .system_prompt
+            .contains("Internal coding capabilities are active"));
+        assert!(!active
+            .tools
             .iter()
             .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
-        assert!(active_tools
+        assert!(active
+            .tools
             .iter()
             .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
 
-        let (next_routing_prompt, next_routing_tools) = &snapshots[2];
-        assert!(next_routing_prompt.contains("disclosed on demand"));
-        assert!(next_routing_tools
+        let next_routing = &snapshots[3];
+        assert!(next_routing.system_prompt.contains("routing pass only"));
+        assert_eq!(next_routing.max_tokens, Some(CODING_ROUTER_MAX_TOKENS));
+        assert_eq!(next_routing.thinking_effort.as_deref(), Some("off"));
+        assert_eq!(next_routing.tools.len(), 2);
+        assert!(next_routing
+            .tools
             .iter()
             .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
-        assert!(!next_routing_tools
+        assert!(next_routing
+            .tools
             .iter()
-            .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+            .any(|name| name == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
+
+        let inactive = &snapshots[4];
+        assert!(!inactive
+            .system_prompt
+            .contains("Internal coding capabilities are active"));
+        assert!(!inactive.system_prompt.contains("routing pass only"));
+        assert!(inactive
+            .tools
+            .iter()
+            .all(|name| !crate::coding::tools::is_reserved_name(name)));
         Ok(())
     }
 
@@ -4127,6 +4447,15 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         hook_manager: crate::hooks::HookManager,
         provider: Arc<dyn crate::providers::base::Provider>,
     ) -> Result<(Agent, String)> {
+        create_test_agent_inner(data_dir, hook_manager, provider, true).await
+    }
+
+    async fn create_test_agent_inner(
+        data_dir: PathBuf,
+        hook_manager: crate::hooks::HookManager,
+        provider: Arc<dyn crate::providers::base::Provider>,
+        intercept_routing: bool,
+    ) -> Result<(Agent, String)> {
         let session_manager = Arc::new(SessionManager::new(data_dir.clone()));
         let permission_manager = Arc::new(PermissionManager::new(data_dir));
         let config = AgentConfig::new(
@@ -4147,6 +4476,12 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                 PonduinMode::Auto,
             )
             .await?;
+        let provider = if intercept_routing {
+            Arc::new(ContinueWithoutCodingRoutingProvider { inner: provider })
+                as Arc<dyn crate::providers::base::Provider>
+        } else {
+            provider
+        };
         agent
             .update_provider(
                 provider,

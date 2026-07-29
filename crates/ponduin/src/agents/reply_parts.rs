@@ -174,6 +174,7 @@ fn message_has_timing_content(message: &Message) -> bool {
 pub(crate) enum CodingToolExposure {
     Routed,
     Active,
+    Inactive,
 }
 
 impl Agent {
@@ -198,8 +199,10 @@ impl Agent {
     ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
         let ponduin_mode = *self.current_ponduin_mode.lock().await;
         let mut tools = self.list_tools(session_id, None).await;
-        if coding_exposure == CodingToolExposure::Routed {
+        if coding_exposure != CodingToolExposure::Active {
             tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
+        }
+        if coding_exposure == CodingToolExposure::Routed {
             tools.extend(self.coding_agent.routing_tools(ponduin_mode));
         }
 
@@ -292,6 +295,7 @@ impl Agent {
             CodingToolExposure::Active => self
                 .coding_agent
                 .system_prompt_for_model(ponduin_mode, &model_config),
+            CodingToolExposure::Inactive => None,
         };
         if let Some(coding_prompt) = coding_prompt {
             system_prompt.push_str("\n\n");
@@ -986,10 +990,13 @@ mod tests {
         assert!(names
             .iter()
             .any(|n| n == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
+        assert!(names
+            .iter()
+            .any(|n| n == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
         assert!(!names
             .iter()
             .any(|n| n == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
-        assert!(system_prompt.contains("disclosed on demand"));
+        assert!(system_prompt.contains("bounded semantic routing decision"));
         assert!(!system_prompt.contains("Internal coding capabilities are active"));
 
         // Verify the names are sorted ascending
@@ -1006,10 +1013,24 @@ mod tests {
             .await?;
         let active_names: Vec<_> = active_tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert!(!active_names.contains(&crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
+        assert!(!active_names.contains(&crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
         assert!(active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
         assert!(active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
         assert!(active_system_prompt.contains("Internal coding capabilities are active"));
-        assert!(!active_system_prompt.contains("disclosed on demand"));
+        assert!(!active_system_prompt.contains("bounded semantic routing decision"));
+
+        let (inactive_tools, _, inactive_system_prompt, _) = agent
+            .prepare_tools_and_prompt_with_coding(
+                &session.id,
+                session.working_dir.as_path(),
+                CodingToolExposure::Inactive,
+            )
+            .await?;
+        assert!(inactive_tools
+            .iter()
+            .all(|tool| !crate::coding::tools::is_reserved_name(&tool.name)));
+        assert!(!inactive_system_prompt.contains("Internal coding capabilities are active"));
+        assert!(!inactive_system_prompt.contains("bounded semantic routing decision"));
 
         Ok(())
     }

@@ -39,7 +39,7 @@ impl CodingAgent {
 
     pub fn routing_tools(&self, ponduin_mode: PonduinMode) -> Vec<Tool> {
         if self.available(ponduin_mode) {
-            vec![tools::routing_definition()]
+            tools::routing_definitions()
         } else {
             Vec::new()
         }
@@ -59,11 +59,11 @@ impl CodingAgent {
         }
 
         Some(format!(
-            "Ponduin has an internal coding capability that is disclosed on demand by the \
-             active language model. This is automatic and requires no user setting or task-type \
-             selection. The session's permission mode is `{ponduin_mode}`; activation itself \
-             changes no files and grants no permission, while every later action remains subject \
-             to that mode and hard security boundaries. Request-routing guidance: \
+            "Ponduin uses the active language model for a bounded semantic routing decision. This \
+             is automatic and requires no user setting or task-type selection. The session's \
+             permission mode is `{ponduin_mode}`; routing changes no files and grants no \
+             permission, while every later action remains subject to that mode and hard security \
+             boundaries. Request-routing guidance: \
              {MODEL_ROUTING_GUIDANCE}"
         ))
     }
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(agent.tool_count(PonduinMode::Auto), 33);
         assert_eq!(agent.tool_count(PonduinMode::Approve), 33);
         assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 33);
-        assert_eq!(agent.routing_tools(PonduinMode::Auto).len(), 1);
+        assert_eq!(agent.routing_tools(PonduinMode::Auto).len(), 2);
     }
 
     #[test]
@@ -209,10 +209,11 @@ mod tests {
             .unwrap();
 
         assert!(prompt.contains("automatic and requires no user setting"));
-        assert!(prompt.contains("activation itself changes no files"));
+        assert!(prompt.contains("routing changes no files"));
         assert!(prompt.contains("complete user request and conversation context"));
         assert!(prompt.contains("Do not use keywords"));
         assert!(prompt.contains("coding__activate_agent"));
+        assert!(prompt.contains("coding__continue_without_agent"));
         assert!(prompt.contains("every new user turn"));
     }
 

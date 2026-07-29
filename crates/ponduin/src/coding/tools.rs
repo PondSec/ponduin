@@ -37,6 +37,7 @@ use std::time::Duration;
 
 pub const CODING_TOOL_PREFIX: &str = "coding__";
 pub const ACTIVATE_AGENT_TOOL_NAME: &str = "coding__activate_agent";
+pub const CONTINUE_WITHOUT_AGENT_TOOL_NAME: &str = "coding__continue_without_agent";
 pub const REPOSITORY_PROFILE_TOOL_NAME: &str = "coding__repository_profile";
 pub const REPOSITORY_INSTRUCTIONS_TOOL_NAME: &str = "coding__repository_instructions";
 pub const FIND_FILES_TOOL_NAME: &str = "coding__find_files";
@@ -711,24 +712,40 @@ pub fn definitions() -> Vec<Tool> {
     ]
 }
 
-pub(crate) fn routing_definition() -> Tool {
-    Tool::new(
-        ACTIVATE_AGENT_TOOL_NAME.to_string(),
-        "Activate ponduin's complete internal coding capability for the current user turn. The \
-         language model must decide from the complete request and conversation context, never \
-         from keywords or previous tool use. Call this as the only tool and emit no prose when \
-         the current request requires inspecting, changing, validating, debugging, reviewing, or \
-         otherwise working with a software project. Do not call it for general knowledge, \
-         conversation, explanations that require no repository work, or unrelated tasks. After \
-         activation, continue the original request automatically with the newly exposed tools."
-            .to_string(),
+pub(crate) fn routing_definitions() -> Vec<Tool> {
+    let empty_input = || {
         object!({
             "type": "object",
             "properties": {},
             "additionalProperties": false
-        }),
-    )
-    .annotate(read_only_annotations("Activate internal coding capability"))
+        })
+    };
+    vec![
+        Tool::new(
+            ACTIVATE_AGENT_TOOL_NAME.to_string(),
+            "Select this route when fulfilling the current user turn requires inspecting, \
+             creating, changing, validating, debugging, reviewing, or otherwise working with a \
+             software project. Decide from the request's complete semantic meaning and \
+             conversation context, not keywords."
+                .to_string(),
+            empty_input(),
+        )
+        .annotate(read_only_annotations(
+            "Route through internal coding capability",
+        )),
+        Tool::new(
+            CONTINUE_WITHOUT_AGENT_TOOL_NAME.to_string(),
+            "Select this route when the current user turn can be fulfilled without working with a \
+             software project, including general knowledge, conversation, and explanations that \
+             require no repository inspection or change. Decide from the request's complete \
+             semantic meaning and conversation context, not keywords."
+                .to_string(),
+            empty_input(),
+        )
+        .annotate(read_only_annotations(
+            "Continue without internal coding capability",
+        )),
+    ]
 }
 
 pub fn is_reserved_name(name: &str) -> bool {
@@ -3781,6 +3798,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().join("workspace");
         fs::create_dir(&root).unwrap();
+        fs::create_dir(temp_dir.path().join("outside")).unwrap();
         let call =
             CallToolRequestParams::new(REPOSITORY_INSTRUCTIONS_TOOL_NAME).with_arguments(object!({
                 "path": temp_dir.path().join("outside")
