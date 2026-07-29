@@ -115,9 +115,11 @@ impl CodingAgent {
              affect {} or more files \
              require the internal workflow: start, inspect/search, set a complete plan, begin \
              editing, apply bounded changes, begin validation, run actual checks, begin review, \
-             then complete with the evidence-backed report. Never claim a check passed from model \
-             text; process results are recorded automatically. Optional local retrieval: LSP={}, \
-             feature_embeddings={}. {}",
+             then complete with the evidence-backed report. In a new or empty project, the plan's \
+             relevant_files must name the workspace-relative paths that will be created; it must \
+             never be an empty array. Never claim a check passed from model text; process results \
+             are recorded automatically. Optional local retrieval: LSP={}, feature_embeddings={}. \
+             {}",
             self.config.plan_file_threshold,
             self.config.lsp,
             self.config.embeddings,
@@ -213,6 +215,8 @@ mod tests {
         assert!(prompt.contains("A prose plan is not execution"));
         assert!(prompt.contains("without asking whether to proceed"));
         assert!(prompt.contains("evidence-backed report"));
+        assert!(prompt.contains("relevant_files"));
+        assert!(prompt.contains("paths that will be created"));
         assert!(prompt.contains("Never claim a check passed"));
         assert!(prompt.contains("active for this model-selected request"));
         assert!(prompt.contains("Model capability profile"));

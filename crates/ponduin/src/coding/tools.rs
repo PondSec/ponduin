@@ -1549,6 +1549,14 @@ pub(crate) fn execute_with_state(
         }
         WORKFLOW_SET_PLAN_TOOL_NAME => {
             let params: WorkflowSetPlanParams = parse_arguments(&tool_call)?;
+            if params.plan.relevant_files.is_empty() {
+                return Err(invalid_arguments(
+                    "`plan.relevant_files` must list workspace-relative paths affected by the \
+                     plan. In an empty or greenfield project, list the intended new paths (for \
+                     example `pyproject.toml`, `src/package/__init__.py`, and `tests/test_package.py`); \
+                     do not send an empty array.",
+                ));
+            }
             for path in &params.plan.relevant_files {
                 workspace
                     .resolve_for_write(path)
@@ -2322,8 +2330,10 @@ fn workflow_set_plan_tool() -> Tool {
     Tool::new(
         WORKFLOW_SET_PLAN_TOOL_NAME.to_string(),
         "Attach a complete, bounded plan to the current workflow after repository analysis. \
-         Relevant paths are revalidated against the workspace and the plan must identify \
-         components, files, intended changes, risks, tests, validation, and rollback."
+         relevant_files includes both existing paths and workspace-relative paths that the task \
+         will create; it must not be empty even for a greenfield project. Relevant paths are \
+         revalidated against the workspace and the plan must identify components, files, intended \
+         changes, risks, tests, validation, and rollback."
             .to_string(),
         object!({
             "type": "object",
@@ -2347,6 +2357,9 @@ fn workflow_set_plan_tool() -> Tool {
                             "type": "array",
                             "minItems": 1,
                             "maxItems": 200,
+                            "description": "Existing workspace-relative paths and intended new \
+                                workspace-relative paths affected by the plan. For an empty project, \
+                                list every planned new file; never use an empty array.",
                             "items": {"type": "string", "minLength": 1}
                         },
                         "risks": bounded_string_array_schema(0),
@@ -3636,6 +3649,45 @@ mod tests {
             assert_eq!(annotations.destructive_hint, Some(destructive));
             assert_eq!(annotations.open_world_hint, Some(false));
         }
+    }
+
+    #[test]
+    fn empty_greenfield_plan_explains_how_to_name_intended_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "create a new package"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let started: Value = serde_json::from_str(&result_text(started)).unwrap();
+        let error = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
+                "workflow_id": started["id"].as_str().unwrap(),
+                "plan": {
+                    "affected_components": ["package"],
+                    "relevant_files": [],
+                    "risks": [],
+                    "intended_changes": ["create package"],
+                    "tests": ["run tests"],
+                    "validation": ["run tests"],
+                    "rollback_strategy": "roll back the change batch"
+                }
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("greenfield project"));
+        assert!(error.message.contains("intended new paths"));
+        assert!(error.message.contains("pyproject.toml"));
     }
 
     #[test]
