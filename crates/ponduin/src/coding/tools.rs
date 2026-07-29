@@ -61,6 +61,7 @@ pub const PROJECT_CAPABILITIES_TOOL_NAME: &str = "coding__project_capabilities";
 pub const PREPARE_CONTEXT_TOOL_NAME: &str = "coding__prepare_context";
 pub const WORKFLOW_START_TOOL_NAME: &str = "coding__workflow_start";
 pub const WORKFLOW_SET_PLAN_TOOL_NAME: &str = "coding__workflow_set_plan";
+pub const WORKFLOW_UPDATE_MEMORY_TOOL_NAME: &str = "coding__workflow_update_memory";
 pub const WORKFLOW_TRANSITION_TOOL_NAME: &str = "coding__workflow_transition";
 pub const WORKFLOW_STATUS_TOOL_NAME: &str = "coding__workflow_status";
 pub const WORKFLOW_COMPLETE_TOOL_NAME: &str = "coding__workflow_complete";
@@ -386,6 +387,30 @@ impl CodingToolState {
         });
     }
 
+    fn note_read_files(&self, workspace_root: &Path, paths: Vec<PathBuf>) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.note_read_files(paths);
+        });
+    }
+
+    fn note_symbols(
+        &self,
+        workspace_root: &Path,
+        symbols: &[crate::coding::intelligence::CodeSymbol],
+    ) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.note_symbols(symbols);
+        });
+    }
+
     fn set_workflow_plan(
         &self,
         workspace_root: &Path,
@@ -399,6 +424,25 @@ impl CodingToolState {
         self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
             workflow
                 .set_plan(plan)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            Ok(workflow.status())
+        })
+    }
+
+    fn update_workflow_memory(
+        &self,
+        workspace_root: &Path,
+        workflow_id: &str,
+        assumptions: Option<Vec<String>>,
+        open_points: Option<Vec<String>>,
+    ) -> Result<WorkflowStatus, ErrorData> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
+            workflow
+                .update_memory_notes(assumptions, open_points)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             Ok(workflow.status())
         })
@@ -639,6 +683,7 @@ pub fn definitions() -> Vec<Tool> {
         prepare_context_tool(),
         workflow_start_tool(),
         workflow_set_plan_tool(),
+        workflow_update_memory_tool(),
         workflow_transition_tool(),
         workflow_status_tool(),
         workflow_complete_tool(),
@@ -1015,6 +1060,7 @@ pub(crate) fn execute_with_state(
                 },
             )
             .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.note_read_files(workspace.root(), vec![snapshot.path.clone()]);
             json_result(&snapshot, config.output_limit)
         }
         PREVIEW_CHANGES_TOOL_NAME => {
@@ -1084,6 +1130,7 @@ pub(crate) fn execute_with_state(
             let result = index
                 .search_symbols(&params.query, params.exact, params.max_results)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.note_symbols(workspace.root(), &result.matches);
             json_result(&result, config.output_limit)
         }
         FIND_REFERENCES_TOOL_NAME => {
@@ -1151,6 +1198,14 @@ pub(crate) fn execute_with_state(
                 planner.prepare(&params.query, limits)
             }
             .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.note_read_files(
+                workspace.root(),
+                bundle
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.path.clone())
+                    .collect(),
+            );
             json_result(&bundle, config.output_limit)
         }
         WORKFLOW_START_TOOL_NAME => {
@@ -1167,6 +1222,21 @@ pub(crate) fn execute_with_state(
             }
             let status =
                 state.set_workflow_plan(workspace.root(), &params.workflow_id, params.plan)?;
+            json_result(&status, config.output_limit)
+        }
+        WORKFLOW_UPDATE_MEMORY_TOOL_NAME => {
+            let params: WorkflowUpdateMemoryParams = parse_arguments(&tool_call)?;
+            if params.assumptions.is_none() && params.open_points.is_none() {
+                return Err(invalid_arguments(
+                    "at least one of assumptions or open_points must be supplied",
+                ));
+            }
+            let status = state.update_workflow_memory(
+                workspace.root(),
+                &params.workflow_id,
+                params.assumptions,
+                params.open_points,
+            )?;
             json_result(&status, config.output_limit)
         }
         WORKFLOW_TRANSITION_TOOL_NAME => {
@@ -1935,6 +2005,46 @@ fn workflow_set_plan_tool() -> Tool {
         }),
     )
     .annotate(stateful_annotations("Set coding workflow plan"))
+}
+
+fn workflow_update_memory_tool() -> Tool {
+    Tool::new(
+        WORKFLOW_UPDATE_MEMORY_TOOL_NAME.to_string(),
+        "Replace the bounded assumptions or open points in the active agent-local workflow \
+         memory. Read files, relevant symbols, executed commands, and known validation errors are \
+         captured automatically without source text, command arguments, or diagnostic text. The \
+         complete memory is ephemeral and never persisted."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["workflow_id"],
+            "properties": {
+                "workflow_id": {"type": "string", "minLength": 1},
+                "assumptions": {
+                    "type": ["array", "null"],
+                    "maxItems": 200,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 16384
+                    },
+                    "default": null
+                },
+                "open_points": {
+                    "type": ["array", "null"],
+                    "maxItems": 200,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 16384
+                    },
+                    "default": null
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(stateful_annotations("Update coding workflow memory"))
 }
 
 fn workflow_transition_tool() -> Tool {
@@ -2834,6 +2944,16 @@ struct WorkflowSetPlanParams {
     plan: WorkflowPlan,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowUpdateMemoryParams {
+    workflow_id: String,
+    #[serde(default)]
+    assumptions: Option<Vec<String>>,
+    #[serde(default)]
+    open_points: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 enum WorkflowTransition {
     #[serde(rename = "begin_editing")]
@@ -3089,7 +3209,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 32);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -3111,6 +3231,7 @@ mod tests {
                 tool.name.as_ref(),
                 WORKFLOW_START_TOOL_NAME
                     | WORKFLOW_SET_PLAN_TOOL_NAME
+                    | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
                     | WORKFLOW_TRANSITION_TOOL_NAME
                     | WORKFLOW_COMPLETE_TOOL_NAME
             );
@@ -3207,6 +3328,11 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = enabled_config();
         let state = CodingToolState::default();
+        fs::write(
+            temp_dir.path().join("context.rs"),
+            "pub fn fixture_context() {}\n",
+        )
+        .unwrap();
 
         let blocked = CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
             "changes": [
@@ -3237,6 +3363,35 @@ mod tests {
             &config,
             &state,
             CallToolRequestParams::new(REPOSITORY_PROFILE_TOOL_NAME),
+            temp_dir.path(),
+        )
+        .unwrap();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(READ_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "context.rs"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(SEARCH_SYMBOLS_TOOL_NAME).with_arguments(object!({
+                "query": "fixture_context"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_UPDATE_MEMORY_TOOL_NAME).with_arguments(object!({
+                "workflow_id": workflow_id.clone(),
+                "assumptions": ["the fixture directory is writable"],
+                "open_points": ["confirm command execution"]
+            })),
             temp_dir.path(),
         )
         .unwrap();
@@ -3318,6 +3473,22 @@ mod tests {
         assert_eq!(completed["validations"][0]["outcome"], "passed");
         assert!(completed["validations"][0].get("stdout").is_none());
         assert!(completed["validations"][0].get("stderr").is_none());
+        assert_eq!(
+            completed["memory"]["assumptions"][0],
+            "the fixture directory is writable"
+        );
+        assert_eq!(completed["memory"]["read_files"][0], "context.rs");
+        assert_eq!(
+            completed["memory"]["relevant_symbols"][0]["name"],
+            "fixture_context"
+        );
+        assert_eq!(
+            completed["memory"]["executed_commands"][0]["program"],
+            "rustc"
+        );
+        assert!(completed["memory"]["executed_commands"][0]
+            .get("args")
+            .is_none());
     }
 
     #[tokio::test]

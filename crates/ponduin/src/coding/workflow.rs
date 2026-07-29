@@ -1,4 +1,5 @@
 use crate::coding::file::content_digest;
+use crate::coding::intelligence::CodeSymbol;
 use crate::coding::patch::MutationPreview;
 use crate::coding::process::ProcessOutput;
 use crate::coding::validation::{ValidationExecution, ValidationStatus};
@@ -31,6 +32,7 @@ pub struct CodingWorkflow {
     last_error_count: Option<usize>,
     stop_reason: Option<WorkflowStopReason>,
     completion: Option<CompletionDetails>,
+    memory: WorkflowMemory,
 }
 
 impl CodingWorkflow {
@@ -54,6 +56,7 @@ impl CodingWorkflow {
             last_error_count: None,
             stop_reason: None,
             completion: None,
+            memory: WorkflowMemory::default(),
         })
     }
 
@@ -82,6 +85,68 @@ impl CodingWorkflow {
         if self.phase == WorkflowPhase::Analyzing {
             self.phase = WorkflowPhase::Searching;
         }
+    }
+
+    pub fn note_read_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        if self.is_terminal() {
+            return;
+        }
+        let mut known = self
+            .memory
+            .read_files
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for path in paths {
+            if known.len() == MAX_EVIDENCE_RECORDS {
+                break;
+            }
+            known.insert(path);
+        }
+        self.memory.read_files = known.into_iter().collect();
+    }
+
+    pub fn note_symbols<'a>(&mut self, symbols: impl IntoIterator<Item = &'a CodeSymbol>) {
+        if self.is_terminal() {
+            return;
+        }
+        let mut known = self
+            .memory
+            .relevant_symbols
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for symbol in symbols {
+            if known.len() == MAX_EVIDENCE_RECORDS {
+                break;
+            }
+            known.insert(RelevantSymbolEvidence {
+                path: symbol.path.clone(),
+                name: symbol.name.clone(),
+                qualified_name: symbol.qualified_name.clone(),
+                line: symbol.line,
+            });
+        }
+        self.memory.relevant_symbols = known.into_iter().collect();
+    }
+
+    pub fn update_memory_notes(
+        &mut self,
+        assumptions: Option<Vec<String>>,
+        open_points: Option<Vec<String>>,
+    ) -> Result<(), WorkflowError> {
+        if self.is_terminal() {
+            return Err(WorkflowError::TerminalMemoryUpdate);
+        }
+        if let Some(assumptions) = assumptions {
+            validate_items("workflow assumptions", &assumptions, true)?;
+            self.memory.assumptions = assumptions;
+        }
+        if let Some(open_points) = open_points {
+            validate_items("workflow open points", &open_points, true)?;
+            self.memory.open_points = open_points;
+        }
+        Ok(())
     }
 
     pub fn set_plan(&mut self, plan: WorkflowPlan) -> Result<(), WorkflowError> {
@@ -187,6 +252,12 @@ impl CodingWorkflow {
         while self.invocation_history.len() > MAX_EVIDENCE_RECORDS {
             self.invocation_history.pop_front();
         }
+        self.record_command_evidence(CommandEvidence::from_process(
+            self.revision,
+            program,
+            args,
+            output,
+        ));
         let repetitions = self
             .invocation_history
             .iter()
@@ -213,6 +284,9 @@ impl CodingWorkflow {
         if self.is_terminal() || self.phase != WorkflowPhase::Testing {
             return Ok(());
         }
+        if let Some(command) = CommandEvidence::from_execution(self.revision, execution) {
+            self.record_command_evidence(command);
+        }
         self.accept_validation(ValidationEvidence::from_execution(self.revision, execution))
     }
 
@@ -229,6 +303,20 @@ impl CodingWorkflow {
             self.non_improving_failures = 0;
             self.last_error_count = Some(0);
             return Ok(());
+        }
+        if let Some(validation) = self.validations.last() {
+            let known = KnownErrorEvidence {
+                revision: validation.revision,
+                outcome: validation.outcome,
+                error_count: validation.error_count,
+                diagnostic_fingerprint: validation.diagnostic_fingerprint.clone(),
+            };
+            if !self.memory.known_errors.contains(&known) {
+                self.memory.known_errors.push(known);
+                if self.memory.known_errors.len() > MAX_EVIDENCE_RECORDS {
+                    self.memory.known_errors.remove(0);
+                }
+            }
         }
         if !failed {
             return Ok(());
@@ -342,6 +430,7 @@ impl CodingWorkflow {
             changed_files: self.changed_files(),
             validation_count: self.validations.len(),
             stop_reason: self.stop_reason.clone(),
+            memory: self.memory.clone(),
         }
     }
 
@@ -375,6 +464,7 @@ impl CodingWorkflow {
                 .map(|completion| completion.remaining_risks.clone())
                 .unwrap_or_default(),
             stop_reason: self.stop_reason.clone(),
+            memory: self.memory.clone(),
         }
     }
 
@@ -386,6 +476,13 @@ impl CodingWorkflow {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    fn record_command_evidence(&mut self, command: CommandEvidence) {
+        self.memory.executed_commands.push(command);
+        if self.memory.executed_commands.len() > MAX_EVIDENCE_RECORDS {
+            self.memory.executed_commands.remove(0);
+        }
     }
 
     fn require_phase(&self, expected: &[WorkflowPhase]) -> Result<(), WorkflowError> {
@@ -481,6 +578,8 @@ pub struct WorkflowStatus {
     pub changed_files: Vec<PathBuf>,
     pub validation_count: usize,
     pub stop_reason: Option<WorkflowStopReason>,
+    #[serde(default)]
+    pub memory: WorkflowMemory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +595,99 @@ pub struct WorkflowReport {
     pub summary: Option<String>,
     pub remaining_risks: Vec<String>,
     pub stop_reason: Option<WorkflowStopReason>,
+    #[serde(default)]
+    pub memory: WorkflowMemory,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowMemory {
+    pub assumptions: Vec<String>,
+    pub read_files: Vec<PathBuf>,
+    pub relevant_symbols: Vec<RelevantSymbolEvidence>,
+    pub executed_commands: Vec<CommandEvidence>,
+    pub known_errors: Vec<KnownErrorEvidence>,
+    pub open_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RelevantSymbolEvidence {
+    pub path: PathBuf,
+    pub name: String,
+    pub qualified_name: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandEvidence {
+    pub revision: u32,
+    pub program: String,
+    pub cwd: PathBuf,
+    pub argument_count: usize,
+    pub argument_fingerprint: String,
+    pub outcome: ValidationOutcome,
+    pub duration_ms: u128,
+}
+
+impl CommandEvidence {
+    fn from_process(revision: u32, program: &str, args: &[String], output: &ProcessOutput) -> Self {
+        let mut argument_bytes = Vec::new();
+        for argument in args {
+            argument_bytes.extend_from_slice(argument.as_bytes());
+            argument_bytes.push(0);
+        }
+        let outcome = if output.timed_out {
+            ValidationOutcome::TimedOut
+        } else if output.background_process_detected || output.output_collection_error.is_some() {
+            ValidationOutcome::IncompleteOutput
+        } else if output.success {
+            ValidationOutcome::Passed
+        } else {
+            ValidationOutcome::Failed
+        };
+        Self {
+            revision,
+            program: program.to_string(),
+            cwd: output.cwd.clone(),
+            argument_count: args.len(),
+            argument_fingerprint: content_digest(&argument_bytes),
+            outcome,
+            duration_ms: output.duration_ms,
+        }
+    }
+
+    fn from_execution(revision: u32, execution: &ValidationExecution) -> Option<Self> {
+        let command = execution.command.as_ref()?;
+        if let Some(output) = &execution.output {
+            return Some(Self::from_process(
+                revision,
+                &command.program,
+                &command.args,
+                output,
+            ));
+        }
+        let mut argument_bytes = Vec::new();
+        for argument in &command.args {
+            argument_bytes.extend_from_slice(argument.as_bytes());
+            argument_bytes.push(0);
+        }
+        Some(Self {
+            revision,
+            program: command.program.clone(),
+            cwd: command.cwd.clone(),
+            argument_count: command.args.len(),
+            argument_fingerprint: content_digest(&argument_bytes),
+            outcome: ValidationOutcome::from(execution.status),
+            duration_ms: 0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownErrorEvidence {
+    pub revision: u32,
+    pub outcome: ValidationOutcome,
+    pub error_count: usize,
+    pub diagnostic_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,11 +985,14 @@ pub enum WorkflowError {
     UnknownChange(String),
     #[error("could not encode workflow evidence: {0}")]
     Evidence(String),
+    #[error("completed, blocked, or failed workflows cannot update working memory")]
+    TerminalMemoryUpdate,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::intelligence::SymbolKind;
     use crate::coding::patch::{FileMutationPreview, MutationOperation};
 
     fn limits() -> WorkflowLimits {
@@ -996,5 +1191,43 @@ mod tests {
 
         assert!(!report.verified);
         assert_eq!(report.validations[0].outcome, ValidationOutcome::NotPresent);
+    }
+
+    #[test]
+    fn retains_bounded_working_memory_without_source_or_diagnostics() {
+        let mut workflow = planned_workflow();
+        workflow
+            .update_memory_notes(
+                Some(vec!["repository is writable".to_string()]),
+                Some(vec!["run focused tests".to_string()]),
+            )
+            .unwrap();
+        workflow.note_read_files([PathBuf::from("src/lib.rs"), PathBuf::from("src/lib.rs")]);
+        workflow.note_symbols([&CodeSymbol {
+            path: PathBuf::from("src/lib.rs"),
+            name: "target".to_string(),
+            qualified_name: "module::target".to_string(),
+            kind: SymbolKind::Function,
+            line: 12,
+            detail: Some("fn target(secret: String)".to_string()),
+        }]);
+        workflow
+            .record_process(
+                "cargo",
+                &["test".to_string(), "secret-filter".to_string()],
+                &output(false, "password=must-not-be-retained"),
+            )
+            .unwrap();
+
+        let memory = workflow.status().memory;
+        assert_eq!(memory.read_files, vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(memory.relevant_symbols[0].name, "target");
+        assert_eq!(memory.relevant_symbols[0].qualified_name, "module::target");
+        assert_eq!(memory.executed_commands[0].program, "cargo");
+        assert_eq!(memory.executed_commands[0].argument_count, 2);
+        let serialized = serde_json::to_string(&memory).unwrap();
+        assert!(!serialized.contains("secret-filter"));
+        assert!(!serialized.contains("must-not-be-retained"));
+        assert!(!serialized.contains("fn target"));
     }
 }
