@@ -18,7 +18,6 @@ import {
   Tray,
 } from 'electron';
 import { pathToFileURL, format as formatUrl, URLSearchParams } from 'node:url';
-import { Buffer } from 'node:buffer';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import started from 'electron-squirrel-startup';
@@ -27,6 +26,7 @@ import os from 'node:os';
 import { execFileSync, spawn, execFile } from 'child_process';
 import 'dotenv/config';
 import { checkBackendStatus } from './backendStatus';
+import { normalizeCertificateFingerprint } from './certificateFingerprint';
 import { startPonduinServe } from './ponduinServe';
 import { PonduinServeLeaseRegistry, type PonduinServeLease } from './ponduinServeLeaseRegistry';
 import { acpWebSocketUrlFromHttpBase, normalizeAcpHttpBaseUrl } from './acp/url';
@@ -321,25 +321,13 @@ function normalizeHostname(hostname: string): string {
   return hostname.toLowerCase();
 }
 
-function normalizeFingerprint(fp: string): string {
-  if (fp.startsWith('sha256/')) {
-    const b64 = fp.slice('sha256/'.length);
-    const buf = Buffer.from(b64, 'base64');
-    return Array.from(buf)
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join(':')
-      .toUpperCase();
-  }
-  return fp.toUpperCase();
-}
-
 function trustBackendCertificate(
   hostname: string,
   fingerprint: string | null
 ): BackendCertificateTrustRegistration {
   const trust: BackendCertificateTrust = {
     hostname: normalizeHostname(hostname),
-    fingerprint: fingerprint ? normalizeFingerprint(fingerprint) : null,
+    fingerprint: fingerprint ? normalizeCertificateFingerprint(fingerprint) : null,
   };
   trustedBackendCertificates.add(trust);
   return {
@@ -356,7 +344,7 @@ function getBackendCertificateTrusts(hostname: string): BackendCertificateTrust[
 }
 
 function verifyBackendCertificate(hostname: string, fingerprint: string): boolean {
-  const normalizedFingerprint = normalizeFingerprint(fingerprint);
+  const normalizedFingerprint = normalizeCertificateFingerprint(fingerprint);
   const trusts = getBackendCertificateTrusts(hostname);
   if (trusts.length === 0) {
     return false;
@@ -1169,6 +1157,9 @@ const createChat = async (
         logger: log,
         diagnosticsDir: STARTUP_LOGS_DIR,
         readinessFetch: net.fetch as unknown as typeof globalThis.fetch,
+        onCertFingerprint: (fingerprint) => {
+          localCertificateTrust.trust.fingerprint = normalizeCertificateFingerprint(fingerprint);
+        },
       });
       if (!ponduinServeResult.certFingerprint) {
         await ponduinServeResult.cleanup();
@@ -1177,7 +1168,9 @@ const createChat = async (
         );
       }
 
-      const localCertFingerprint = normalizeFingerprint(ponduinServeResult.certFingerprint);
+      const localCertFingerprint = normalizeCertificateFingerprint(
+        ponduinServeResult.certFingerprint
+      );
       if (
         localCertificateTrust.trust.fingerprint &&
         localCertificateTrust.trust.fingerprint !== localCertFingerprint

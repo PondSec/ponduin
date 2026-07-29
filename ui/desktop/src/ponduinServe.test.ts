@@ -220,11 +220,13 @@ describe('startPonduinServe', () => {
       vi.stubEnv('PONDUIN_BINARY', ponduinPath);
 
       const readinessUrls: string[] = [];
+      let fingerprintRegistered = false;
       const logger = {
         info: vi.fn(),
         error: vi.fn(),
       };
       const readinessFetch = vi.fn(async (input: string, _init?: ReadinessFetchInit) => {
+        expect(fingerprintRegistered).toBe(true);
         readinessUrls.push(input);
         return new Response(null, { status: 200 });
       });
@@ -238,12 +240,17 @@ describe('startPonduinServe', () => {
         },
         logger,
         readinessFetch,
+        onCertFingerprint: (fingerprint) => {
+          expect(fingerprint).toBe('DD:EE:FF');
+          fingerprintRegistered = true;
+        },
       });
 
       try {
         expect(readinessUrls[0]).toMatch(/^https:\/\/127\.0\.0\.1:\d+\/status$/);
         expect(result.acpUrl).toMatch(/^wss:\/\/127\.0\.0\.1:\d+\/acp\?token=test-secret$/);
         expect(result.certFingerprint).toBe('DD:EE:FF');
+        expect(fingerprintRegistered).toBe(true);
         await expect(waitForFileLines(argsPath)).resolves.toContain('--tls');
       } finally {
         await result.cleanup();
@@ -252,7 +259,7 @@ describe('startPonduinServe', () => {
   );
 
   it.skipIf(process.platform === 'win32')(
-    'waits for TLS fingerprint after readiness succeeds',
+    'waits for and registers the TLS fingerprint before readiness',
     async () => {
       const tempDir = makeTempDir();
       const ponduinPath = makeExecutable(
@@ -267,18 +274,26 @@ describe('startPonduinServe', () => {
       );
       vi.stubEnv('PONDUIN_BINARY', ponduinPath);
 
-      const readinessFetch = vi.fn(async () => new Response(null, { status: 200 }));
+      const events: string[] = [];
+      const readinessFetch = vi.fn(async () => {
+        events.push('readiness');
+        return new Response(null, { status: 200 });
+      });
 
       const result = await startPonduinServe({
         serverSecret: 'test-secret',
         dir: tempDir,
         tls: true,
         readinessFetch,
+        onCertFingerprint: () => {
+          events.push('fingerprint');
+        },
       });
 
       try {
         expect(readinessFetch).toHaveBeenCalled();
         expect(result.certFingerprint).toBe('11:22:33');
+        expect(events).toEqual(['fingerprint', 'readiness']);
       } finally {
         await result.cleanup();
       }
