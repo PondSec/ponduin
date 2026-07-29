@@ -51,6 +51,7 @@ pub const GIT_HISTORY_TOOL_NAME: &str = "coding__git_history";
 pub const GIT_STAGE_OWNED_TOOL_NAME: &str = "coding__git_stage_owned";
 pub const GIT_UNSTAGE_OWNED_TOOL_NAME: &str = "coding__git_unstage_owned";
 pub const GIT_COMMIT_OWNED_TOOL_NAME: &str = "coding__git_commit_owned";
+pub const GIT_REVERT_OWNED_TOOL_NAME: &str = "coding__git_revert_owned";
 pub const GIT_CREATE_BRANCH_TOOL_NAME: &str = "coding__git_create_branch";
 pub const GIT_PUSH_OWNED_TOOL_NAME: &str = "coding__git_push_owned";
 pub const REPOSITORY_MAP_TOOL_NAME: &str = "coding__repository_map";
@@ -272,6 +273,21 @@ impl CodingToolState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .any(|commit| commit.workspace_root == workspace_root && commit.oid == oid)
+    }
+
+    fn replace_commit(&self, workspace_root: &Path, old_oid: &str, new_oid: &str) {
+        let mut committed = self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        committed.retain(|commit| commit.workspace_root != workspace_root || commit.oid != old_oid);
+        committed.push_back(OwnedCommit {
+            workspace_root: workspace_root.to_path_buf(),
+            oid: new_oid.to_string(),
+        });
+        while committed.len() > MAX_ROLLBACK_RECORDS {
+            committed.pop_front();
+        }
     }
 
     fn intelligence_index(
@@ -673,6 +689,7 @@ pub fn definitions() -> Vec<Tool> {
         git_stage_owned_tool(),
         git_unstage_owned_tool(),
         git_commit_owned_tool(),
+        git_revert_owned_tool(),
         git_create_branch_tool(),
         git_push_owned_tool(),
         repository_map_tool(),
@@ -729,6 +746,7 @@ pub(crate) fn is_async_tool(name: &str) -> bool {
             | GIT_STAGE_OWNED_TOOL_NAME
             | GIT_UNSTAGE_OWNED_TOOL_NAME
             | GIT_COMMIT_OWNED_TOOL_NAME
+            | GIT_REVERT_OWNED_TOOL_NAME
             | GIT_CREATE_BRANCH_TOOL_NAME
             | GIT_PUSH_OWNED_TOOL_NAME
             | RUN_VALIDATION_TOOL_NAME
@@ -866,6 +884,24 @@ pub(crate) async fn execute_async(
                 .map_err(|error| invalid_arguments(error.to_string()))?;
             state.remember_commit(workspace.root(), &result.oid);
             state.expire_committed(workspace.root(), &result.committed_files);
+            json_result(&result, config.output_limit)
+        }
+        GIT_REVERT_OWNED_TOOL_NAME => {
+            let params: GitOwnedCommitParams = parse_arguments(&tool_call)?;
+            if !state.owns_commit(workspace.root(), &params.oid) {
+                return Err(invalid_arguments(format!(
+                    "commit `{}` is not retained as an agent-owned commit",
+                    params.oid
+                )));
+            }
+            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = repository
+                .revert_owned_commit(&params.oid)
+                .await
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            state.replace_commit(workspace.root(), &result.reverted_oid, &result.revert_oid);
             json_result(&result, config.output_limit)
         }
         GIT_CREATE_BRANCH_TOOL_NAME => {
@@ -1270,6 +1306,7 @@ pub(crate) fn execute_with_state(
         | GIT_STAGE_OWNED_TOOL_NAME
         | GIT_UNSTAGE_OWNED_TOOL_NAME
         | GIT_COMMIT_OWNED_TOOL_NAME
+        | GIT_REVERT_OWNED_TOOL_NAME
         | GIT_CREATE_BRANCH_TOOL_NAME
         | GIT_PUSH_OWNED_TOOL_NAME
         | RUN_VALIDATION_TOOL_NAME
@@ -1697,6 +1734,32 @@ fn git_commit_owned_tool() -> Tool {
         }),
     )
     .annotate(mutation_annotations("Commit agent-owned Git changes"))
+}
+
+fn git_revert_owned_tool() -> Tool {
+    Tool::new(
+        GIT_REVERT_OWNED_TOOL_NAME.to_string(),
+        "Create one inverse commit for a commit retained as created by this agent. Requires that \
+         the owned commit is still the exact current HEAD and that the worktree and index are \
+         completely clean. Hooks, signing, executable filters, history rewriting, reset, and \
+         force operations are disabled. The returned revert commit remains agent-owned so it can \
+         be pushed explicitly."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["oid"],
+            "properties": {
+                "oid": {
+                    "type": "string",
+                    "minLength": 40,
+                    "maxLength": 64,
+                    "description": "Current commit object id returned by coding__git_commit_owned."
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(mutation_annotations("Revert agent-owned Git commit"))
 }
 
 fn git_create_branch_tool() -> Tool {
@@ -3063,6 +3126,12 @@ struct GitCommitOwnedParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GitOwnedCommitParams {
+    oid: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GitCreateBranchParams {
     name: String,
     #[serde(default)]
@@ -3209,7 +3278,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 32);
+        assert_eq!(tools.len(), 33);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -3223,6 +3292,7 @@ mod tests {
                     | GIT_STAGE_OWNED_TOOL_NAME
                     | GIT_UNSTAGE_OWNED_TOOL_NAME
                     | GIT_COMMIT_OWNED_TOOL_NAME
+                    | GIT_REVERT_OWNED_TOOL_NAME
                     | GIT_CREATE_BRANCH_TOOL_NAME
                     | GIT_PUSH_OWNED_TOOL_NAME
                     | RUN_VALIDATION_TOOL_NAME
@@ -4163,7 +4233,21 @@ mod tests {
         let committed_json: Value = serde_json::from_str(&result_text(committed)).unwrap();
         assert_eq!(committed_json["committed_files"][0], "app.txt");
         assert!(state.find(&rollback_id).unwrap().is_none());
-        let commit_oid = committed_json["oid"].as_str().unwrap();
+        let commit_oid = committed_json["oid"].as_str().unwrap().to_string();
+        let revert =
+            CallToolRequestParams::new(GIT_REVERT_OWNED_TOOL_NAME).with_arguments(object!({
+                "oid": commit_oid.clone()
+            }));
+        let reverted = execute_async(&config, &state, revert, temp_dir.path())
+            .await
+            .unwrap();
+        let reverted_json: Value = serde_json::from_str(&result_text(reverted)).unwrap();
+        let revert_oid = reverted_json["revert_oid"].as_str().unwrap().to_string();
+        assert_eq!(reverted_json["reverted_oid"], commit_oid);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        let canonical_root = CodingWorkspace::new(temp_dir.path()).unwrap();
+        assert!(!state.owns_commit(canonical_root.root(), &commit_oid));
+        assert!(state.owns_commit(canonical_root.root(), &revert_oid));
 
         run_git(temp_dir.path(), &["init", "--bare", ".test-remote.git"]);
         run_git(
@@ -4171,14 +4255,14 @@ mod tests {
             &["remote", "add", "test-origin", ".test-remote.git"],
         );
         let push = CallToolRequestParams::new(GIT_PUSH_OWNED_TOOL_NAME).with_arguments(object!({
-            "oid": commit_oid,
+            "oid": revert_oid,
             "remote": "test-origin"
         }));
         let pushed = execute_async(&config, &state, push, temp_dir.path())
             .await
             .unwrap();
         let pushed_json: Value = serde_json::from_str(&result_text(pushed)).unwrap();
-        assert_eq!(pushed_json["oid"], commit_oid);
+        assert_eq!(pushed_json["oid"], revert_oid);
         assert_eq!(pushed_json["remote"], "test-origin");
 
         let history = execute_async(
@@ -4192,7 +4276,10 @@ mod tests {
         .await
         .unwrap();
         let history_json: Value = serde_json::from_str(&result_text(history)).unwrap();
-        assert_eq!(history_json["commits"][0]["subject"], "agent-owned change");
+        assert_eq!(
+            history_json["commits"][0]["subject"],
+            "Revert \"agent-owned change\""
+        );
 
         let unknown_stage =
             CallToolRequestParams::new(GIT_STAGE_OWNED_TOOL_NAME).with_arguments(object!({

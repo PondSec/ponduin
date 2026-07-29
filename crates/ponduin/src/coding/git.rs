@@ -409,6 +409,57 @@ impl<'workspace> GitRepository<'workspace> {
         })
     }
 
+    pub async fn revert_owned_commit(
+        &self,
+        owned_commit_oid: &str,
+    ) -> Result<GitRevertResult, GitError> {
+        validate_object_id(owned_commit_oid)?;
+        let before = self.status().await?;
+        if before.truncated || !before.changes.is_empty() {
+            return Err(GitError::DirtyRevert);
+        }
+        let head_oid = before
+            .head_oid
+            .ok_or(GitError::MalformedOutput("revert HEAD"))?;
+        if head_oid != owned_commit_oid {
+            return Err(GitError::RevertHeadMismatch {
+                expected: owned_commit_oid.to_string(),
+                actual: head_oid,
+            });
+        }
+
+        let hooks_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let output = self
+            .run_with_filters_disabled(vec![
+                "-c".to_string(),
+                format!("core.hooksPath={hooks_path}"),
+                "-c".to_string(),
+                "commit.gpgSign=false".to_string(),
+                "revert".to_string(),
+                "--no-edit".to_string(),
+                owned_commit_oid.to_string(),
+            ])
+            .await?;
+        if !output.success {
+            return self.recover_failed_revert(owned_commit_oid, output).await;
+        }
+
+        let after = self.status().await?;
+        if after.truncated || !after.changes.is_empty() {
+            return Err(GitError::RevertLeftChanges);
+        }
+        let revert_oid = after
+            .head_oid
+            .ok_or(GitError::MalformedOutput("revert commit oid"))?;
+        if revert_oid == owned_commit_oid {
+            return Err(GitError::MalformedOutput("unchanged revert HEAD"));
+        }
+        Ok(GitRevertResult {
+            reverted_oid: owned_commit_oid.to_string(),
+            revert_oid,
+        })
+    }
+
     pub async fn create_branch(
         &self,
         name: &str,
@@ -728,6 +779,46 @@ impl<'workspace> GitRepository<'workspace> {
         Ok((ahead, behind))
     }
 
+    async fn recover_failed_revert(
+        &self,
+        owned_commit_oid: &str,
+        failed: ProcessOutput,
+    ) -> Result<GitRevertResult, GitError> {
+        let status = self.status().await?;
+        if !status.truncated
+            && status.changes.is_empty()
+            && status.head_oid.as_deref() == Some(owned_commit_oid)
+        {
+            return Err(GitError::CommandFailed {
+                operation: "revert owned commit",
+                exit_code: failed.exit_code,
+                stderr: failed.stderr,
+            });
+        }
+
+        let aborted = self
+            .run_with_filters_disabled(["revert", "--abort"])
+            .await?;
+        if !aborted.success {
+            return Err(GitError::RevertCleanupFailed {
+                revert_exit_code: failed.exit_code,
+                abort_exit_code: aborted.exit_code,
+            });
+        }
+        let restored = self.status().await?;
+        if restored.truncated
+            || !restored.changes.is_empty()
+            || restored.head_oid.as_deref() != Some(owned_commit_oid)
+        {
+            return Err(GitError::RevertCleanupIncomplete);
+        }
+        Err(GitError::CommandFailed {
+            operation: "revert owned commit",
+            exit_code: failed.exit_code,
+            stderr: failed.stderr,
+        })
+    }
+
     async fn optional_stdout<const N: usize>(
         &self,
         args: [&str; N],
@@ -931,6 +1022,12 @@ pub struct GitUnstageResult {
 pub struct GitCommitResult {
     pub oid: String,
     pub committed_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRevertResult {
+    pub reverted_oid: String,
+    pub revert_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1199,6 +1296,21 @@ pub enum GitError {
     InvalidRevision { kind: &'static str },
     #[error("invalid agent-owned commit object id")]
     InvalidOwnedCommit,
+    #[error("owned commit revert requires a completely clean and untruncated Git status")]
+    DirtyRevert,
+    #[error("current HEAD {actual} does not match agent-owned commit {expected} to revert")]
+    RevertHeadMismatch { expected: String, actual: String },
+    #[error("owned commit revert unexpectedly left worktree or index changes")]
+    RevertLeftChanges,
+    #[error(
+        "owned commit revert failed with exit code {revert_exit_code:?}, and cleanup failed with exit code {abort_exit_code:?}"
+    )]
+    RevertCleanupFailed {
+        revert_exit_code: Option<i32>,
+        abort_exit_code: Option<i32>,
+    },
+    #[error("owned commit revert cleanup did not restore the original clean HEAD")]
+    RevertCleanupIncomplete,
     #[error("current HEAD {actual} does not match agent-owned commit {expected}")]
     PushHeadMismatch { expected: String, actual: String },
     #[error("cannot push from a detached HEAD")]
@@ -1512,6 +1624,59 @@ mod tests {
         assert_eq!(
             repository.history(1).await.unwrap().commits[0].subject,
             "initial"
+        );
+    }
+
+    #[tokio::test]
+    async fn reverts_only_a_clean_current_commit_without_rewriting_history() {
+        let (_temp_dir, workspace) = fixture();
+        let repository = GitRepository::open(&workspace, GitLimits::default())
+            .await
+            .unwrap();
+        let app = workspace.root().join("app.txt");
+        let original_digest = content_digest(&fs::read(&app).unwrap());
+        fs::write(&app, "agent\n").unwrap();
+        let owned = GitOwnedPath {
+            path: PathBuf::from("app.txt"),
+            original_digest: Some(original_digest),
+            applied_digest: Some(content_digest(&fs::read(&app).unwrap())),
+        };
+        repository
+            .stage_owned(std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+        let committed = repository
+            .commit_owned("agent change", std::slice::from_ref(&owned))
+            .await
+            .unwrap();
+
+        let reverted = repository
+            .revert_owned_commit(&committed.oid)
+            .await
+            .unwrap();
+
+        assert_eq!(reverted.reverted_oid, committed.oid);
+        assert_ne!(reverted.revert_oid, reverted.reverted_oid);
+        assert_eq!(fs::read_to_string(&app).unwrap(), "before\n");
+        let status = repository.status().await.unwrap();
+        assert_eq!(
+            status.head_oid.as_deref(),
+            Some(reverted.revert_oid.as_str())
+        );
+        assert!(status.changes.is_empty());
+        let history = repository.history(2).await.unwrap();
+        assert_eq!(history.commits[0].subject, "Revert \"agent change\"");
+        assert_eq!(history.commits[1].subject, "agent change");
+
+        fs::write(workspace.root().join("other.txt"), "user change\n").unwrap();
+        let error = repository
+            .revert_owned_commit(&reverted.revert_oid)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GitError::DirtyRevert));
+        assert_eq!(
+            repository.status().await.unwrap().head_oid.as_deref(),
+            Some(reverted.revert_oid.as_str())
         );
     }
 

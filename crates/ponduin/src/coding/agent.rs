@@ -140,9 +140,9 @@ mod tests {
         let agent = enabled_agent();
 
         assert!(agent.tools(PonduinMode::Chat).is_empty());
-        assert_eq!(agent.tool_count(PonduinMode::Auto), 32);
-        assert_eq!(agent.tool_count(PonduinMode::Approve), 32);
-        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 32);
+        assert_eq!(agent.tool_count(PonduinMode::Auto), 33);
+        assert_eq!(agent.tool_count(PonduinMode::Approve), 33);
+        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 33);
     }
 
     #[test]
