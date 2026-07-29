@@ -14,7 +14,8 @@ import {
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import log from './logger';
-import { githubUpdater } from './githubUpdater';
+import { githubUpdater, type GitHubUpdateArtifact } from './githubUpdater';
+import { genericFeedUrl, resolveUpdateChannel } from './updateSource';
 import { loadRecentDirs } from './recentDirs';
 import { errorMessage } from './conversionUtils';
 import {
@@ -31,11 +32,11 @@ let trayRef: Tray | null = null;
 let isUsingGitHubFallback = false;
 let githubUpdateInfo: {
   latestVersion?: string;
-  downloadUrl?: string;
   releaseUrl?: string;
+  artifact?: GitHubUpdateArtifact;
   downloadPath?: string;
-  extractedPath?: string;
 } = {};
+const updateChannel = resolveUpdateChannel(process.env.PONDUIN_UPDATE_CHANNEL);
 
 // Store update state
 let lastUpdateState: { updateAvailable: boolean; latestVersion?: string } | null = null;
@@ -47,6 +48,17 @@ let lastReportedProgress = 0;
 let ipcUpdateHandlersRegistered = false;
 
 let autoDownloadDisabled = false;
+
+function manualInstallInstructions(version: string | undefined): string {
+  const heading = `Version ${version || 'unknown'} has been downloaded and verified.`;
+  if (process.platform === 'darwin') {
+    return `${heading}\n\n1. Click "Open Folder" to view the archive\n2. Quit Ponduin (this app will close)\n3. Open the archive and drag the new Ponduin.app to your Applications folder\n4. Replace the existing app when prompted\n\nThe update will be available the next time you launch Ponduin.`;
+  }
+  if (process.platform === 'win32') {
+    return `${heading}\n\n1. Click "Open Folder" to view the archive\n2. Quit Ponduin (this app will close)\n3. Extract the archive\n4. Replace the existing Ponduin application directory with the extracted directory\n\nThe update will be available the next time you launch Ponduin.`;
+  }
+  return `${heading}\n\n1. Click "Open Folder" to view the verified Debian package\n2. Quit Ponduin (this app will close)\n3. Install the package with your system package installer, or run:\n   sudo apt install ./<downloaded-package>.deb\n\nThe update will be available the next time you launch Ponduin.`;
+}
 
 export function setAutoDownloadDisabled(disabled: boolean) {
   autoDownloadDisabled = disabled;
@@ -82,6 +94,10 @@ export function registerUpdateIpcHandlers() {
       isUsingGitHubFallback = false;
       githubUpdateInfo = {};
       lastReportedProgress = 0; // Reset progress tracking
+
+      if (updateChannel === 'main') {
+        return await checkVerifiedGitHubSource(currentVersion, 'manual check');
+      }
 
       // Ensure auto-updater is properly initialized
       if (!autoUpdater.currentVersion) {
@@ -123,13 +139,7 @@ export function registerUpdateIpcHandlers() {
       });
 
       // If electron-updater fails, try GitHub API fallback
-      if (
-        error instanceof Error &&
-        (error.message.includes('HttpError: 404') ||
-          error.message.includes('ERR_CONNECTION_REFUSED') ||
-          error.message.includes('ENOTFOUND') ||
-          error.message.includes('No published versions'))
-      ) {
+      if (error instanceof Error && shouldUseGitHubFallback(error)) {
         log.info('Using GitHub API fallback in check-for-updates...');
         log.info('Manual fallback triggered by error:', error.message);
         isUsingGitHubFallback = true;
@@ -150,10 +160,13 @@ export function registerUpdateIpcHandlers() {
 
           // Store GitHub update info
           if (result.updateAvailable) {
+            if (!result.artifact) {
+              throw new Error('Update source did not return a verified artifact');
+            }
             githubUpdateInfo = {
               latestVersion: result.latestVersion,
-              downloadUrl: result.downloadUrl,
               releaseUrl: result.releaseUrl,
+              artifact: result.artifact,
             };
 
             trackUpdateCheckCompleted('available', currentVersion, {
@@ -168,7 +181,7 @@ export function registerUpdateIpcHandlers() {
 
             if (!autoDownloadDisabled) {
               log.info('Auto-downloading update via GitHub fallback...');
-              await githubAutoDownload(result.downloadUrl!, result.latestVersion!, 'manual check');
+              await githubAutoDownload(result.artifact, 'manual check');
             } else {
               log.info('Auto-download disabled — skipping GitHub fallback download');
             }
@@ -217,27 +230,22 @@ export function registerUpdateIpcHandlers() {
 
   ipcMain.handle('download-update', async () => {
     try {
-      if (isUsingGitHubFallback && githubUpdateInfo.downloadUrl && githubUpdateInfo.latestVersion) {
+      if (isUsingGitHubFallback && githubUpdateInfo.artifact && githubUpdateInfo.latestVersion) {
         log.info('Using GitHub fallback for download...');
         lastReportedProgress = 0; // Reset progress tracking
         trackUpdateDownloadStarted(githubUpdateInfo.latestVersion, 'github-fallback');
 
-        const result = await githubUpdater.downloadUpdate(
-          githubUpdateInfo.downloadUrl,
-          githubUpdateInfo.latestVersion,
-          (percent) => {
-            // Only send if progress increased (monotonic)
-            if (percent > lastReportedProgress) {
-              lastReportedProgress = percent;
-              trackUpdateDownloadProgress(percent);
-              sendStatusToWindow('download-progress', { percent });
-            }
+        const result = await githubUpdater.downloadUpdate(githubUpdateInfo.artifact, (percent) => {
+          // Only send if progress increased (monotonic)
+          if (percent > lastReportedProgress) {
+            lastReportedProgress = percent;
+            trackUpdateDownloadProgress(percent);
+            sendStatusToWindow('download-progress', { percent });
           }
-        );
+        });
 
         if (result.success && result.downloadPath) {
           githubUpdateInfo.downloadPath = result.downloadPath;
-          githubUpdateInfo.extractedPath = result.extractedPath;
           trackUpdateDownloadCompleted(true, githubUpdateInfo.latestVersion, 'github-fallback');
           sendStatusToWindow('update-downloaded', { version: githubUpdateInfo.latestVersion });
           return { success: true, error: null };
@@ -276,8 +284,7 @@ export function registerUpdateIpcHandlers() {
       log.info('Installing update from GitHub fallback...');
 
       try {
-        // Use the stored extracted path if available, otherwise download path
-        const updatePath = githubUpdateInfo.extractedPath || githubUpdateInfo.downloadPath;
+        const updatePath = githubUpdateInfo.downloadPath;
 
         if (!updatePath) {
           throw new Error('Update file path not found. Please download the update first.');
@@ -295,7 +302,7 @@ export function registerUpdateIpcHandlers() {
           type: 'info',
           title: 'Update Ready to Install',
           message: `Version ${githubUpdateInfo.latestVersion} is ready to install.`,
-          detail: `The update has been downloaded and extracted. To complete the installation:\n\n1. Click "Open Folder" to view the new Ponduin.app\n2. Quit Ponduin (this app will close)\n3. Drag the new Ponduin.app to your Applications folder\n4. Replace the existing app when prompted\n\nThe update will be available the next time you launch Ponduin.`,
+          detail: manualInstallInstructions(githubUpdateInfo.latestVersion),
           buttons: ['Open Folder & Quit', 'Open Folder Only', 'Cancel'],
           defaultId: 0,
           cancelId: 2,
@@ -368,15 +375,20 @@ export function setupAutoUpdater(tray?: Tray) {
   log.info(`App path: ${app.getAppPath()}`);
   log.info(`Resources path: ${process.resourcesPath}`);
 
-  // Set the feed URL for GitHub releases
-  const feedConfig = {
-    provider: 'github' as const,
-    owner: 'PondSec',
-    repo: 'ponduin',
-    releaseType: 'release' as const,
-  };
+  const mainFeedUrl = genericFeedUrl('PondSec', 'ponduin', updateChannel);
+  const feedConfig = mainFeedUrl
+    ? {
+        provider: 'generic' as const,
+        url: mainFeedUrl,
+      }
+    : {
+        provider: 'github' as const,
+        owner: 'PondSec',
+        repo: 'ponduin',
+        releaseType: 'release' as const,
+      };
 
-  log.info('Setting feed URL with config:', feedConfig);
+  log.info(`Setting ${updateChannel} update feed URL with config:`, feedConfig);
   autoUpdater.setFeedURL(feedConfig);
 
   // Log the feed URL after setting it
@@ -399,6 +411,8 @@ export function setupAutoUpdater(tray?: Tray) {
   // Configure auto-updater settings
   autoUpdater.autoDownload = !autoDownloadDisabled;
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowPrerelease = updateChannel === 'main';
+  autoUpdater.allowDowngrade = false;
 
   // Enable updates in development mode for testing
   if (process.env.ENABLE_DEV_UPDATES === 'true') {
@@ -440,6 +454,11 @@ export function setupAutoUpdater(tray?: Tray) {
 
     trackUpdateCheckStarted('startup', currentVersion);
 
+    if (updateChannel === 'main') {
+      void checkVerifiedGitHubSource(currentVersion, 'on startup');
+      return;
+    }
+
     // Set up a timeout warning for long-running checks
     const timeoutWarning = setTimeout(() => {
       log.warn(
@@ -476,12 +495,7 @@ export function setupAutoUpdater(tray?: Tray) {
         });
 
         // If electron-updater fails, try GitHub API as fallback
-        if (
-          err.message.includes('HttpError: 404') ||
-          err.message.includes('ERR_CONNECTION_REFUSED') ||
-          err.message.includes('ENOTFOUND') ||
-          err.message.includes('No published versions')
-        ) {
+        if (shouldUseGitHubFallback(err)) {
           log.info('Using GitHub API fallback for startup update check...');
           log.info('Fallback triggered by error containing:', err.message);
           isUsingGitHubFallback = true;
@@ -496,11 +510,14 @@ export function setupAutoUpdater(tray?: Tray) {
                 });
                 sendStatusToWindow('error', result.error);
               } else if (result.updateAvailable) {
+                if (!result.artifact) {
+                  throw new Error('Update source did not return a verified artifact');
+                }
                 // Store GitHub update info
                 githubUpdateInfo = {
                   latestVersion: result.latestVersion,
-                  downloadUrl: result.downloadUrl,
                   releaseUrl: result.releaseUrl,
+                  artifact: result.artifact,
                 };
 
                 trackUpdateCheckCompleted('available', currentVersion, {
@@ -515,11 +532,7 @@ export function setupAutoUpdater(tray?: Tray) {
 
                 if (!autoDownloadDisabled) {
                   log.info('Auto-downloading update via GitHub fallback on startup...');
-                  await githubAutoDownload(
-                    result.downloadUrl!,
-                    result.latestVersion!,
-                    'on startup'
-                  );
+                  await githubAutoDownload(result.artifact, 'on startup');
                 } else {
                   log.info('Auto-download disabled — skipping GitHub fallback download on startup');
                 }
@@ -601,12 +614,7 @@ export function setupAutoUpdater(tray?: Tray) {
     });
 
     // Check if this is a 404 error (missing update files) or connection error
-    if (
-      err.message.includes('HttpError: 404') ||
-      err.message.includes('ERR_CONNECTION_REFUSED') ||
-      err.message.includes('ENOTFOUND') ||
-      err.message.includes('No published versions')
-    ) {
+    if (shouldUseGitHubFallback(err)) {
       log.info('Falling back to GitHub API for update check...');
       log.info('Fallback triggered by error:', err.message);
       isUsingGitHubFallback = true;
@@ -617,20 +625,24 @@ export function setupAutoUpdater(tray?: Tray) {
         if (result.error) {
           sendStatusToWindow('error', result.error);
         } else if (result.updateAvailable) {
+          if (!result.artifact) {
+            throw new Error('Update source did not return a verified artifact');
+          }
           // Store GitHub update info
           githubUpdateInfo = {
             latestVersion: result.latestVersion,
-            downloadUrl: result.downloadUrl,
             releaseUrl: result.releaseUrl,
+            artifact: result.artifact,
           };
 
           updateAvailable = true;
+          lastUpdateState = { updateAvailable: true, latestVersion: result.latestVersion };
           updateTrayIcon(true);
           sendStatusToWindow('update-available', { version: result.latestVersion });
 
           if (!autoDownloadDisabled) {
             log.info('Auto-downloading update via GitHub fallback after error...');
-            await githubAutoDownload(result.downloadUrl!, result.latestVersion!, 'after error');
+            await githubAutoDownload(result.artifact, 'after error');
           } else {
             log.info('Auto-download disabled — skipping GitHub fallback download after error');
           }
@@ -705,31 +717,26 @@ function sendStatusToWindow(event: string, data?: unknown) {
 
 // centralize GitHub fallback auto-download logic.
 async function githubAutoDownload(
-  downloadUrl: string,
-  latestVersion: string,
+  artifact: GitHubUpdateArtifact,
   contextLabel = ''
 ): Promise<void> {
+  const latestVersion = artifact.version;
   // Reset progress tracking for new download
   lastReportedProgress = 0;
   trackUpdateDownloadStarted(latestVersion, 'github-fallback');
 
   try {
-    const downloadResult = await githubUpdater.downloadUpdate(
-      downloadUrl,
-      latestVersion,
-      (percent) => {
-        // Only send if progress increased (monotonic)
-        if (percent > lastReportedProgress) {
-          lastReportedProgress = percent;
-          trackUpdateDownloadProgress(percent);
-          sendStatusToWindow('download-progress', { percent });
-        }
+    const downloadResult = await githubUpdater.downloadUpdate(artifact, (percent) => {
+      // Only send if progress increased (monotonic)
+      if (percent > lastReportedProgress) {
+        lastReportedProgress = percent;
+        trackUpdateDownloadProgress(percent);
+        sendStatusToWindow('download-progress', { percent });
       }
-    );
+    });
 
     if (downloadResult.success && downloadResult.downloadPath) {
       githubUpdateInfo.downloadPath = downloadResult.downloadPath;
-      githubUpdateInfo.extractedPath = downloadResult.extractedPath;
       trackUpdateDownloadCompleted(true, latestVersion, 'github-fallback');
       sendStatusToWindow('update-downloaded', { version: latestVersion });
     } else {
@@ -751,6 +758,73 @@ async function githubAutoDownload(
       downloadError
     );
   }
+}
+
+async function checkVerifiedGitHubSource(
+  currentVersion: string,
+  contextLabel: string
+): Promise<{ updateInfo: null; error: string | null }> {
+  isUsingGitHubFallback = true;
+  try {
+    const result = await githubUpdater.checkForUpdates();
+    if (result.error) {
+      trackUpdateCheckCompleted('error', currentVersion, {
+        usingFallback: true,
+        errorType: result.error,
+      });
+      sendStatusToWindow('error', result.error);
+      return { updateInfo: null, error: result.error };
+    }
+    if (result.updateAvailable) {
+      if (!result.artifact) {
+        throw new Error('Update source did not return a verified artifact');
+      }
+      githubUpdateInfo = {
+        latestVersion: result.latestVersion,
+        releaseUrl: result.releaseUrl,
+        artifact: result.artifact,
+      };
+      trackUpdateCheckCompleted('available', currentVersion, {
+        latestVersion: result.latestVersion,
+        usingFallback: true,
+      });
+      updateAvailable = true;
+      lastUpdateState = { updateAvailable: true, latestVersion: result.latestVersion };
+      updateTrayIcon(true);
+      sendStatusToWindow('update-available', { version: result.latestVersion });
+      if (!autoDownloadDisabled) {
+        await githubAutoDownload(result.artifact, contextLabel);
+      }
+    } else {
+      trackUpdateCheckCompleted('not_available', currentVersion, {
+        latestVersion: result.latestVersion,
+        usingFallback: true,
+      });
+      updateAvailable = false;
+      lastUpdateState = { updateAvailable: false };
+      updateTrayIcon(false);
+      sendStatusToWindow('update-not-available', { version: currentVersion });
+    }
+    return { updateInfo: null, error: null };
+  } catch (error) {
+    const message = errorMessage(error, 'Unable to check for verified updates');
+    trackUpdateCheckCompleted('error', currentVersion, {
+      usingFallback: true,
+      errorType: message,
+    });
+    sendStatusToWindow('error', message);
+    return { updateInfo: null, error: message };
+  }
+}
+
+function shouldUseGitHubFallback(error: Error): boolean {
+  return (
+    updateChannel === 'main' ||
+    error.message.includes('HttpError: 404') ||
+    error.message.includes('ERR_CONNECTION_REFUSED') ||
+    error.message.includes('ENOTFOUND') ||
+    error.message.includes('No published versions')
+  );
 }
 
 function updateTrayIcon(hasUpdate: boolean) {

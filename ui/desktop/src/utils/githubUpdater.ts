@@ -1,287 +1,668 @@
 import { app } from 'electron';
-import { compareVersions } from 'compare-versions';
+import { execFile } from 'child_process';
+import { createHash, randomUUID } from 'crypto';
+import { constants as fsConstants, createReadStream } from 'fs';
 import * as fs from 'fs/promises';
-import * as path from 'path';
 import * as os from 'os';
+import * as path from 'path';
 import log from './logger';
-import { safeJsonParse, errorMessage } from './conversionUtils';
+import { errorMessage } from './conversionUtils';
+import {
+  isAllowedGitHubUrl,
+  isNewerVersion,
+  parseUpdateManifest,
+  releaseApiUrl,
+  releaseTag,
+  resolveUpdateChannel,
+  selectManifestFile,
+  updateAssetName,
+  updateManifestName,
+  type UpdateChannel,
+} from './updateSource';
+
+const CHECK_TIMEOUT_MS = 30_000;
+const DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
+const MAX_MANIFEST_BYTES = 1024 * 1024;
+const MAX_RELEASE_METADATA_BYTES = 4 * 1024 * 1024;
+const MAX_UPDATE_BYTES = 2 * 1024 * 1024 * 1024;
+
+interface GitHubReleaseAsset {
+  name: string;
+  browser_download_url: string;
+  size: number;
+}
 
 interface GitHubRelease {
   tag_name: string;
   name: string;
   published_at: string;
   html_url: string;
-  assets: Array<{
-    name: string;
-    browser_download_url: string;
-    size: number;
-  }>;
+  assets: GitHubReleaseAsset[];
 }
 
-interface UpdateCheckResult {
+interface GhReleaseAsset {
+  name: string;
+  size: number;
+  url: string;
+}
+
+interface GhRelease {
+  tagName: string;
+  name: string;
+  publishedAt: string;
+  url: string;
+  assets: GhReleaseAsset[];
+}
+
+interface ReleaseDescriptor {
+  tag: string;
+  name: string;
+  publishedAt: string;
+  releaseUrl: string;
+  assets: GitHubReleaseAsset[];
+  transport: 'https' | 'gh-cli';
+  ghPath?: string;
+}
+
+export interface GitHubUpdateArtifact {
+  version: string;
+  assetName: string;
+  size: number;
+  sha512: string;
+  releaseUrl: string;
+  releaseTag: string;
+  transport: 'https' | 'gh-cli';
+  downloadUrl?: string;
+  ghPath?: string;
+}
+
+export interface UpdateCheckResult {
   updateAvailable: boolean;
   latestVersion?: string;
-  downloadUrl?: string;
   releaseUrl?: string;
+  artifact?: GitHubUpdateArtifact;
+  error?: string;
+}
+
+interface DownloadResult {
+  success: boolean;
+  downloadPath?: string;
   error?: string;
 }
 
 export class GitHubUpdater {
-  private readonly owner = process.env.GITHUB_OWNER || 'PondSec';
-  private readonly repo = process.env.GITHUB_REPO || 'ponduin';
+  private readonly owner = 'PondSec';
+  private readonly repo = 'ponduin';
   private readonly bundleName = process.env.PONDUIN_BUNDLE_NAME || 'Ponduin';
-  private readonly apiUrl = `https://api.github.com/repos/${this.owner}/${this.repo}/releases/latest`;
+  private readonly channel: UpdateChannel = resolveUpdateChannel(
+    process.env.PONDUIN_UPDATE_CHANNEL
+  );
 
   async checkForUpdates(): Promise<UpdateCheckResult> {
-    const startTime = Date.now();
+    const started = Date.now();
     try {
-      log.info('=== GitHubUpdater: STARTING UPDATE CHECK ===');
-      log.info(`GitHubUpdater: API URL: ${this.apiUrl}`);
-      log.info(`GitHubUpdater: Current app version: ${app.getVersion()}`);
-      log.info(`GitHubUpdater: Timestamp: ${new Date().toISOString()}`);
-
-      log.info('GitHubUpdater: Initiating fetch request...');
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        log.error('GitHubUpdater: Fetch request timed out after 30 seconds');
-        controller.abort();
-      }, 30000);
-
-      const response = await fetch(this.apiUrl, {
-        headers: {
-          Accept: 'application/vnd.github.v3+json',
-          'User-Agent': `Ponduin-Desktop/${app.getVersion()}`,
-        },
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-      const fetchDuration = Date.now() - startTime;
-      log.info(
-        `GitHubUpdater: GitHub API response status: ${response.status} ${response.statusText} (took ${fetchDuration}ms)`
-      );
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        log.error(`GitHubUpdater: GitHub API error response: ${errorText}`);
-        throw new Error(`GitHub API returned ${response.status}: ${response.statusText}`);
-      }
-
-      const release: GitHubRelease = await safeJsonParse<GitHubRelease>(
-        response,
-        'Failed to get GitHub release information'
-      );
-      log.info(`GitHubUpdater: Found release: ${release.tag_name} (${release.name})`);
-      log.info(`GitHubUpdater: Release published at: ${release.published_at}`);
-      log.info(`GitHubUpdater: Release assets count: ${release.assets.length}`);
-
-      const latestVersion = release.tag_name.replace(/^v/, ''); // Remove 'v' prefix if present
       const currentVersion = app.getVersion();
+      log.info(`Checking ${this.channel} updates from ${this.owner}/${this.repo}`);
+      log.info(`Current app version: ${currentVersion}`);
+
+      const release = await this.loadRelease();
+      const artifact = await this.resolveArtifact(release);
+      const updateAvailable = isNewerVersion(artifact.version, currentVersion);
 
       log.info(
-        `GitHubUpdater: Current version: ${currentVersion}, Latest version: ${latestVersion}`
+        `Update check completed in ${Date.now() - started}ms: current=${currentVersion}, latest=${artifact.version}, available=${updateAvailable}, transport=${artifact.transport}`
       );
-
-      // Compare versions
-      const updateAvailable = compareVersions(latestVersion, currentVersion) > 0;
-      log.info(`GitHubUpdater: Update available: ${updateAvailable}`);
-
       if (!updateAvailable) {
         return {
           updateAvailable: false,
-          latestVersion,
+          latestVersion: artifact.version,
+          releaseUrl: artifact.releaseUrl,
         };
       }
-
-      // Find the appropriate download URL based on platform
-      const platform = process.platform;
-      const arch = process.arch;
-      let downloadUrl: string | undefined;
-      let assetName: string;
-
-      log.info(`GitHubUpdater: Looking for asset for platform: ${platform}, arch: ${arch}`);
-
-      if (platform === 'darwin') {
-        // macOS
-        if (arch === 'arm64') {
-          assetName = `${this.bundleName}.zip`;
-        } else {
-          assetName = `${this.bundleName}_intel_mac.zip`;
-        }
-      } else if (platform === 'win32') {
-        // Windows - for future support
-        assetName = `${this.bundleName}-win32-x64.zip`;
-      } else {
-        // Linux - for future support
-        assetName = `${this.bundleName}-linux-${arch}.zip`;
-      }
-
-      log.info(`GitHubUpdater: Looking for asset named: ${assetName}`);
-      log.info(`GitHubUpdater: Available assets: ${release.assets.map((a) => a.name).join(', ')}`);
-
-      const asset = release.assets.find((a) => a.name.toLowerCase() === assetName.toLowerCase()); // keeping comparison to lowercase because Ponduin vs ponduin
-      if (asset) {
-        downloadUrl = asset.browser_download_url;
-        log.info(`GitHubUpdater: Found matching asset: ${asset.name} (${asset.size} bytes)`);
-        log.info(`GitHubUpdater: Download URL: ${downloadUrl}`);
-      } else {
-        log.warn(`GitHubUpdater: No matching asset found for ${assetName}`);
-      }
-
-      if (!downloadUrl) {
-        throw new Error(
-          `Update Available but no download URL found for platform: ${platform}, arch: ${arch}`
-        );
-      }
-
       return {
         updateAvailable: true,
-        latestVersion,
-        downloadUrl,
-        releaseUrl: release.html_url,
+        latestVersion: artifact.version,
+        releaseUrl: artifact.releaseUrl,
+        artifact,
       };
     } catch (error) {
-      log.error('GitHubUpdater: Error checking for updates:', error);
-      log.error('GitHubUpdater: Error details:', {
-        message: errorMessage(error, 'Unknown error'),
-        stack: error instanceof Error ? error.stack : 'No stack',
-        name: error instanceof Error ? error.name : 'Unknown',
-        code:
-          error instanceof Error && 'code' in error
-            ? (error as Error & { code: unknown }).code
-            : undefined,
-      });
-      return {
-        updateAvailable: false,
-        error: errorMessage(error, 'Unknown error'),
-      };
+      const message = errorMessage(error, 'Unknown update error');
+      log.error(`GitHub update check failed after ${Date.now() - started}ms: ${message}`);
+      return { updateAvailable: false, error: message };
     }
   }
 
   async downloadUpdate(
-    downloadUrl: string,
-    latestVersion: string,
+    artifact: GitHubUpdateArtifact,
     onProgress?: (percent: number) => void
-  ): Promise<{ success: boolean; downloadPath?: string; extractedPath?: string; error?: string }> {
-    const downloadStartTime = Date.now();
+  ): Promise<DownloadResult> {
+    const started = Date.now();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ponduin-update-'));
     try {
-      log.info('=== GitHubUpdater: STARTING DOWNLOAD ===');
-      log.info(`GitHubUpdater: Download URL: ${downloadUrl}`);
-      log.info(`GitHubUpdater: Version: ${latestVersion}`);
-      log.info(`GitHubUpdater: Timestamp: ${new Date().toISOString()}`);
-
-      log.info('GitHubUpdater: Initiating download fetch request...');
-      const response = await fetch(downloadUrl);
-      const fetchDuration = Date.now() - downloadStartTime;
       log.info(
-        `GitHubUpdater: Download response received in ${fetchDuration}ms - Status: ${response.status} ${response.statusText}`
+        `Downloading verified ${this.channel} update ${artifact.version} via ${artifact.transport}`
       );
+      onProgress?.(1);
+      const temporaryArchive =
+        artifact.transport === 'gh-cli'
+          ? await this.downloadWithGitHubCli(artifact, tempDir, onProgress)
+          : await this.downloadWithHttps(artifact, tempDir, onProgress);
 
-      if (!response.ok) {
-        throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+      await verifyFileIntegrity(temporaryArchive, artifact);
+      onProgress?.(95);
+      const downloadPath = await copyVerifiedArchive(temporaryArchive, artifact, this.bundleName);
+      onProgress?.(100);
+      log.info(
+        `Verified update ${artifact.version} saved in ${Date.now() - started}ms at ${downloadPath}`
+      );
+      return { success: true, downloadPath };
+    } catch (error) {
+      const message = errorMessage(error, 'Unknown download error');
+      log.error(`Verified update download failed after ${Date.now() - started}ms: ${message}`);
+      return { success: false, error: message };
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch((error) => {
+        log.warn(`Could not remove updater temporary directory: ${errorMessage(error, 'unknown')}`);
+      });
+    }
+  }
+
+  private async loadRelease(): Promise<ReleaseDescriptor> {
+    if (this.channel === 'main') {
+      return this.loadReleaseWithGitHubCli();
+    }
+    try {
+      return await this.loadReleaseWithHttps();
+    } catch (httpsError) {
+      log.info(
+        `Unauthenticated GitHub release lookup unavailable; trying authenticated GitHub CLI: ${errorMessage(httpsError, 'unknown')}`
+      );
+      return this.loadReleaseWithGitHubCli();
+    }
+  }
+
+  private async loadReleaseWithHttps(): Promise<ReleaseDescriptor> {
+    const apiUrl = releaseApiUrl(this.owner, this.repo, this.channel);
+    const source = await fetchBoundedText(apiUrl, MAX_RELEASE_METADATA_BYTES);
+    const release = JSON.parse(source) as GitHubRelease;
+    if (
+      !release ||
+      typeof release.tag_name !== 'string' ||
+      typeof release.html_url !== 'string' ||
+      !Array.isArray(release.assets)
+    ) {
+      throw new Error('GitHub release API returned invalid release information');
+    }
+    return {
+      tag: release.tag_name,
+      name: release.name,
+      publishedAt: release.published_at,
+      releaseUrl: release.html_url,
+      assets: release.assets,
+      transport: 'https',
+    };
+  }
+
+  private async loadReleaseWithGitHubCli(): Promise<ReleaseDescriptor> {
+    const ghPath = await findGitHubCli();
+    const tag = releaseTag(this.channel);
+    const args = ['release', 'view'];
+    if (tag) {
+      args.push(tag);
+    }
+    args.push(
+      '--repo',
+      `${this.owner}/${this.repo}`,
+      '--json',
+      'tagName,name,publishedAt,url,assets'
+    );
+    const stdout = await runGitHubCli(ghPath, args, CHECK_TIMEOUT_MS);
+    const release = JSON.parse(stdout) as GhRelease;
+    if (
+      !release ||
+      typeof release.tagName !== 'string' ||
+      !Array.isArray(release.assets) ||
+      typeof release.url !== 'string'
+    ) {
+      throw new Error('GitHub CLI returned invalid release information');
+    }
+    return {
+      tag: release.tagName,
+      name: release.name,
+      publishedAt: release.publishedAt,
+      releaseUrl: release.url,
+      assets: release.assets.map((asset) => ({
+        name: asset.name,
+        browser_download_url: asset.url,
+        size: asset.size,
+      })),
+      transport: 'gh-cli',
+      ghPath,
+    };
+  }
+
+  private async resolveArtifact(release: ReleaseDescriptor): Promise<GitHubUpdateArtifact> {
+    log.info(
+      `Found ${this.channel} release ${release.tag} (${release.name}), published ${release.publishedAt}`
+    );
+    const manifestName = updateManifestName(process.platform);
+    const manifestAsset = release.assets.find(
+      (asset) => asset.name.toLowerCase() === manifestName.toLowerCase()
+    );
+    if (!manifestAsset) {
+      throw new Error(
+        `${this.channel} release does not contain the required ${manifestName} integrity manifest`
+      );
+    }
+
+    const manifestSource =
+      release.transport === 'gh-cli'
+        ? await this.downloadAndVerifyManifest(release, manifestName)
+        : await fetchManifest(manifestAsset.browser_download_url);
+    const manifest = parseUpdateManifest(manifestSource);
+    const expectedAssetName = updateAssetName(process.platform, process.arch, this.bundleName);
+    const manifestFile = selectManifestFile(manifest, expectedAssetName);
+    const releaseAsset = release.assets.find(
+      (asset) => asset.name.toLowerCase() === manifestFile.url.toLowerCase()
+    );
+    if (!releaseAsset) {
+      throw new Error(`Release does not contain manifest asset ${manifestFile.url}`);
+    }
+    if (releaseAsset.size !== manifestFile.size) {
+      throw new Error(`Release size for ${manifestFile.url} does not match its manifest`);
+    }
+    if (release.transport === 'https' && !isAllowedGitHubUrl(releaseAsset.browser_download_url)) {
+      throw new Error('Release asset URL is outside the allowed GitHub hosts');
+    }
+
+    return {
+      version: manifest.version,
+      assetName: manifestFile.url,
+      size: manifestFile.size,
+      sha512: manifestFile.sha512,
+      releaseUrl: release.releaseUrl,
+      releaseTag: release.tag,
+      transport: release.transport,
+      downloadUrl: release.transport === 'https' ? releaseAsset.browser_download_url : undefined,
+      ghPath: release.ghPath,
+    };
+  }
+
+  private async downloadAndVerifyManifest(
+    release: ReleaseDescriptor,
+    manifestName: string
+  ): Promise<string> {
+    if (!release.ghPath) {
+      throw new Error('Authenticated GitHub CLI path is unavailable');
+    }
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ponduin-update-manifest-'));
+    try {
+      await downloadReleaseAsset(
+        release.ghPath,
+        `${this.owner}/${this.repo}`,
+        release.tag,
+        manifestName,
+        tempDir
+      );
+      const manifestPath = path.join(tempDir, manifestName);
+      await verifyGitHubAttestation(
+        release.ghPath,
+        manifestPath,
+        this.owner,
+        this.repo,
+        this.channel
+      );
+      const stats = await fs.stat(manifestPath);
+      if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_MANIFEST_BYTES) {
+        throw new Error('Downloaded update manifest has an invalid size');
+      }
+      return await fs.readFile(manifestPath, 'utf8');
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch((error) => {
+        log.warn(`Could not remove updater manifest directory: ${errorMessage(error, 'unknown')}`);
+      });
+    }
+  }
+
+  private async downloadWithGitHubCli(
+    artifact: GitHubUpdateArtifact,
+    tempDir: string,
+    onProgress?: (percent: number) => void
+  ): Promise<string> {
+    if (!artifact.ghPath) {
+      throw new Error('Authenticated GitHub CLI path is unavailable');
+    }
+    await downloadReleaseAsset(
+      artifact.ghPath,
+      `${this.owner}/${this.repo}`,
+      artifact.releaseTag,
+      artifact.assetName,
+      tempDir
+    );
+    onProgress?.(75);
+    const archivePath = path.join(tempDir, artifact.assetName);
+    await verifyGitHubAttestation(
+      artifact.ghPath,
+      archivePath,
+      this.owner,
+      this.repo,
+      this.channel
+    );
+    onProgress?.(90);
+    return archivePath;
+  }
+
+  private async downloadWithHttps(
+    artifact: GitHubUpdateArtifact,
+    tempDir: string,
+    onProgress?: (percent: number) => void
+  ): Promise<string> {
+    if (!artifact.downloadUrl || !isAllowedGitHubUrl(artifact.downloadUrl)) {
+      throw new Error('Verified HTTPS update URL is unavailable');
+    }
+    const archivePath = path.join(tempDir, artifact.assetName);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+    let handle: fs.FileHandle | undefined;
+    try {
+      const response = await fetch(artifact.downloadUrl, {
+        headers: githubHeaders(app.getVersion()),
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`Update download returned HTTP ${response.status}`);
+      }
+      ensureAllowedResponseUrl(response);
+      const declaredLength = Number(response.headers.get('content-length') || '0');
+      if (
+        declaredLength > MAX_UPDATE_BYTES ||
+        (declaredLength > 0 && declaredLength !== artifact.size)
+      ) {
+        throw new Error('Update download Content-Length does not match the verified manifest');
       }
 
-      // Get total size from headers
-      const contentLength = response.headers.get('content-length');
-      const totalSize = contentLength ? parseInt(contentLength, 10) : 0;
-      log.info(
-        `GitHubUpdater: Content-Length: ${totalSize} bytes (${(totalSize / 1024 / 1024).toFixed(2)} MB)`
-      );
-
-      if (!response.body) {
-        throw new Error('Response body is null');
-      }
-      let lastReportedPercent = -1; // Track last reported percentage to throttle updates
-      let lastLoggedPercent = -1; // Track for logging at 10% intervals
-
-      // Read the response stream
-      log.info('GitHubUpdater: Starting to read response stream...');
+      handle = await fs.open(archivePath, 'wx', 0o600);
       const reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let downloadedSize = 0;
-      let lastProgressTime = Date.now();
-
+      let downloaded = 0;
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-
-        chunks.push(value);
-        downloadedSize += value.length;
-
-        // Report progress - only when percentage changes by at least 1%
-        if (totalSize > 0 && onProgress) {
-          const percent = Math.round((downloadedSize / totalSize) * 100);
-
-          // Only report if percent changed (throttles from hundreds/sec to ~100 total)
-          if (percent !== lastReportedPercent) {
-            onProgress(percent);
-            lastReportedPercent = percent;
-
-            // Log at 10% intervals for debugging
-            if (percent % 10 === 0 && percent !== lastLoggedPercent) {
-              const elapsed = Date.now() - downloadStartTime;
-              const speed = downloadedSize / (elapsed / 1000) / 1024; // KB/s
-              log.info(
-                `GitHubUpdater: Download progress ${percent}% (${(downloadedSize / 1024 / 1024).toFixed(2)}/${(totalSize / 1024 / 1024).toFixed(2)} MB) @ ${speed.toFixed(0)} KB/s`
-              );
-              lastLoggedPercent = percent;
-            }
-          }
+        if (done) {
+          break;
         }
-
-        // Warn if no progress for 30 seconds
-        const now = Date.now();
-        if (now - lastProgressTime > 30000) {
-          log.warn(
-            `GitHubUpdater: Download appears slow - no significant progress in 30 seconds (${downloadedSize}/${totalSize} bytes)`
-          );
-          lastProgressTime = now;
-        } else if (value.length > 0) {
-          lastProgressTime = now;
+        downloaded += value.byteLength;
+        if (downloaded > MAX_UPDATE_BYTES || downloaded > artifact.size) {
+          throw new Error('Update download exceeded its verified size');
         }
+        await handle.write(value);
+        onProgress?.(Math.max(2, Math.min(85, Math.floor((downloaded / artifact.size) * 85))));
       }
-
-      const downloadDuration = Date.now() - downloadStartTime;
-      const avgSpeed = downloadedSize / (downloadDuration / 1000) / 1024;
-      log.info(
-        `GitHubUpdater: Download stream complete - ${downloadedSize} bytes in ${downloadDuration}ms (avg ${avgSpeed.toFixed(0)} KB/s)`
-      );
-
-      // Combine chunks into a single buffer
-      log.info('GitHubUpdater: Combining chunks into buffer...');
-      const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-      log.info(`GitHubUpdater: Buffer created - ${buffer.length} bytes`);
-
-      // Save to Downloads directory
-      const downloadsDir = path.join(os.homedir(), 'Downloads');
-      const fileName = `${this.bundleName}-${latestVersion}.zip`;
-      const downloadPath = path.join(downloadsDir, fileName);
-
-      log.info(`GitHubUpdater: Writing file to ${downloadPath}...`);
-      await fs.writeFile(downloadPath, buffer);
-
-      const totalDuration = Date.now() - downloadStartTime;
-      log.info(`=== GitHubUpdater: DOWNLOAD COMPLETE in ${totalDuration}ms ===`);
-      log.info(`GitHubUpdater: File saved to ${downloadPath}`);
-
-      // Return success - user will handle extraction manually
-      return { success: true, downloadPath, extractedPath: downloadsDir };
-    } catch (error) {
-      const duration = Date.now() - downloadStartTime;
-      log.error(`=== GitHubUpdater: DOWNLOAD FAILED after ${duration}ms ===`);
-      log.error('GitHubUpdater: Error downloading update:', error);
-      log.error('GitHubUpdater: Download error details:', {
-        message: errorMessage(error, 'Unknown error'),
-        stack: error instanceof Error ? error.stack : 'No stack',
-        name: error instanceof Error ? error.name : 'Unknown',
-      });
-      return {
-        success: false,
-        error: errorMessage(error, 'Unknown error'),
-      };
+      if (downloaded !== artifact.size) {
+        throw new Error('Update download size does not match the verified manifest');
+      }
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      return archivePath;
+    } finally {
+      clearTimeout(timeout);
+      await handle?.close().catch(() => undefined);
     }
   }
 }
 
-// Create singleton instance
+async function fetchManifest(url: string): Promise<string> {
+  return fetchBoundedText(url, MAX_MANIFEST_BYTES);
+}
+
+async function fetchBoundedText(url: string, maxBytes: number): Promise<string> {
+  if (!isAllowedGitHubUrl(url)) {
+    throw new Error('Updater request URL is outside the allowed GitHub hosts');
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      headers: githubHeaders(app.getVersion()),
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`Updater request returned HTTP ${response.status}`);
+    }
+    ensureAllowedResponseUrl(response);
+    const declaredLength = Number(response.headers.get('content-length') || '0');
+    if (declaredLength > maxBytes) {
+      throw new Error('Updater response exceeds its size limit');
+    }
+    const chunks: Uint8Array[] = [];
+    const reader = response.body.getReader();
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      received += value.byteLength;
+      if (received > maxBytes) {
+        throw new Error('Updater response exceeds its size limit');
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8');
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function ensureAllowedResponseUrl(response: Response): void {
+  if (!isAllowedGitHubUrl(response.url)) {
+    throw new Error('Updater response redirected outside the allowed GitHub hosts');
+  }
+}
+
+function githubHeaders(version: string): Record<string, string> {
+  return {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': `Ponduin-Desktop/${version}`,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
+
+async function findGitHubCli(): Promise<string> {
+  const executableName = process.platform === 'win32' ? 'gh.exe' : 'gh';
+  const candidates = [
+    '/opt/homebrew/bin/gh',
+    '/usr/local/bin/gh',
+    '/usr/bin/gh',
+    ...(process.env.PATH || '')
+      .split(path.delimiter)
+      .filter((directory) => path.isAbsolute(directory))
+      .map((directory) => path.join(directory, executableName)),
+  ];
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    candidates.unshift(path.join(process.env.LOCALAPPDATA, 'Programs', 'GitHub CLI', 'gh.exe'));
+  }
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      await fs.access(candidate, fsConstants.X_OK);
+      return await fs.realpath(candidate);
+    } catch {
+      // Try the next absolute candidate.
+    }
+  }
+  throw new Error(
+    'This private main update requires an authenticated GitHub CLI (`gh auth login`)'
+  );
+}
+
+async function runGitHubCli(
+  executable: string,
+  args: string[],
+  timeoutMs: number
+): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    execFile(
+      executable,
+      args,
+      {
+        encoding: 'utf8',
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+        windowsHide: true,
+        env: githubCliEnvironment(),
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(new Error('Authenticated GitHub CLI operation failed'));
+        } else {
+          resolve(stdout);
+        }
+      }
+    );
+  });
+}
+
+function githubCliEnvironment(): Record<string, string | undefined> {
+  const allowed = [
+    'PATH',
+    'HOME',
+    'USERPROFILE',
+    'LOCALAPPDATA',
+    'APPDATA',
+    'XDG_CONFIG_HOME',
+    'GH_CONFIG_DIR',
+    'GH_HOST',
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'SystemRoot',
+    'WINDIR',
+  ];
+  const environment: Record<string, string | undefined> = {
+    GH_PROMPT_DISABLED: '1',
+    GH_PAGER: 'cat',
+    NO_COLOR: '1',
+  };
+  for (const name of allowed) {
+    if (process.env[name]) {
+      environment[name] = process.env[name];
+    }
+  }
+  return environment;
+}
+
+async function downloadReleaseAsset(
+  ghPath: string,
+  repository: string,
+  tag: string,
+  assetName: string,
+  destination: string
+): Promise<void> {
+  await runGitHubCli(
+    ghPath,
+    [
+      'release',
+      'download',
+      tag,
+      '--repo',
+      repository,
+      '--pattern',
+      assetName,
+      '--dir',
+      destination,
+      '--clobber',
+    ],
+    DOWNLOAD_TIMEOUT_MS
+  );
+  const downloaded = path.join(destination, assetName);
+  const stats = await fs.stat(downloaded);
+  if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_UPDATE_BYTES) {
+    throw new Error('GitHub CLI downloaded an invalid update artifact');
+  }
+}
+
+async function verifyGitHubAttestation(
+  ghPath: string,
+  artifactPath: string,
+  owner: string,
+  repo: string,
+  channel: UpdateChannel
+): Promise<void> {
+  const workflow = channel === 'main' ? 'canary.yml' : 'release.yml';
+  const args = [
+    'attestation',
+    'verify',
+    artifactPath,
+    '--repo',
+    `${owner}/${repo}`,
+    '--signer-workflow',
+    `${owner}/${repo}/.github/workflows/${workflow}`,
+    '--deny-self-hosted-runners',
+  ];
+  if (channel === 'main') {
+    args.push('--source-ref', 'refs/heads/main');
+  }
+  await runGitHubCli(ghPath, args, CHECK_TIMEOUT_MS);
+}
+
+async function verifyFileIntegrity(
+  filePath: string,
+  artifact: Pick<GitHubUpdateArtifact, 'size' | 'sha512'>
+): Promise<void> {
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile() || stats.size !== artifact.size || stats.size > MAX_UPDATE_BYTES) {
+    throw new Error('Downloaded update size does not match the verified manifest');
+  }
+  const hash = createHash('sha512');
+  for await (const chunk of createReadStream(filePath)) {
+    hash.update(chunk as Buffer);
+  }
+  if (hash.digest('base64') !== artifact.sha512) {
+    throw new Error('Downloaded update SHA-512 does not match the verified manifest');
+  }
+}
+
+async function copyVerifiedArchive(
+  source: string,
+  artifact: GitHubUpdateArtifact,
+  bundleName: string
+): Promise<string> {
+  const downloadsDir = path.join(os.homedir(), 'Downloads');
+  await fs.mkdir(downloadsDir, { recursive: true });
+  const extension = path.extname(artifact.assetName) || '.zip';
+  const version = artifact.version.replace(/[^A-Za-z0-9._+-]/g, '_');
+  const digestPrefix = Buffer.from(artifact.sha512, 'base64').toString('hex').slice(0, 12);
+  const baseName = `${bundleName}-${version}-${process.platform}-${process.arch}-${digestPrefix}${extension}`;
+  let destination = path.join(downloadsDir, baseName);
+  if (await pathExists(destination)) {
+    try {
+      await verifyFileIntegrity(destination, artifact);
+      return destination;
+    } catch {
+      destination = path.join(
+        downloadsDir,
+        `${path.basename(baseName, extension)}-${randomUUID()}${extension}`
+      );
+    }
+  }
+
+  const partial = `${destination}.part-${randomUUID()}`;
+  try {
+    await fs.copyFile(source, partial, fsConstants.COPYFILE_EXCL);
+    await verifyFileIntegrity(partial, artifact);
+    await fs.rename(partial, destination);
+    return destination;
+  } catch (error) {
+    await fs.rm(partial, { force: true });
+    throw error;
+  }
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const githubUpdater = new GitHubUpdater();
