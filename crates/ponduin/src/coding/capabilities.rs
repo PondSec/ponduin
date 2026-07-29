@@ -302,12 +302,8 @@ impl std::fmt::Display for ExecutionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::CodingTaskMode;
-
     fn coding_config() -> CodingConfig {
         CodingConfig {
-            enabled: true,
-            task_mode: CodingTaskMode::Coding,
             max_context_tokens: 100_000,
             max_files_per_batch: 20,
             plan_file_threshold: 4,

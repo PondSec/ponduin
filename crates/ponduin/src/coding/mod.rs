@@ -46,7 +46,7 @@ pub use project::ProjectDiscovery;
 pub use repository::RepositoryProfile;
 pub use review::ReviewAnalyzer;
 pub use search::RepositorySearch;
-pub use strategy::CodingTaskMode;
+pub use strategy::MODEL_ROUTING_GUIDANCE;
 pub use validation::ValidationService;
 pub use workflow::CodingWorkflow;
 pub use workspace::CodingWorkspace;

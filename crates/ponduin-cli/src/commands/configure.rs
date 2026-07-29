@@ -5,8 +5,6 @@ use ponduin::agents::extension::{ToolInfo, PLATFORM_EXTENSIONS};
 use ponduin::agents::extension_manager::get_parameter_names;
 use ponduin::agents::Agent;
 use ponduin::agents::{extension::Envs, ExtensionConfig};
-use ponduin::coding::config::{CodingConfig, CODING_ENABLED_KEY, CODING_MODE_KEY};
-use ponduin::coding::strategy::CodingTaskMode;
 use ponduin::config::declarative_providers::{
     create_custom_provider, remove_custom_provider, CreateCustomProviderParams,
 };
@@ -1414,13 +1412,11 @@ pub fn remove_extension_dialog() -> anyhow::Result<()> {
 
 pub async fn configure_settings_dialog() -> anyhow::Result<()> {
     #[allow(unused_mut)]
-    let mut setting_select = cliclack::select("What setting would you like to configure?")
-        .item("ponduin_mode", "ponduin mode", "Configure ponduin mode")
-        .item(
-            "coding_agent",
-            "Internal Coding Agent",
-            "Enable built-in coding capabilities and select their task workflow",
-        );
+    let mut setting_select = cliclack::select("What setting would you like to configure?").item(
+        "ponduin_mode",
+        "ponduin mode",
+        "Configure ponduin mode",
+    );
     #[cfg(feature = "telemetry")]
     {
         setting_select = setting_select.item(
@@ -1467,9 +1463,6 @@ pub async fn configure_settings_dialog() -> anyhow::Result<()> {
     match setting_type {
         "ponduin_mode" => {
             configure_ponduin_mode_dialog()?;
-        }
-        "coding_agent" => {
-            configure_coding_agent_dialog()?;
         }
         #[cfg(feature = "telemetry")]
         "telemetry" => {
@@ -1549,118 +1542,6 @@ pub fn configure_ponduin_mode_dialog() -> anyhow::Result<()> {
         PonduinMode::Chat => "Set to Chat Mode - no tools or modifications enabled",
     };
     cliclack::outro(msg)?;
-    Ok(())
-}
-
-fn save_coding_agent_settings(
-    config: &Config,
-    enabled: bool,
-    task_mode: CodingTaskMode,
-) -> anyhow::Result<()> {
-    let task_mode = if enabled && task_mode == CodingTaskMode::General {
-        CodingTaskMode::Coding
-    } else {
-        task_mode
-    };
-    config.set_param_values(&[
-        (
-            CODING_ENABLED_KEY.to_string(),
-            serde_json::to_value(enabled)?,
-        ),
-        (
-            CODING_MODE_KEY.to_string(),
-            serde_json::to_value(task_mode)?,
-        ),
-    ])?;
-    Ok(())
-}
-
-pub fn configure_coding_agent_dialog() -> anyhow::Result<()> {
-    let config = Config::global();
-    let current = CodingConfig::from_config(config)?;
-
-    for key in [CODING_ENABLED_KEY, CODING_MODE_KEY] {
-        if std::env::var(key).is_ok() {
-            let _ = cliclack::log::info(format!(
-                "Notice: {key} is set in the environment and overrides the saved value."
-            ));
-        }
-    }
-
-    let _ = cliclack::log::info(
-        "The coding agent is built into Ponduin and does not use an extension.",
-    );
-    let enabled = cliclack::confirm("Enable the internal coding agent?")
-        .initial_value(current.enabled)
-        .interact()?;
-
-    if !enabled {
-        save_coding_agent_settings(config, false, current.task_mode)?;
-        cliclack::outro("Internal coding agent disabled. Restart Ponduin to apply the change.")?;
-        return Ok(());
-    }
-
-    let initial_mode = if current.task_mode.enables_coding_tools() {
-        current.task_mode
-    } else {
-        CodingTaskMode::Coding
-    };
-    let task_mode = cliclack::select("Which workflow should new coding tasks use?")
-        .item(
-            CodingTaskMode::Coding,
-            "Coding",
-            "Implement changes in small validated patches",
-        )
-        .item(
-            CodingTaskMode::Debugging,
-            "Debugging",
-            "Diagnose from evidence before changing code",
-        )
-        .item(
-            CodingTaskMode::Refactoring,
-            "Refactoring",
-            "Preserve behavior through reversible structural steps",
-        )
-        .item(
-            CodingTaskMode::RepositoryAnalysis,
-            "Repository Analysis",
-            "Map architecture and risks read-only by default",
-        )
-        .item(
-            CodingTaskMode::TestGeneration,
-            "Test Generation",
-            "Add behavior-focused coverage using repository conventions",
-        )
-        .item(
-            CodingTaskMode::Documentation,
-            "Documentation",
-            "Document only repository-verified behavior",
-        )
-        .item(
-            CodingTaskMode::Review,
-            "Review",
-            "Report actionable findings without editing by default",
-        )
-        .initial_value(initial_mode)
-        .interact()?;
-
-    save_coding_agent_settings(config, true, task_mode)?;
-
-    let autonomy = match config.get_ponduin_mode()? {
-        PonduinMode::Auto => {
-            "Autonomous Mode is active: coding tools run without confirmation; hard security blocks still apply."
-        }
-        PonduinMode::Approve | PonduinMode::SmartApprove => {
-            "Coding is enabled, but only Autonomous Mode removes confirmation gates."
-        }
-        PonduinMode::Chat => {
-            "Coding is enabled, but Chat Mode disables all tools. Select Autonomous Mode to run without confirmation."
-        }
-    };
-    cliclack::log::info(autonomy)?;
-    cliclack::outro(format!(
-        "Internal coding agent enabled in {task_mode} mode. Restart Ponduin to apply the change."
-    ))?;
     Ok(())
 }
 
@@ -2461,15 +2342,6 @@ fn print_config_file_saved() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    fn test_config(temp_dir: &TempDir) -> Config {
-        Config::new_with_file_secrets(
-            temp_dir.path().join("config.yaml"),
-            temp_dir.path().join("secrets.yaml"),
-        )
-        .unwrap()
-    }
 
     #[test]
     fn selected_item_inside_visible_window_keeps_order() {
@@ -2521,33 +2393,5 @@ mod tests {
         let filtered = fuzzy_filter_provider_items(&items, "open ai");
 
         assert_eq!(filtered.first().map(|item| item.0.as_str()), Some("openai"));
-    }
-
-    #[test]
-    fn saving_enabled_coding_normalizes_general_to_coding() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = test_config(&temp_dir);
-
-        save_coding_agent_settings(&config, true, CodingTaskMode::General).unwrap();
-
-        assert!(config.get_param::<bool>(CODING_ENABLED_KEY).unwrap());
-        assert_eq!(
-            config.get_param::<CodingTaskMode>(CODING_MODE_KEY).unwrap(),
-            CodingTaskMode::Coding
-        );
-    }
-
-    #[test]
-    fn saving_disabled_coding_preserves_the_selected_workflow() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = test_config(&temp_dir);
-
-        save_coding_agent_settings(&config, false, CodingTaskMode::Review).unwrap();
-
-        assert!(!config.get_param::<bool>(CODING_ENABLED_KEY).unwrap());
-        assert_eq!(
-            config.get_param::<CodingTaskMode>(CODING_MODE_KEY).unwrap(),
-            CodingTaskMode::Review
-        );
     }
 }

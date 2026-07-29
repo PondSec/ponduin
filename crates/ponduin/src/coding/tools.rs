@@ -761,11 +761,6 @@ pub(crate) async fn execute_async(
     tool_call: CallToolRequestParams,
     working_dir: &Path,
 ) -> Result<CallToolResult, ErrorData> {
-    if !config.tools_enabled() {
-        return Err(tool_unavailable(
-            "internal coding tools are disabled for this task",
-        ));
-    }
     if !is_async_tool(&tool_call.name) {
         return Err(invalid_arguments(format!(
             "`{}` is not an asynchronous internal coding tool",
@@ -1018,12 +1013,6 @@ pub(crate) fn execute_with_state(
     tool_call: CallToolRequestParams,
     working_dir: &Path,
 ) -> Result<CallToolResult, ErrorData> {
-    if !config.tools_enabled() {
-        return Err(tool_unavailable(
-            "internal coding tools are disabled for this task",
-        ));
-    }
-
     let workspace = CodingWorkspace::new(working_dir).map_err(invalid_workspace)?;
     if is_repository_activity(&tool_call.name) {
         state.note_repository_activity(workspace.root());
@@ -3220,16 +3209,11 @@ fn default_context_overlap_lines() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::CodingTaskMode;
     use std::fs;
     use std::process::Command;
 
     fn enabled_config() -> CodingConfig {
-        CodingConfig {
-            enabled: true,
-            task_mode: CodingTaskMode::Coding,
-            ..CodingConfig::default()
-        }
+        CodingConfig::default()
     }
 
     fn result_text(result: CallToolResult) -> String {
@@ -3788,13 +3772,15 @@ mod tests {
     }
 
     #[test]
-    fn disabled_configuration_fails_closed() {
+    fn default_configuration_exposes_the_core_tools_without_opt_in() {
         let temp_dir = tempfile::tempdir().unwrap();
         let call = CallToolRequestParams::new(REPOSITORY_PROFILE_TOOL_NAME);
 
-        let error = execute(&CodingConfig::default(), call, temp_dir.path()).unwrap_err();
+        let result = execute(&CodingConfig::default(), call, temp_dir.path()).unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
 
-        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert!(json["root"].as_str().is_some_and(|root| !root.is_empty()));
+        assert_eq!(json["scanned_files"], 0);
     }
 
     #[test]

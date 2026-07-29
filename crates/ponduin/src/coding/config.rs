@@ -1,13 +1,10 @@
 use crate::coding::capabilities::{
     CapabilitySupport, CodingSuitability, PerformanceClass, ResourceClass,
 };
-use crate::coding::strategy::CodingTaskMode;
 use crate::config::{Config, ConfigError};
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
-pub const CODING_ENABLED_KEY: &str = "PONDUIN_CODING_ENABLED";
-pub const CODING_MODE_KEY: &str = "PONDUIN_CODING_MODE";
 pub const CODING_MAX_ITERATIONS_KEY: &str = "PONDUIN_CODING_MAX_ITERATIONS";
 pub const CODING_MAX_REPAIR_ATTEMPTS_KEY: &str = "PONDUIN_CODING_MAX_REPAIR_ATTEMPTS";
 pub const CODING_MAX_CONTEXT_TOKENS_KEY: &str = "PONDUIN_CODING_MAX_CONTEXT_TOKENS";
@@ -40,15 +37,13 @@ const MAX_SHELL_TIMEOUT_SECONDS: u64 = 3_600;
 const MIN_OUTPUT_LIMIT: usize = 1_024;
 const MAX_OUTPUT_LIMIT: usize = 100 * 1_024 * 1_024;
 
-/// Validated settings for the internal coding agent.
+/// Validated tuning settings for the internal coding agent.
 ///
-/// Confirmation behavior is intentionally absent. It remains controlled by
-/// the session's `PonduinMode`, so enabling coding cannot silently enable
-/// autonomous execution.
+/// The agent is a core Ponduin capability and is always available outside Chat
+/// mode. Confirmation behavior is intentionally absent: it remains controlled
+/// exclusively by the session's `PonduinMode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodingConfig {
-    pub enabled: bool,
-    pub task_mode: CodingTaskMode,
     pub max_iterations: u32,
     pub max_repair_attempts: u32,
     pub max_context_tokens: usize,
@@ -74,8 +69,6 @@ pub struct CodingConfig {
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            task_mode: CodingTaskMode::General,
             max_iterations: 50,
             max_repair_attempts: 3,
             max_context_tokens: 32_768,
@@ -103,7 +96,6 @@ impl Default for CodingConfig {
 impl CodingConfig {
     pub fn from_config(config: &Config) -> Result<Self, CodingConfigError> {
         let defaults = Self::default();
-        let task_mode = optional(config, CODING_MODE_KEY, defaults.task_mode)?;
         let shell_timeout_seconds = optional(
             config,
             CODING_SHELL_TIMEOUT_KEY,
@@ -111,8 +103,6 @@ impl CodingConfig {
         )?;
 
         let resolved = Self {
-            enabled: optional(config, CODING_ENABLED_KEY, defaults.enabled)?,
-            task_mode,
             max_iterations: optional(config, CODING_MAX_ITERATIONS_KEY, defaults.max_iterations)?,
             max_repair_attempts: optional(
                 config,
@@ -177,10 +167,6 @@ impl CodingConfig {
 
         resolved.validate()?;
         Ok(resolved)
-    }
-
-    pub const fn tools_enabled(&self) -> bool {
-        self.enabled && self.task_mode.enables_coding_tools()
     }
 
     fn validate(&self) -> Result<(), CodingConfigError> {
@@ -291,11 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn safe_defaults_do_not_enable_tools() {
+    fn defaults_keep_optional_subsystems_conservative() {
         let defaults = CodingConfig::default();
-        assert!(!defaults.enabled);
-        assert_eq!(defaults.task_mode, CodingTaskMode::General);
-        assert!(!defaults.tools_enabled());
         assert!(defaults.tree_sitter);
         assert!(!defaults.embeddings);
         assert!(!defaults.lsp);
@@ -310,10 +293,6 @@ mod tests {
     fn resolves_typed_values_from_existing_config() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = test_config(&temp_dir);
-        config.set_param(CODING_ENABLED_KEY, true).unwrap();
-        config
-            .set_param(CODING_MODE_KEY, CodingTaskMode::Debugging)
-            .unwrap();
         config.set_param(CODING_MAX_ITERATIONS_KEY, 12).unwrap();
         config.set_param(CODING_SHELL_TIMEOUT_KEY, 45).unwrap();
         config
@@ -337,8 +316,6 @@ mod tests {
 
         let resolved = CodingConfig::from_config(&config).unwrap();
 
-        assert!(resolved.tools_enabled());
-        assert_eq!(resolved.task_mode, CodingTaskMode::Debugging);
         assert_eq!(resolved.max_iterations, 12);
         assert_eq!(resolved.shell_timeout, Duration::from_secs(45));
         assert_eq!(
@@ -368,14 +345,14 @@ mod tests {
     }
 
     #[test]
-    fn enabling_general_mode_does_not_expose_coding_tools() {
-        let mut config = CodingConfig {
-            enabled: true,
-            ..CodingConfig::default()
-        };
-        assert!(!config.tools_enabled());
+    fn legacy_opt_in_keys_do_not_control_the_core_capability() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = test_config(&temp_dir);
+        config.set_param("PONDUIN_CODING_ENABLED", false).unwrap();
+        config.set_param("PONDUIN_CODING_MODE", "general").unwrap();
 
-        config.task_mode = CodingTaskMode::Coding;
-        assert!(config.tools_enabled());
+        let resolved = CodingConfig::from_config(&config).unwrap();
+
+        assert_eq!(resolved, CodingConfig::default());
     }
 }

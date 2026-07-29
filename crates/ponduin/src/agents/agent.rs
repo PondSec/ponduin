@@ -3532,7 +3532,6 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::CodingTaskMode;
     use crate::permission::permission_confirmation::PrincipalType;
     use crate::plugins::discovery::{DiscoveredPlugin, PluginScope};
     use crate::providers::base::{stream_from_single_message, MessageStream, PermissionRouting};
@@ -4308,11 +4307,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
     ) -> (AgentConfig, Arc<SessionManager>) {
         let session_manager = Arc::new(SessionManager::new(temp_dir.path().join("data")));
         let permission_manager = Arc::new(PermissionManager::new(temp_dir.path().join("config")));
-        let coding_config = CodingConfig {
-            enabled: true,
-            task_mode: CodingTaskMode::Coding,
-            ..CodingConfig::default()
-        };
+        let coding_config = CodingConfig::default();
         (
             AgentConfig::new(
                 session_manager.clone(),
