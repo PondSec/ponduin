@@ -27,12 +27,15 @@ use rmcp::model::Role;
 use rmcp::model::Tool;
 
 const CODEX_PROVIDER_NAME: &str = "codex";
-pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.2-codex";
+pub const CODEX_DEFAULT_MODEL: &str = "default";
 pub const CODEX_KNOWN_MODELS: &[&str] = &[
-    "gpt-5.2-codex",
-    "gpt-5.2",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini",
+    CODEX_DEFAULT_MODEL,
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
 ];
 pub const CODEX_DOC_URL: &str = "https://developers.openai.com/codex/cli";
 
@@ -71,12 +74,14 @@ impl CodexProvider {
             })
     }
 
-    fn map_thinking_effort(_model_name: &str, effort: Option<ThinkingEffort>) -> Option<String> {
+    fn map_thinking_effort(model_name: &str, effort: Option<ThinkingEffort>) -> Option<String> {
         use ThinkingEffort;
-        match effort
-            .or_else(Self::legacy_reasoning_effort)
-            .unwrap_or(ThinkingEffort::High)
-        {
+        let effort = effort.or_else(Self::legacy_reasoning_effort);
+        if model_name == CODEX_DEFAULT_MODEL && effort.is_none() {
+            return None;
+        }
+
+        match effort.unwrap_or(ThinkingEffort::High) {
             ThinkingEffort::Off => Some("none".to_string()),
             ThinkingEffort::Low => Some("low".to_string()),
             ThinkingEffort::Medium => Some("medium".to_string()),
@@ -92,6 +97,39 @@ impl CodexProvider {
         }
 
         true
+    }
+
+    fn should_override_model(model_name: &str) -> bool {
+        let model_name = model_name.trim();
+        !model_name.is_empty() && model_name != CODEX_DEFAULT_MODEL
+    }
+
+    fn parse_model_catalog(output: &[u8]) -> Option<Vec<String>> {
+        let catalog: serde_json::Value = serde_json::from_slice(output).ok()?;
+        let models = catalog.get("models")?.as_array()?;
+        let mut result = vec![CODEX_DEFAULT_MODEL.to_string()];
+
+        for model in models.iter().take(256) {
+            if model.get("visibility").and_then(|value| value.as_str()) != Some("list") {
+                continue;
+            }
+            let Some(slug) = model.get("slug").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if slug.is_empty()
+                || slug.len() > 128
+                || !slug
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                continue;
+            }
+            if !result.iter().any(|existing| existing == slug) {
+                result.push(slug.to_string());
+            }
+        }
+
+        (result.len() > 1).then_some(result)
     }
 
     /// Apply permission flags based on PonduinMode
@@ -161,9 +199,9 @@ impl CodexProvider {
         // Use 'exec' subcommand for non-interactive mode
         cmd.arg("exec");
 
-        // Only pass model parameter if it's in the known models list
-        // This allows users to set PONDUIN_PROVIDER=codex without needing to specify a model
-        if CODEX_KNOWN_MODELS.contains(&model.model_name.as_str()) {
+        // Let the authenticated Codex CLI choose its account-compatible default unless the
+        // user explicitly selected a concrete model.
+        if Self::should_override_model(&model.model_name) {
             cmd.arg("-m").arg(&model.model_name);
         }
 
@@ -745,6 +783,26 @@ impl Provider for CodexProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
+        let mut cmd = Command::new(&self.command);
+        configure_subprocess(&mut cmd);
+        if let Ok(path) = SearchPaths::builder().with_npm().path() {
+            cmd.env("PATH", path);
+        }
+        cmd.args(["debug", "models"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        if let Ok(Ok(output)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await
+        {
+            if output.status.success() {
+                if let Some(models) = Self::parse_model_catalog(&output.stdout) {
+                    return Ok(models);
+                }
+            }
+        }
+
         Ok(CODEX_KNOWN_MODELS.iter().map(|s| s.to_string()).collect())
     }
 }
@@ -1021,10 +1079,44 @@ mod tests {
 
     #[test]
     fn test_known_models() {
-        assert!(CODEX_KNOWN_MODELS.contains(&"gpt-5.2-codex"));
-        assert!(CODEX_KNOWN_MODELS.contains(&"gpt-5.2"));
-        assert!(CODEX_KNOWN_MODELS.contains(&"gpt-5.1-codex-max"));
-        assert!(CODEX_KNOWN_MODELS.contains(&"gpt-5.1-codex-mini"));
+        assert!(CODEX_KNOWN_MODELS.contains(&CODEX_DEFAULT_MODEL));
+        assert!(CODEX_KNOWN_MODELS.contains(&"gpt-5.6-sol"));
+        assert!(CODEX_KNOWN_MODELS.contains(&"gpt-5.6-terra"));
+        assert!(CODEX_KNOWN_MODELS.contains(&"gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn test_default_model_defers_to_cli() {
+        let _guard = env_lock::lock_env([
+            ("CODEX_REASONING_EFFORT", None::<&str>),
+            ("PONDUIN_THINKING_EFFORT", None::<&str>),
+        ]);
+
+        assert!(!CodexProvider::should_override_model(CODEX_DEFAULT_MODEL));
+        assert!(!CodexProvider::should_override_model(""));
+        assert!(CodexProvider::should_override_model("gpt-5.6-sol"));
+        assert_eq!(
+            CodexProvider::map_thinking_effort(CODEX_DEFAULT_MODEL, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_model_catalog_filters_hidden_and_invalid_models() {
+        let catalog = br#"{
+            "models": [
+                {"slug": "gpt-5.6-sol", "visibility": "list"},
+                {"slug": "codex-auto-review", "visibility": "hide"},
+                {"slug": "gpt-5.6-sol", "visibility": "list"},
+                {"slug": "../invalid", "visibility": "list"},
+                {"slug": "", "visibility": "list"}
+            ]
+        }"#;
+
+        assert_eq!(
+            CodexProvider::parse_model_catalog(catalog),
+            Some(vec!["default".to_string(), "gpt-5.6-sol".to_string()])
+        );
     }
 
     #[test]
@@ -1296,7 +1388,7 @@ mod tests {
 
     #[test]
     fn test_default_model() {
-        assert_eq!(CODEX_DEFAULT_MODEL, "gpt-5.2-codex");
+        assert_eq!(CODEX_DEFAULT_MODEL, "default");
     }
 
     #[test_case(PonduinMode::Auto, &["--yolo"] ; "auto_yolo")]
