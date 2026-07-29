@@ -428,3 +428,104 @@ async fn analyzes_edits_validates_and_repairs_a_polyglot_repository() {
     let repaired = ValidationService::run(&workspace, &capabilities, &typecheck_id, limits).await;
     assert_eq!(repaired.status, ValidationStatus::Passed);
 }
+
+#[test]
+fn bounds_analysis_search_and_context_for_a_medium_repository() {
+    let repository = tempfile::tempdir().unwrap();
+    for index in 0..900 {
+        let (directory, extension, source) = match index % 3 {
+            0 => (
+                "rust",
+                "rs",
+                format!("pub fn medium_handler_{index}() -> usize {{ {index} }}\n"),
+            ),
+            1 => (
+                "python",
+                "py",
+                format!("def medium_handler_{index}() -> int:\n    return {index}\n"),
+            ),
+            _ => (
+                "web",
+                "ts",
+                format!("export function mediumHandler{index}(): number {{ return {index}; }}\n"),
+            ),
+        };
+        write_fixture(
+            repository.path(),
+            &format!("{directory}/module_{index}.{extension}"),
+            &source,
+        );
+    }
+    for index in 0..300 {
+        write_fixture(
+            repository.path(),
+            &format!("node_modules/dependency_{index}/index.ts"),
+            "export const MEDIUM_MATCH = 'excluded';\n",
+        );
+    }
+    let workspace = CodingWorkspace::new(repository.path()).unwrap();
+
+    let profile = RepositoryProfile::discover(&workspace, 200).unwrap();
+    assert_eq!(profile.scanned_files, 200);
+    assert!(profile.truncated);
+    assert_eq!(profile.languages.values().sum::<usize>(), 200);
+
+    let index = RepositoryIntelligence::build(
+        &workspace,
+        IntelligenceLimits {
+            max_files: 300,
+            max_file_bytes: 8 * 1_024,
+            max_symbols: 1_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(index.scanned_files, 300);
+    assert_eq!(index.files.len(), 300);
+    assert!(index.truncated);
+    assert!(index
+        .files
+        .iter()
+        .all(|file| !file.path.starts_with("node_modules")));
+
+    let search = RepositorySearch::new(&workspace);
+    let result = search
+        .search_text(
+            &TextSearchRequest {
+                pattern: "medium".to_string(),
+                scope: PathBuf::from("."),
+                regex: false,
+                case_sensitive: false,
+                include: Vec::new(),
+            },
+            SearchLimits {
+                max_results: 25,
+                max_files: 100,
+                max_file_bytes: 8 * 1_024,
+                max_line_bytes: 1_024,
+            },
+        )
+        .unwrap();
+    assert_eq!(result.matches.len(), 25);
+    assert!(result.truncated);
+    assert!(result.scanned_files <= 100);
+    assert!(result
+        .matches
+        .iter()
+        .all(|matched| !matched.path.starts_with("node_modules")));
+
+    let context = ContextPlanner::new(&workspace, &index)
+        .prepare(
+            "medium handler",
+            ContextLimits {
+                token_budget: 2_048,
+                max_files: 8,
+                max_file_bytes: 8 * 1_024,
+                chunk_lines: 20,
+                overlap_lines: 4,
+            },
+        )
+        .unwrap();
+    assert!(!context.chunks.is_empty());
+    assert!(context.selected_files <= 8);
+    assert!(context.used_tokens <= context.token_budget);
+}
