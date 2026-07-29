@@ -1547,7 +1547,7 @@ pub(crate) fn execute_with_state(
             json_result(&status, config.output_limit)
         }
         WORKFLOW_SET_PLAN_TOOL_NAME => {
-            let params: WorkflowSetPlanParams = parse_arguments(&tool_call)?;
+            let mut params: WorkflowSetPlanParams = parse_arguments(&tool_call)?;
             if params.plan.relevant_files.is_empty() {
                 return Err(invalid_arguments(
                     "`plan.relevant_files` must list workspace-relative paths affected by the \
@@ -1556,11 +1556,7 @@ pub(crate) fn execute_with_state(
                      do not send an empty array.",
                 ));
             }
-            for path in &params.plan.relevant_files {
-                workspace
-                    .resolve_for_write(path)
-                    .map_err(|error| invalid_arguments(error.to_string()))?;
-            }
+            normalize_plan_paths(&workspace, &mut params.plan)?;
             let status =
                 state.set_workflow_plan(workspace.root(), &params.workflow_id, params.plan)?;
             json_result(&status, config.output_limit)
@@ -2331,8 +2327,10 @@ fn workflow_set_plan_tool() -> Tool {
         "Attach a complete, bounded plan to the current workflow after repository analysis. \
          relevant_files includes both existing paths and workspace-relative paths that the task \
          will create; it must not be empty even for a greenfield project. Relevant paths are \
-         revalidated against the workspace and the plan must identify components, files, intended \
-         changes, risks, tests, validation, and rollback."
+         revalidated against the workspace. Absolute paths are accepted only when they resolve \
+         inside the workspace and are normalized to workspace-relative paths before storage. The \
+         plan must identify components, files, intended changes, risks, tests, validation, and \
+         rollback."
             .to_string(),
         object!({
             "type": "object",
@@ -2807,6 +2805,28 @@ where
         tool_call.arguments.clone().unwrap_or_default(),
     ))
     .map_err(|error| invalid_arguments(error.to_string()))
+}
+
+fn normalize_plan_paths(
+    workspace: &CodingWorkspace,
+    plan: &mut WorkflowPlan,
+) -> Result<(), ErrorData> {
+    for path in &mut plan.relevant_files {
+        let resolved = workspace
+            .resolve_for_write(&*path)
+            .map_err(|error| invalid_arguments(error.to_string()))?;
+        let relative = resolved
+            .strip_prefix(workspace.root())
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                invalid_arguments(format!(
+                    "path is outside the coding workspace: {}",
+                    resolved.display()
+                ))
+            })?;
+        *path = relative;
+    }
+    Ok(())
 }
 
 fn json_result(
@@ -3638,6 +3658,87 @@ mod tests {
         assert!(error.message.contains("greenfield project"));
         assert!(error.message.contains("intended new paths"));
         assert!(error.message.contains("pyproject.toml"));
+    }
+
+    #[test]
+    fn plan_normalizes_absolute_paths_inside_workspace() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "create a new package"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let started: Value = serde_json::from_str(&result_text(started)).unwrap();
+        let intended_path = temp_dir.path().join("src/package/__init__.py");
+        let planned = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
+                "workflow_id": started["id"].as_str().unwrap(),
+                "plan": {
+                    "affected_components": ["package"],
+                    "relevant_files": [intended_path.to_string_lossy().to_string()],
+                    "risks": [],
+                    "intended_changes": ["create package"],
+                    "tests": ["run tests"],
+                    "validation": ["run tests"],
+                    "rollback_strategy": "roll back the change batch"
+                }
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let planned: Value = serde_json::from_str(&result_text(planned)).unwrap();
+
+        assert_eq!(
+            planned["plan"]["relevant_files"],
+            serde_json::json!(["src/package/__init__.py"])
+        );
+    }
+
+    #[test]
+    fn plan_rejects_absolute_paths_outside_workspace() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let external_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "create a new package"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let started: Value = serde_json::from_str(&result_text(started)).unwrap();
+        let external_path = external_dir.path().join("outside.py");
+        let error = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
+                "workflow_id": started["id"].as_str().unwrap(),
+                "plan": {
+                    "affected_components": ["package"],
+                    "relevant_files": [external_path.to_string_lossy().to_string()],
+                    "risks": [],
+                    "intended_changes": ["create package"],
+                    "tests": [],
+                    "validation": [],
+                    "rollback_strategy": "roll back the change batch"
+                }
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("outside the coding workspace"));
     }
 
     #[test]
