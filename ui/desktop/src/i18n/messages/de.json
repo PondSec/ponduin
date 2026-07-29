@@ -4612,50 +4612,5 @@
   },
   "userMessage.forkSessionTitle": {
     "defaultMessage": "Eine neue Sitzung mit der bearbeiteten Nachricht erstellen"
-  },
-  "chatSettings.codingAgentDescription": {
-    "defaultMessage": "Anbieterunabhängige Coding-Fähigkeiten aktivieren und den Arbeitsablauf für neue Aufgaben auswählen."
-  },
-  "chatSettings.codingAgentTitle": {
-    "defaultMessage": "Interner Coding-Agent"
-  },
-  "codingAgentSettings.autonomous": {
-    "defaultMessage": "Der autonome Modus ist aktiv: Coding-Werkzeuge dürfen ohne Bestätigung ausgeführt werden. Harte Sicherheitsblockaden gelten weiterhin."
-  },
-  "codingAgentSettings.description": {
-    "defaultMessage": "Fügt Repository-Analyse, sichere Bearbeitung, Validierung, Review und Git-Werkzeuge direkt zu Ponduin hinzu. Es wird keine Erweiterung verwendet."
-  },
-  "codingAgentSettings.enable": {
-    "defaultMessage": "Internen Coding-Agenten aktivieren"
-  },
-  "codingAgentSettings.gated": {
-    "defaultMessage": "Nur der autonome Modus führt Coding-Werkzeuge ohne Bestätigung aus. Manuell und Smart behalten Bestätigungsgrenzen bei; Chat deaktiviert alle Werkzeuge."
-  },
-  "codingAgentSettings.mode.coding": {
-    "defaultMessage": "Coding"
-  },
-  "codingAgentSettings.mode.debugging": {
-    "defaultMessage": "Debugging"
-  },
-  "codingAgentSettings.mode.documentation": {
-    "defaultMessage": "Dokumentation"
-  },
-  "codingAgentSettings.mode.refactoring": {
-    "defaultMessage": "Refactoring"
-  },
-  "codingAgentSettings.mode.repositoryAnalysis": {
-    "defaultMessage": "Repository-Analyse"
-  },
-  "codingAgentSettings.mode.review": {
-    "defaultMessage": "Review"
-  },
-  "codingAgentSettings.mode.testGeneration": {
-    "defaultMessage": "Testerzeugung"
-  },
-  "codingAgentSettings.restart": {
-    "defaultMessage": "Änderungen am Coding-Agenten gelten nach einem Neustart von Ponduin."
-  },
-  "codingAgentSettings.taskMode": {
-    "defaultMessage": "Coding-Aufgabenmodus"
   }
 }

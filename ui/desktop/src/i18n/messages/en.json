@@ -227,12 +227,6 @@
   "chatInput.waitingForImages": {
     "defaultMessage": "Waiting for images to save..."
   },
-  "chatSettings.codingAgentDescription": {
-    "defaultMessage": "Enable provider-independent coding capabilities and choose the workflow for new tasks."
-  },
-  "chatSettings.codingAgentTitle": {
-    "defaultMessage": "Internal Coding Agent"
-  },
   "chatSettings.modeDescription": {
     "defaultMessage": "Choose the default mode Ponduin uses for new sessions. Existing sessions keep their current mode."
   },
@@ -244,45 +238,6 @@
   },
   "chatSettings.responseStylesTitle": {
     "defaultMessage": "Response Styles"
-  },
-  "codingAgentSettings.autonomous": {
-    "defaultMessage": "Autonomous mode is active: coding tools can run without confirmation. Hard security blocks still apply."
-  },
-  "codingAgentSettings.description": {
-    "defaultMessage": "Adds repository analysis, safe editing, validation, review, and Git tools directly to Ponduin. No extension is used."
-  },
-  "codingAgentSettings.enable": {
-    "defaultMessage": "Enable internal coding agent"
-  },
-  "codingAgentSettings.gated": {
-    "defaultMessage": "Only Autonomous mode runs coding tools without confirmation. Manual and Smart retain approval gates; Chat disables all tools."
-  },
-  "codingAgentSettings.mode.coding": {
-    "defaultMessage": "Coding"
-  },
-  "codingAgentSettings.mode.debugging": {
-    "defaultMessage": "Debugging"
-  },
-  "codingAgentSettings.mode.documentation": {
-    "defaultMessage": "Documentation"
-  },
-  "codingAgentSettings.mode.refactoring": {
-    "defaultMessage": "Refactoring"
-  },
-  "codingAgentSettings.mode.repositoryAnalysis": {
-    "defaultMessage": "Repository analysis"
-  },
-  "codingAgentSettings.mode.review": {
-    "defaultMessage": "Review"
-  },
-  "codingAgentSettings.mode.testGeneration": {
-    "defaultMessage": "Test generation"
-  },
-  "codingAgentSettings.restart": {
-    "defaultMessage": "Coding-agent changes apply after restarting Ponduin."
-  },
-  "codingAgentSettings.taskMode": {
-    "defaultMessage": "Coding task mode"
   },
   "configSettings.configReset": {
     "defaultMessage": "Configuration Reset"

@@ -227,51 +227,6 @@
   "chatInput.waitingForImages": {
     "defaultMessage": "Đang chờ lưu hình ảnh..."
   },
-  "chatSettings.codingAgentDescription": {
-    "defaultMessage": "Enable provider-independent coding capabilities and choose the workflow for new tasks."
-  },
-  "chatSettings.codingAgentTitle": {
-    "defaultMessage": "Internal Coding Agent"
-  },
-  "codingAgentSettings.autonomous": {
-    "defaultMessage": "Autonomous mode is active: coding tools can run without confirmation. Hard security blocks still apply."
-  },
-  "codingAgentSettings.description": {
-    "defaultMessage": "Adds repository analysis, safe editing, validation, review, and Git tools directly to Ponduin. No extension is used."
-  },
-  "codingAgentSettings.enable": {
-    "defaultMessage": "Enable internal coding agent"
-  },
-  "codingAgentSettings.gated": {
-    "defaultMessage": "Only Autonomous mode runs coding tools without confirmation. Manual and Smart retain approval gates; Chat disables all tools."
-  },
-  "codingAgentSettings.mode.coding": {
-    "defaultMessage": "Coding"
-  },
-  "codingAgentSettings.mode.debugging": {
-    "defaultMessage": "Debugging"
-  },
-  "codingAgentSettings.mode.documentation": {
-    "defaultMessage": "Documentation"
-  },
-  "codingAgentSettings.mode.refactoring": {
-    "defaultMessage": "Refactoring"
-  },
-  "codingAgentSettings.mode.repositoryAnalysis": {
-    "defaultMessage": "Repository analysis"
-  },
-  "codingAgentSettings.mode.review": {
-    "defaultMessage": "Review"
-  },
-  "codingAgentSettings.mode.testGeneration": {
-    "defaultMessage": "Test generation"
-  },
-  "codingAgentSettings.restart": {
-    "defaultMessage": "Coding-agent changes apply after restarting Ponduin."
-  },
-  "codingAgentSettings.taskMode": {
-    "defaultMessage": "Coding task mode"
-  },
   "chatSettings.modeDescription": {
     "defaultMessage": "Chọn chế độ mặc định mà Ponduin sử dụng cho các phiên mới. Các phiên hiện có vẫn giữ chế độ hiện tại của chúng."
   },

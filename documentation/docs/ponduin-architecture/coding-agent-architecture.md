@@ -43,7 +43,7 @@ documentation subprojects.
 | Extension system | `McpClientTrait`, `PlatformExtensionDef`, `PLATFORM_EXTENSIONS`, external MCP support | Preserve it for general-agent compatibility; the internal coding agent does not register or dispatch its tools through it |
 | Providers | `Provider`, `ProviderDef`, provider registry, declarative providers, ACP providers | Derive coding behavior from model capabilities without provider-specific branches |
 | Model metadata | `ModelConfig`, `ModelInfo`, canonical model catalog | Add a backward-compatible capability profile that consumes existing metadata |
-| Prompts | `PromptManager`, templates, extension instructions, prompt overrides | Compose internal coding-mode instructions through keyed prompt extras |
+| Prompts | `PromptManager`, templates, extension instructions, prompt overrides | Compose model-selected internal coding guidance through keyed prompt extras |
 | Context | token counting, structured compaction, tool-pair summarization, fast-model fallback | Add repository context selection before content reaches conversation history |
 | Project instructions | `.ponduinhints`, `AGENTS.md`, referenced files, hierarchical subdirectory hints | Preserve the loader and expose the resolved hierarchy to repository analysis |
 | File editing | exact unique text replacement and full-file writes | Add workspace enforcement, content versions, preview, patching, atomic batches, and rollback |
@@ -52,7 +52,7 @@ documentation subprojects.
 | Loop control | maximum turns, recipe retries, repetition inspector, stop-hook cap | Add coding-progress fingerprints for errors, diffs, and validation attempts |
 | Git | hardened internal `git_command` helper and limited internal Git usage | Add first-class read tools and policy-gated write tools; never use repository hooks |
 | Storage | SQLite sessions, extension data, structured summaries | Store coding task metadata only; do not persist source bodies or secrets by default |
-| CLI | `ponduin-cli`, interactive session, recipes, review command | Add task-mode and repository-oriented commands without changing existing defaults |
+| CLI | `ponduin-cli`, interactive session, recipes, review command | Make repository-oriented capabilities available without an activation or task-mode command |
 | Desktop | Electron/React UI over ACP with extension, permission, session, and diagnostics views | Add coding status, plan, files, diffs, and validation results through ACP types |
 | Logging | structured tracing, local rolling files, optional OTLP/Langfuse, opt-in PostHog | Redact coding arguments and paths where necessary; retain explicit opt-in for network telemetry |
 | Tests and CI | Rust unit/integration tests, Vitest, Playwright, Docusaurus tests, Clippy and formatting jobs | Add focused fixtures and preserve the existing CI commands |
@@ -179,7 +179,7 @@ The modules have narrow responsibilities:
 - `review`: severity-ordered local added-line review findings;
 - `agent`: internal coding-agent lifecycle and integration with the existing
   reply loop;
-- `strategy`: task-mode policies and prompt/tool presets;
+- `strategy`: model-routing guidance for semantic per-turn tool selection;
 - `workflow`: plan, status, bounded memory, attempts, errors, changed files,
   validations, progress fingerprints, and factual completion reports;
 - `tools`: internal tool schemas and direct dispatch to coding services;
@@ -189,37 +189,30 @@ The modules have narrow responsibilities:
 
 The existing surfaces consume this core:
 
-- `Agent` owns an optional internal `CodingAgent` and directly appends its tools
+- `Agent` owns an internal `CodingAgent` and directly appends its tools
   beside existing internal platform tools;
 - tool dispatch recognizes internal coding tool names before extension
   resolution, following the same pattern as existing internal final-output and
   scheduling tools;
 - reusable parsing is shared with the existing analyzer where doing so
   preserves its public extension tools;
-- `PromptManager` adds a keyed internal coding strategy prompt without
+- `PromptManager` adds keyed internal model-routing guidance without
   replacing the base system prompt;
-- the agent loop owns a coding task record only when an internal coding
-  strategy is active;
-- CLI configuration and desktop Chat settings enable the internal agent and
-  select its strategy without changing the provider;
+- the selected model decides semantically whether the current turn needs
+  coding tools; there is no keyword, regular-expression, or host-side branch
+  that classifies user prompts;
+- coding capabilities require no CLI or desktop opt-in and do not change the
+  provider;
 - the desktop reuses the current permission and session surfaces.
 
-## Task strategies
+## Model-selected request routing
 
-`CodingTaskMode` is a separate serialized enum:
-
-- `general`
-- `coding`
-- `debugging`
-- `refactoring`
-- `repository_analysis`
-- `test_generation`
-- `documentation`
-- `review`
-
-Each strategy selects instructions, recommended tools, planning threshold,
-validation behavior, and report sections. It is configured independently from
-`PonduinMode`.
+Every eligible turn exposes the same bounded internal tool set and routing
+guidance to the active model. Using the complete conversation, the model decides
+whether to answer normally or use an implementation, debugging, refactoring,
+repository-analysis, test-generation, documentation, or review approach. It
+re-evaluates that decision on each new turn. No task mode is serialized or
+selected by the user.
 
 `PonduinMode` remains the sole confirmation setting:
 
@@ -378,8 +371,6 @@ Coding settings use the existing config file and environment-variable
 resolution. The keys are:
 
 ```text
-PONDUIN_CODING_ENABLED
-PONDUIN_CODING_MODE
 PONDUIN_CODING_MAX_ITERATIONS
 PONDUIN_CODING_MAX_REPAIR_ATTEMPTS
 PONDUIN_CODING_MAX_CONTEXT_TOKENS
@@ -404,8 +395,8 @@ PONDUIN_CODING_MODEL_RESOURCE_DEMAND
 
 Defaults enable local analysis and Tree-sitter, keep embeddings and language
 servers optional, and limit iterations and timeouts. Confirmation behavior is
-always taken from the explicit `PonduinMode` setting; coding configuration
-cannot silently enable `auto`.
+always taken from the explicit `PonduinMode` setting; coding tuning cannot
+silently enable `auto`.
 
 The complete defaults, ranges, local-model examples, and troubleshooting steps
 are in the [Internal Coding Agent guide](/docs/guides/internal-coding-agent).
@@ -442,8 +433,8 @@ are in the [Internal Coding Agent guide](/docs/guides/internal-coding-agent).
 ### Phase 5: integration and advanced adapters
 
 - Added optional language-server and local embedding adapters.
-- Integrated enablement and task-mode selection into the existing CLI
-  configuration and desktop Chat settings.
+- Integrated always-available, model-selected request routing into the existing
+  reply loop without GUI or CLI activation steps.
 - Kept all coding tools internal and retained existing extension behavior.
 
 ### Phase 6: stabilization
@@ -474,14 +465,15 @@ Unavailable tools produce a `not_executable` validation result.
 
 ## Compatibility and migration
 
-- Existing sessions default to `general` task mode.
+- Existing coding enable/task-mode keys are ignored; coding capabilities are
+  core behavior and the model selects their use per request.
 - Existing `PonduinMode` serialization is unchanged.
 - Existing extension tool names remain valid, while internal coding tools use a
   reserved `coding__` namespace.
 - Stronger safety checks can reject operations that were previously unsafe; the
   rejection includes a precise reason and safe alternative.
 - New model fields are optional and conservative when absent.
-- New configuration keys have safe defaults and do not require migration.
+- Coding tuning keys have bounded defaults and do not require migration.
 - Existing providers do not need to implement a new trait method.
 - External MCP extensions and ACP providers continue to use their current
   interfaces, but are not required by the internal coding agent.

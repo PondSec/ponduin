@@ -12,58 +12,36 @@ validation, review, and Git tools work with local Ollama models,
 OpenAI-compatible local servers, llama.cpp, LM Studio, vLLM, and the existing
 optional cloud providers.
 
-The coding agent is disabled by default. Enabling it does not change the
-current provider or permission mode.
+The coding agent is an always-available core capability. There is no extension,
+enable switch, or task-type setting. The selected language model decides from
+the complete request and conversation context whether a turn needs coding
+tools and which working approach fits it.
 
-## Enable it
+## Use it
 
-### Desktop
+Ask for the outcome you want in the Desktop app or CLI. No setup step is
+required. For example:
 
-1. Open **Settings**.
-2. Open **Chat**.
-3. Turn on **Enable internal coding agent**.
-4. Choose a task mode.
-5. Restart ponduin.
-
-Select **Autonomous** as the ponduin permission mode only when ordinary coding
-tool calls should run without confirmation. Hard security denials remain
-active.
-
-### CLI
-
-Run:
-
-```bash
-ponduin configure
+```text
+Add pagination to this API, update its tests, and run the relevant checks.
 ```
 
-Choose the internal coding-agent configuration, enable it, select a workflow,
-and restart the active CLI session.
+The model can instead answer an ordinary non-coding question without calling a
+coding tool. Ponduin does not use keyword matching, regular expressions, or a
+host-side `if/else` classifier to make this choice. The model makes the
+semantic decision in its normal response loop and re-evaluates it for every
+turn.
 
-The equivalent minimal `config.yaml` settings are:
+The only related user setting is the existing ponduin permission mode. Select
+**Autonomous** only when ordinary coding tool calls should run without
+confirmation. Hard security denials remain active.
 
-```yaml
-PONDUIN_CODING_ENABLED: true
-PONDUIN_CODING_MODE: coding
-```
+## Model-selected workflows and permissions
 
-Environment variables with the same names override saved configuration for the
-current process.
-
-## Task modes and permissions
-
-Task mode controls the workflow. Permission mode independently controls
-confirmation.
-
-| Coding task mode | Behavior |
-| --- | --- |
-| `coding` | Implement in small patches and validate each step |
-| `debugging` | Form and test a cause hypothesis before editing |
-| `refactoring` | Preserve behavior through reversible structural changes |
-| `repository_analysis` | Map architecture and risks; read-only by default |
-| `test_generation` | Reuse the existing test framework and add behavior-focused tests |
-| `documentation` | Document repository-verified behavior |
-| `review` | Report actionable local-diff findings; read-only by default |
+The model chooses among normal conversation, implementation, debugging,
+refactoring, repository analysis, test generation, documentation, and review.
+These are semantic working approaches, not serialized task modes or
+user-selected branches.
 
 | `PONDUIN_MODE` | Coding-tool behavior |
 | --- | --- |
@@ -114,15 +92,11 @@ In another terminal, run `ponduin configure` and select:
 - provider: **Ollama**
 - host: `http://localhost:11434`
 - model: `qwen3:8b`
-- internal coding agent: enabled
-- task mode: **Coding**
 
 For an 8B model, these conservative optional settings are a useful starting
 point:
 
 ```yaml
-PONDUIN_CODING_ENABLED: true
-PONDUIN_CODING_MODE: coding
 PONDUIN_CODING_MAX_CONTEXT_TOKENS: 8192
 PONDUIN_CODING_MAX_FILES_PER_BATCH: 3
 PONDUIN_CODING_PLAN_FILE_THRESHOLD: 1
@@ -175,8 +149,6 @@ All values use the existing ponduin configuration system.
 
 | Setting | Default | Valid range or values |
 | --- | --- | --- |
-| `PONDUIN_CODING_ENABLED` | `false` | Boolean |
-| `PONDUIN_CODING_MODE` | `general` | The seven coding task modes above, or `general` |
 | `PONDUIN_CODING_MAX_ITERATIONS` | `50` | 1–1000 |
 | `PONDUIN_CODING_MAX_REPAIR_ATTEMPTS` | `3` | 0–100 |
 | `PONDUIN_CODING_MAX_CONTEXT_TOKENS` | `32768` | 1024–1000000 |
@@ -198,8 +170,8 @@ All values use the existing ponduin configuration system.
 | `PONDUIN_CODING_MODEL_SPEED` | `unknown` | `unknown`, `slow`, `balanced`, `fast` |
 | `PONDUIN_CODING_MODEL_RESOURCE_DEMAND` | `unknown` | `unknown`, `low`, `moderate`, `high` |
 
-Invalid and out-of-range settings fail closed instead of silently expanding
-agent authority.
+Invalid and out-of-range tuning settings fail closed instead of silently
+expanding resource use or agent authority.
 
 ## Typical workflow
 
