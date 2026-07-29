@@ -1,5 +1,6 @@
 use crate::coding::config::CodingConfig;
 use crate::coding::context::{ContextLimits, ContextPlanner};
+use crate::coding::embedding::hybrid_context_candidates;
 use crate::coding::file::{
     FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
 };
@@ -1096,9 +1097,14 @@ pub(crate) fn execute_with_state(
         SELECT_CONTEXT_TOOL_NAME => {
             let params: ContextSelectionParams = parse_arguments(&tool_call)?;
             let index = state.intelligence_index(config, &workspace, params.limits())?;
-            let result = index
-                .context_candidates(&params.query, params.max_results)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = if config.embeddings {
+                hybrid_context_candidates(index.as_ref(), &params.query, params.max_results)
+                    .map_err(|error| invalid_arguments(error.to_string()))?
+            } else {
+                index
+                    .context_candidates(&params.query, params.max_results)
+                    .map_err(|error| invalid_arguments(error.to_string()))?
+            };
             json_result(&result, config.output_limit)
         }
         PROJECT_CAPABILITIES_TOOL_NAME => {
@@ -1131,18 +1137,20 @@ pub(crate) fn execute_with_state(
                 )));
             }
             let index = state.intelligence_index(config, &workspace, params.index_limits())?;
-            let bundle = ContextPlanner::new(&workspace, index.as_ref())
-                .prepare(
-                    &params.query,
-                    ContextLimits {
-                        token_budget: requested_budget,
-                        max_files: params.max_files,
-                        max_file_bytes: params.max_file_bytes,
-                        chunk_lines: params.chunk_lines,
-                        overlap_lines: params.overlap_lines,
-                    },
-                )
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let planner = ContextPlanner::new(&workspace, index.as_ref());
+            let limits = ContextLimits {
+                token_budget: requested_budget,
+                max_files: params.max_files,
+                max_file_bytes: params.max_file_bytes,
+                chunk_lines: params.chunk_lines,
+                overlap_lines: params.overlap_lines,
+            };
+            let bundle = if config.embeddings {
+                planner.prepare_with_local_embeddings(&params.query, limits)
+            } else {
+                planner.prepare(&params.query, limits)
+            }
+            .map_err(|error| invalid_arguments(error.to_string()))?;
             json_result(&bundle, config.output_limit)
         }
         WORKFLOW_START_TOOL_NAME => {
@@ -1754,7 +1762,9 @@ fn select_context_tool() -> Tool {
         SELECT_CONTEXT_TOOL_NAME.to_string(),
         "Rank bounded repository files as context candidates for a coding query using paths, \
          symbols, imports, calls, framework evidence, entry points, and configuration files from \
-         the internal Tree-sitter index. This selects files but does not read their contents."
+         the internal Tree-sitter index. When explicitly configured, a deterministic local \
+         feature embedding adds bounded hybrid relevance without a model, provider, network, or \
+         source reread. This selects files but does not read their contents."
             .to_string(),
         object!({
             "type": "object",
@@ -1804,8 +1814,10 @@ fn prepare_context_tool() -> Tool {
     Tool::new(
         PREPARE_CONTEXT_TOOL_NAME.to_string(),
         "Prepare exact-token-budgeted, versioned source chunks for a coding query using the \
-         internal Tree-sitter index. Relevant symbol and call-site windows are ranked; sensitive, \
-         generated, binary, oversized, and excess files are excluded with explicit evidence."
+         internal Tree-sitter index and the optional local hybrid feature embedding. Relevant \
+         symbol and call-site windows are ranked; sensitive, generated, binary, oversized, and \
+         excess files are excluded with explicit evidence. The result states which retrieval \
+         strategy actually ran."
             .to_string(),
         object!({
             "type": "object",
@@ -3396,6 +3408,35 @@ mod tests {
         let context: Value = serde_json::from_str(&result_text(context)).unwrap();
         assert_eq!(context[0]["path"], "worker.py");
         assert!(context[0]["score"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn opt_in_local_embeddings_are_visible_in_context_evidence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("identity.rs"),
+            "pub fn authenticate_user(credentials: Credentials) { validate(credentials); }\n",
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("widget.rs"), "pub fn render() {}\n").unwrap();
+        let mut config = enabled_config();
+        config.embeddings = true;
+
+        let context = execute(
+            &config,
+            CallToolRequestParams::new(SELECT_CONTEXT_TOOL_NAME).with_arguments(object!({
+                "query": "login credential checks"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let context: Value = serde_json::from_str(&result_text(context)).unwrap();
+
+        assert_eq!(context[0]["path"], "identity.rs");
+        assert!(context[0]["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("local_embedding".to_string())));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::coding::embedding::hybrid_context_candidates;
 use crate::coding::file::{FileReadOptions, FileSnapshot, MAX_READ_LIMIT, MIN_READ_LIMIT};
 use crate::coding::intelligence::{ContextCandidate, RepositoryIndex};
 use crate::coding::workspace::CodingWorkspace;
@@ -30,14 +31,35 @@ impl<'a> ContextPlanner<'a> {
         query: &str,
         limits: ContextLimits,
     ) -> Result<ContextBundle, ContextError> {
+        self.prepare_with_retrieval(query, limits, ContextRetrieval::Lexical)
+    }
+
+    pub fn prepare_with_local_embeddings(
+        &self,
+        query: &str,
+        limits: ContextLimits,
+    ) -> Result<ContextBundle, ContextError> {
+        self.prepare_with_retrieval(query, limits, ContextRetrieval::HybridLocalEmbedding)
+    }
+
+    fn prepare_with_retrieval(
+        &self,
+        query: &str,
+        limits: ContextLimits,
+        retrieval: ContextRetrieval,
+    ) -> Result<ContextBundle, ContextError> {
         limits.validate()?;
         if query.trim().is_empty() {
             return Err(ContextError::EmptyQuery);
         }
         let tokenizer = context_tokenizer()?;
-        let mut candidates = self
-            .index
-            .context_candidates(query, (limits.max_files * 4).min(200))?;
+        let candidate_limit = (limits.max_files * 4).min(200);
+        let mut candidates = match retrieval {
+            ContextRetrieval::Lexical => self.index.context_candidates(query, candidate_limit)?,
+            ContextRetrieval::HybridLocalEmbedding => {
+                hybrid_context_candidates(self.index, query, candidate_limit)?
+            }
+        };
         append_fallback_candidates(self.index, &mut candidates);
 
         let generated = self
@@ -153,6 +175,7 @@ impl<'a> ContextPlanner<'a> {
             omissions,
             truncated,
             source_fingerprint: self.index.source_fingerprint.clone(),
+            retrieval,
         })
     }
 }
@@ -213,6 +236,16 @@ pub struct ContextBundle {
     pub omissions: Vec<ContextOmission>,
     pub truncated: bool,
     pub source_fingerprint: String,
+    #[serde(default)]
+    pub retrieval: ContextRetrieval,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRetrieval {
+    #[default]
+    Lexical,
+    HybridLocalEmbedding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +466,8 @@ pub enum ContextError {
     Tokenizer(String),
     #[error(transparent)]
     Intelligence(#[from] crate::coding::intelligence::IntelligenceError),
+    #[error(transparent)]
+    Embedding(#[from] crate::coding::embedding::EmbeddingError),
 }
 
 #[cfg(test)]
@@ -483,6 +518,7 @@ mod tests {
         assert!(bundle.chunks[0].end_line >= 90);
         assert!(bundle.chunks[0].content.contains("process_invoice"));
         assert!(bundle.chunks[0].digest.starts_with("blake3:"));
+        assert_eq!(bundle.retrieval, ContextRetrieval::Lexical);
         assert_eq!(
             bundle.used_tokens,
             bundle
@@ -490,6 +526,15 @@ mod tests {
                 .iter()
                 .map(|chunk| chunk.token_count)
                 .sum::<usize>()
+        );
+
+        let mut legacy = serde_json::to_value(&bundle).unwrap();
+        legacy.as_object_mut().unwrap().remove("retrieval");
+        assert_eq!(
+            serde_json::from_value::<ContextBundle>(legacy)
+                .unwrap()
+                .retrieval,
+            ContextRetrieval::Lexical
         );
     }
 
@@ -531,5 +576,29 @@ mod tests {
                 }
             )
             .is_err());
+    }
+
+    #[test]
+    fn reports_opt_in_hybrid_local_embedding_retrieval() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("identity.rs"),
+            "pub fn authenticate_user() {}\n",
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("widget.rs"), "pub fn render() {}\n").unwrap();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let index =
+            RepositoryIntelligence::build(&workspace, IntelligenceLimits::default()).unwrap();
+
+        let bundle = ContextPlanner::new(&workspace, &index)
+            .prepare_with_local_embeddings("login credentials", ContextLimits::default())
+            .unwrap();
+
+        assert_eq!(bundle.retrieval, ContextRetrieval::HybridLocalEmbedding);
+        assert_eq!(bundle.chunks[0].path, PathBuf::from("identity.rs"));
+        assert!(bundle.chunks[0]
+            .reasons
+            .contains(&"local_embedding".to_string()));
     }
 }

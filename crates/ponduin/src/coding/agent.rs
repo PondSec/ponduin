@@ -62,9 +62,12 @@ impl CodingAgent {
              require the internal workflow: start, inspect/search, set a complete plan, begin \
              editing, apply bounded changes, begin validation, run actual checks, begin review, \
              then complete with the evidence-backed report. Never claim a check passed from model \
-             text; process results are recorded automatically. Mode-specific strategy: {} {}",
+             text; process results are recorded automatically. Optional local retrieval: LSP={}, \
+             feature_embeddings={}. Mode-specific strategy: {} {}",
             self.config.task_mode,
             self.config.plan_file_threshold,
+            self.config.lsp,
+            self.config.embeddings,
             self.config.task_mode.prompt_guidance(),
             capabilities.prompt_guidance()
         ))

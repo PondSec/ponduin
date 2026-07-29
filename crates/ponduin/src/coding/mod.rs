@@ -8,6 +8,7 @@ pub mod capabilities;
 pub mod config;
 pub mod context;
 pub mod diagnostic;
+pub mod embedding;
 pub mod file;
 pub mod git;
 pub mod instructions;
@@ -33,6 +34,7 @@ pub use capabilities::{
 pub use config::CodingConfig;
 pub use context::ContextPlanner;
 pub use diagnostic::DiagnosticAnalyzer;
+pub use embedding::LocalEmbeddingIndex;
 pub use file::FileSnapshot;
 pub use git::GitRepository;
 pub use instructions::RepositoryInstructions;
