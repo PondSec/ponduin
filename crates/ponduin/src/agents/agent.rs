@@ -1985,6 +1985,7 @@ impl Agent {
             let mut consecutive_stop_hook_blocks = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
             let mut can_drain_pending_steers = false;
+            let mut coding_tools_active = false;
 
             loop {
                 if is_token_cancelled(&cancel_token) {
@@ -2274,10 +2275,17 @@ impl Agent {
 
                                     // Track extension requests
                                     let mut enable_extension_request_ids = vec![];
+                                    let mut coding_activation_request_ids = vec![];
                                     for request in &remaining_requests {
                                         if let Ok(tool_call) = &request.tool_call {
                                             if tool_call.name == MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE {
                                                 enable_extension_request_ids.push(request.id.clone());
+                                            }
+                                            if tool_call.name
+                                                == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME
+                                            {
+                                                coding_activation_request_ids
+                                                    .push(request.id.clone());
                                             }
                                         }
                                     }
@@ -2313,6 +2321,7 @@ impl Agent {
 
                                     let mut combined = stream::select_all(with_id);
                                     let mut all_install_successful = true;
+                                    let mut all_coding_activations_successful = true;
 
                                     loop {
                                         if is_token_cancelled(&cancel_token) {
@@ -2358,6 +2367,11 @@ impl Agent {
                                                                 {
                                                                     all_install_successful = false;
                                                                 }
+                                                                if coding_activation_request_ids.contains(&request_id)
+                                                                    && output.is_err()
+                                                                {
+                                                                    all_coding_activations_successful = false;
+                                                                }
                                                                 if let Some(response) = request_to_response_map.get_mut(&request_id) {
                                                                     let metadata = request_metadata.get(&request_id).and_then(|m| m.as_ref());
                                                                     response.add_tool_response_with_metadata(request_id, output, metadata);
@@ -2380,6 +2394,12 @@ impl Agent {
                                         if let Err(e) = self.save_extension_state(&session_config).await {
                                             warn!("Failed to save extension state after runtime changes: {}", e);
                                         }
+                                        tools_updated = true;
+                                    }
+                                    if all_coding_activations_successful
+                                        && !coding_activation_request_ids.is_empty()
+                                    {
+                                        coding_tools_active = true;
                                         tools_updated = true;
                                     }
                                 }
@@ -2700,8 +2720,18 @@ impl Agent {
                 can_drain_pending_steers = true;
 
                 if tools_updated {
+                    let coding_exposure = if coding_tools_active {
+                        super::reply_parts::CodingToolExposure::Active
+                    } else {
+                        super::reply_parts::CodingToolExposure::Routed
+                    };
                     (tools, toolshim_tools, system_prompt, _) =
-                        self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
+                        self.prepare_tools_and_prompt_with_coding(
+                            &session_config.id,
+                            &session.working_dir,
+                            coding_exposure,
+                        )
+                        .await?;
                 }
 
                 {
@@ -2711,8 +2741,18 @@ impl Agent {
                         .await
                         .load_subdirectory_hints(&working_dir);
                     if has_new_hints && !tools_updated {
+                        let coding_exposure = if coding_tools_active {
+                            super::reply_parts::CodingToolExposure::Active
+                        } else {
+                            super::reply_parts::CodingToolExposure::Routed
+                        };
                         (tools, toolshim_tools, system_prompt, _) =
-                            self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
+                            self.prepare_tools_and_prompt_with_coding(
+                                &session_config.id,
+                                &session.working_dir,
+                                coding_exposure,
+                            )
+                            .await?;
                     }
                 }
 
@@ -3865,6 +3905,54 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         call_count: AtomicUsize,
     }
 
+    struct CodingDisclosureProvider {
+        call_count: AtomicUsize,
+        snapshots: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl CodingDisclosureProvider {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                snapshots: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for CodingDisclosureProvider {
+        async fn stream(
+            &self,
+            _model_config: &ponduin_providers::model::ModelConfig,
+            system_prompt: &str,
+            _messages: &[Message],
+            tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.snapshots.lock().unwrap().push((
+                system_prompt.to_string(),
+                tools.iter().map(|tool| tool.name.to_string()).collect(),
+            ));
+            let message = if call == 0 {
+                Message::assistant().with_tool_request(
+                    "activate-coding",
+                    Ok(
+                        CallToolRequestParams::new(crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+                            .with_arguments(serde_json::Map::new()),
+                    ),
+                )
+            } else {
+                Message::assistant().with_text(format!("provider response {call}"))
+            };
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            Ok(stream_from_single_message(message, usage))
+        }
+
+        fn get_name(&self) -> &str {
+            "coding-disclosure"
+        }
+    }
+
     impl CountingTextProvider {
         fn new() -> Self {
             Self {
@@ -3895,6 +3983,49 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         fn get_name(&self) -> &str {
             "counting-text"
         }
+    }
+
+    #[tokio::test]
+    async fn coding_tools_are_disclosed_after_activation_and_reset_next_reply() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let provider = Arc::new(CodingDisclosureProvider::new());
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
+        let (agent, session_id) =
+            create_test_agent(temp_dir.path().join("data"), hook_manager, provider.clone()).await?;
+
+        run_stop_hook_test_turn(&agent, &session_id, "Implement the requested change").await?;
+        run_stop_hook_test_turn(&agent, &session_id, "Now answer without project work").await?;
+
+        let snapshots = provider.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 3);
+
+        let (routing_prompt, routing_tools) = &snapshots[0];
+        assert!(routing_prompt.contains("disclosed on demand"));
+        assert!(routing_tools
+            .iter()
+            .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
+        assert!(!routing_tools
+            .iter()
+            .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+
+        let (active_prompt, active_tools) = &snapshots[1];
+        assert!(active_prompt.contains("Internal coding capabilities are active"));
+        assert!(!active_tools
+            .iter()
+            .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
+        assert!(active_tools
+            .iter()
+            .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+
+        let (next_routing_prompt, next_routing_tools) = &snapshots[2];
+        assert!(next_routing_prompt.contains("disclosed on demand"));
+        assert!(next_routing_tools
+            .iter()
+            .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
+        assert!(!next_routing_tools
+            .iter()
+            .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        Ok(())
     }
 
     struct ChunkedTextProvider;

@@ -76,6 +76,10 @@ impl PermissionInspector {
             return None;
         }
 
+        if tool_name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME {
+            return (ponduin_mode != PonduinMode::Chat).then_some(InspectionAction::Allow);
+        }
+
         let user_permission = self.permission_manager.get_user_permission(tool_name);
         Some(match ponduin_mode {
             PonduinMode::Chat => return None,
@@ -448,6 +452,23 @@ mod tests {
         .await;
 
         assert_eq!(action, expected);
+    }
+
+    #[test_case(PonduinMode::Auto; "auto")]
+    #[test_case(PonduinMode::Approve; "approve")]
+    #[test_case(PonduinMode::SmartApprove; "smart_approve")]
+    #[tokio::test]
+    async fn coding_activation_never_requires_user_approval(mode: PonduinMode) {
+        let (action, _) = inspect_named_tool(
+            crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME,
+            mode,
+            false,
+            Some(PermissionLevel::NeverAllow),
+            Some(PermissionLevel::AskBefore),
+        )
+        .await;
+
+        assert_eq!(action, InspectionAction::Allow);
     }
 
     #[test]
