@@ -5,6 +5,26 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const MAX_RECORDED_WALK_ERRORS: usize = 20;
+pub(crate) const DEFAULT_EXCLUDED_DIRECTORIES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    "target",
+    ".cache",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".next",
+    ".nuxt",
+    "coverage",
+    "vendor",
+];
 
 /// Side-effect-free repository inventory used before deeper indexing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +57,10 @@ impl RepositoryProfile {
             .require_git(false)
             .ignore(true)
             .hidden(true)
-            .follow_links(false);
+            .follow_links(false)
+            .filter_entry(|entry| {
+                entry.depth() == 0 || !is_default_excluded_directory(entry.path())
+            });
 
         let mut manifests = Vec::new();
         let mut languages = BTreeMap::new();
@@ -184,6 +207,12 @@ fn detect_version_control(root: &Path) -> VersionControl {
     }
 }
 
+pub(crate) fn is_default_excluded_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| DEFAULT_EXCLUDED_DIRECTORIES.contains(&name))
+}
+
 fn manifest_kind(path: &Path) -> Option<ManifestKind> {
     let file_name = path.file_name()?.to_str()?;
     match file_name {
@@ -322,6 +351,27 @@ mod tests {
 
         assert_eq!(profile.languages.get(&Language::Rust), Some(&1));
         assert!(!profile.languages.contains_key(&Language::Python));
+    }
+
+    #[test]
+    fn excludes_dependency_build_and_cache_directories_without_gitignore() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        for directory in ["node_modules", "target", "dist", ".venv", ".cache"] {
+            fs::create_dir_all(temp_dir.path().join(directory)).unwrap();
+            fs::write(
+                temp_dir.path().join(directory).join("ignored.py"),
+                "def ignored(): pass",
+            )
+            .unwrap();
+        }
+        fs::write(temp_dir.path().join("visible.rs"), "fn visible() {}").unwrap();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+
+        let profile = RepositoryProfile::discover(&workspace, 100).unwrap();
+
+        assert_eq!(profile.languages.get(&Language::Rust), Some(&1));
+        assert!(!profile.languages.contains_key(&Language::Python));
+        assert_eq!(profile.scanned_files, 1);
     }
 
     #[test]

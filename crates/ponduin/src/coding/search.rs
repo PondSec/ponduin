@@ -1,3 +1,4 @@
+use crate::coding::repository::is_default_excluded_directory;
 use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -170,7 +171,10 @@ impl<'workspace> RepositorySearch<'workspace> {
         let filter_scope = scope.clone();
         builder.filter_entry(move |entry| {
             let path = entry.path();
-            path == filter_root || filter_scope.starts_with(path) || path.starts_with(&filter_scope)
+            (path == filter_root
+                || filter_scope.starts_with(path)
+                || path.starts_with(&filter_scope))
+                && (entry.depth() == 0 || !is_default_excluded_directory(path))
         });
 
         for entry in builder.build() {
@@ -557,6 +561,43 @@ mod tests {
 
         assert!(result.matches.is_empty());
         assert_eq!(result.skipped_sensitive, 1);
+    }
+
+    #[test]
+    fn excludes_dependency_build_and_cache_directories_without_gitignore() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        for directory in ["node_modules", "target", "dist", ".venv", ".cache"] {
+            fs::create_dir_all(temp_dir.path().join(directory)).unwrap();
+            fs::write(
+                temp_dir.path().join(directory).join("ignored.ts"),
+                "const DEFAULT_EXCLUDED_MATCH = true;",
+            )
+            .unwrap();
+        }
+        fs::write(
+            temp_dir.path().join("visible.ts"),
+            "const VISIBLE_MATCH = true;",
+        )
+        .unwrap();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let search = RepositorySearch::new(&workspace);
+
+        let result = search
+            .search_text(
+                &TextSearchRequest {
+                    pattern: "MATCH".to_string(),
+                    scope: PathBuf::from("."),
+                    regex: false,
+                    case_sensitive: true,
+                    include: Vec::new(),
+                },
+                SearchLimits::default(),
+            )
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].path, PathBuf::from("visible.ts"));
+        assert_eq!(result.scanned_files, 1);
     }
 
     #[cfg(unix)]

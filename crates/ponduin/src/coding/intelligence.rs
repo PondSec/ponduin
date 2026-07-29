@@ -1,4 +1,5 @@
 use crate::code_analysis::parser::Parser;
+use crate::coding::repository::{is_default_excluded_directory, DEFAULT_EXCLUDED_DIRECTORIES};
 use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::workspace::CodingWorkspace;
 use ignore::WalkBuilder;
@@ -10,27 +11,6 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 const MAX_RECORDED_WARNINGS: usize = 20;
-const EXCLUDED_DIRECTORIES: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    ".venv",
-    "venv",
-    "dist",
-    "build",
-    "target",
-    ".cache",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".next",
-    ".nuxt",
-    "coverage",
-    "vendor",
-];
-
 #[derive(Debug)]
 pub struct RepositoryIntelligence;
 
@@ -50,7 +30,9 @@ impl RepositoryIntelligence {
             .ignore(true)
             .hidden(false)
             .follow_links(false)
-            .filter_entry(|entry| entry.depth() == 0 || !is_excluded_directory(entry.path()));
+            .filter_entry(|entry| {
+                entry.depth() == 0 || !is_default_excluded_directory(entry.path())
+            });
 
         let parser = Parser::new();
         let mut files = Vec::new();
@@ -211,7 +193,7 @@ impl RepositoryIntelligence {
             entry_points: entry_points.into_iter().collect(),
             config_files: config_files.into_iter().collect(),
             generated_files: generated_files.into_iter().collect(),
-            excluded_directory_names: EXCLUDED_DIRECTORIES
+            excluded_directory_names: DEFAULT_EXCLUDED_DIRECTORIES
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
@@ -238,7 +220,9 @@ impl RepositoryIntelligence {
             .ignore(true)
             .hidden(false)
             .follow_links(false)
-            .filter_entry(|entry| entry.depth() == 0 || !is_excluded_directory(entry.path()));
+            .filter_entry(|entry| {
+                entry.depth() == 0 || !is_default_excluded_directory(entry.path())
+            });
         let mut entries = Vec::new();
         let mut scanned = 0usize;
         for entry in builder.build().filter_map(Result::ok) {
@@ -537,12 +521,6 @@ fn read_utf8_bounded(path: &Path, max_bytes: usize) -> io::Result<Option<String>
         return Ok(None);
     }
     Ok(String::from_utf8(bytes).ok())
-}
-
-fn is_excluded_directory(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| EXCLUDED_DIRECTORIES.contains(&name))
 }
 
 fn classify_repository_path(
