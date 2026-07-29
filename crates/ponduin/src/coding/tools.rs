@@ -752,6 +752,21 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with(CODING_TOOL_PREFIX)
 }
 
+pub(crate) fn conflicts_with_internal_project_tools(name: &str) -> bool {
+    let local_name = name.rsplit("__").next().unwrap_or(name);
+    matches!(
+        local_name,
+        "analyze"
+            | "edit"
+            | "execute_typescript"
+            | "get_function_details"
+            | "list_functions"
+            | "shell"
+            | "tree"
+            | "write"
+    )
+}
+
 fn is_repository_activity(name: &str) -> bool {
     matches!(
         name,
@@ -3330,6 +3345,32 @@ mod tests {
             assert_eq!(annotations.read_only_hint, Some(!destructive && !stateful));
             assert_eq!(annotations.destructive_hint, Some(destructive));
             assert_eq!(annotations.open_world_hint, Some(false));
+        }
+    }
+
+    #[test]
+    fn internal_agent_suppresses_only_conflicting_generic_project_tools() {
+        for name in [
+            "analyze",
+            "developer__edit",
+            "execute_typescript",
+            "get_function_details",
+            "list_functions",
+            "developer__shell",
+            "tree",
+            "write",
+        ] {
+            assert!(conflicts_with_internal_project_tools(name), "{name}");
+        }
+        for name in [
+            "delegate",
+            "load",
+            "load_skill",
+            "read_image",
+            "platform__manage_schedule",
+            APPLY_CHANGES_TOOL_NAME,
+        ] {
+            assert!(!conflicts_with_internal_project_tools(name), "{name}");
         }
     }
 

@@ -199,7 +199,12 @@ impl Agent {
     ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
         let ponduin_mode = *self.current_ponduin_mode.lock().await;
         let mut tools = self.list_tools(session_id, None).await;
-        if coding_exposure != CodingToolExposure::Active {
+        if coding_exposure == CodingToolExposure::Active {
+            tools.retain(|tool| {
+                crate::coding::tools::is_reserved_name(&tool.name)
+                    || !crate::coding::tools::conflicts_with_internal_project_tools(&tool.name)
+            });
+        } else {
             tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
         }
         if coding_exposure == CodingToolExposure::Routed {
@@ -1016,6 +1021,10 @@ mod tests {
         assert!(!active_names.contains(&crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
         assert!(active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
         assert!(active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(active_names
+            .iter()
+            .all(|name| crate::coding::tools::is_reserved_name(name)
+                || !crate::coding::tools::conflicts_with_internal_project_tools(name)));
         assert!(active_system_prompt.contains("Internal coding capabilities are active"));
         assert!(!active_system_prompt.contains("bounded semantic routing decision"));
 
