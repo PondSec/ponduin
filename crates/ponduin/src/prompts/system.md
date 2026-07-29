@@ -29,7 +29,10 @@ in your tool specification.
 {% endfor %}
 
 {% else %}
-No extensions are defined. You should let the user know that they should add extensions.
+No extensions are defined. Direct platform or internal capabilities may still be present in
+your tool specification. Use those capabilities normally. Never claim that repository or tool
+access is unavailable merely because no extensions are configured; mention extensions only when
+the task truly requires a capability that is absent from the available tools.
 {% endif %}
 {% endif %}
 

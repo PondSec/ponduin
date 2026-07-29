@@ -416,6 +416,18 @@ mod tests {
     }
 
     #[test]
+    fn no_extensions_do_not_disclaim_direct_tool_access() {
+        let manager = PromptManager::with_timestamp(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+
+        let system_prompt = manager.builder().build();
+
+        assert!(system_prompt.contains("Direct platform or internal capabilities"));
+        assert!(system_prompt.contains("Never claim that repository or tool"));
+        assert!(system_prompt.contains("access is unavailable"));
+        assert!(!system_prompt.contains("should add extensions"));
+    }
+
+    #[test]
     fn test_one_extension() {
         let manager = PromptManager::with_timestamp(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
 
