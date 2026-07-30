@@ -3,7 +3,7 @@
 
 # Ponduin
 
-**Local AI Agent · Privacy First**
+**Local AI Agent Privacy First**
 
 Ponduin is a local AI agent developed by [PondSec](https://pondsec.com). It combines
 private on-device operation with model-independent automation for coding, terminal
