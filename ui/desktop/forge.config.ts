@@ -1,6 +1,7 @@
 const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 const { resolve } = require('path');
+const { readdir, rm } = require('fs/promises');
 
 const isLinuxVulkanBuild = process.env.PONDUIN_DESKTOP_LINUX_VARIANT === 'vulkan';
 
@@ -10,6 +11,26 @@ let cfg = {
   appCategoryType: 'public.app-category.developer-tools',
   appCopyright: 'Copyright © PondSec',
   extraResource: ['src/bin', 'src/images', 'src/app-update.yml'],
+  afterCopyExtraResources: [
+    (buildPath, _electronVersion, platform, _arch, callback) => {
+      const resourcesPath =
+        platform === 'darwin'
+          ? resolve(buildPath, 'Ponduin.app', 'Contents', 'Resources')
+          : resolve(buildPath, 'resources');
+      const bundledBinPath = resolve(resourcesPath, 'bin');
+
+      readdir(bundledBinPath)
+        .then((names) =>
+          Promise.all(
+            names
+              .filter((name) => /^ponduin \d+$/.test(name))
+              .map((name) => rm(resolve(bundledBinPath, name), { force: true }))
+          )
+        )
+        .then(() => callback())
+        .catch(callback);
+    },
+  ],
   icon: 'src/images/icon',
   // Windows specific configuration
   win32: {
