@@ -43,7 +43,19 @@ export const test = base.extend<PonduinTestFixtures>({
 
       // Start the electron-forge process with Playwright remote debugging enabled
       // Use detached mode on Unix to create a process group we can kill together
-      appProcess = spawn('pnpm', ['run', 'start-gui'], {
+      const startGuiArgs = ['run', 'start-gui'];
+      const e2eWorkingDir = process.env.PONDUIN_E2E_WORKING_DIR;
+      const e2eUserDataDir = process.env.PONDUIN_E2E_USER_DATA_DIR;
+      if (e2eWorkingDir || e2eUserDataDir) {
+        startGuiArgs.push('--');
+        if (e2eWorkingDir) {
+          startGuiArgs.push('--dir', e2eWorkingDir);
+        }
+        if (e2eUserDataDir) {
+          startGuiArgs.push('--user-data-dir', e2eUserDataDir);
+        }
+      }
+      appProcess = spawn('pnpm', startGuiArgs, {
         cwd: join(__dirname, '../..'),
         stdio: 'pipe',
         detached: process.platform !== 'win32',
@@ -52,6 +64,7 @@ export const test = base.extend<PonduinTestFixtures>({
           ELECTRON_IS_DEV: '1',
           NODE_ENV: 'development',
           PONDUIN_ALLOWLIST_BYPASS: 'true',
+          PONDUIN_E2E_PATH_ROOT: e2eUserDataDir,
           ENABLE_PLAYWRIGHT: 'true',
           PLAYWRIGHT_DEBUG_PORT: debugPort.toString(), // Unique port per test for parallel execution
           RUST_LOG: 'info', // Enable info-level logging for ponduind backend
@@ -72,7 +85,8 @@ export const test = base.extend<PonduinTestFixtures>({
       // Wait for the app to start and remote debugging to be available
       // Retry connection until it succeeds (app is ready) or timeout
       console.log(`Waiting for Electron app to start on port ${debugPort}...`);
-      const maxRetries = 100; // 100 retries * 100ms = 10 seconds max
+      const isLiveAgentE2e = process.env.PONDUIN_LIVE_AGENT_E2E === '1';
+      const maxRetries = isLiveAgentE2e ? 600 : 100; // Live local-model runs may need a cold 60-second start.
       const retryDelay = 100; // 100ms between retries
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {

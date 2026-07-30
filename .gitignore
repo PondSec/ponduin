@@ -95,3 +95,15 @@ ponduinselftest/
 /crates/ponduin-sdk/examples/uniffi/kotlin/.gradle/
 /crates/ponduin-sdk/examples/uniffi/kotlin/.kotlin/
 /crates/ponduin-sdk/examples/uniffi/kotlin/build/
+
+# Generated desktop binaries
+ui/desktop/src/bin/ponduin
+ui/desktop/src/bin/ponduin [0-9]*
+ui/desktop/src/bin/*.dSYM/
+ui/desktop/src/bin/*.app/
+
+# Accidental macOS duplicate files
+**/* 2
+**/* 3
+**/* 4
+**/* 5

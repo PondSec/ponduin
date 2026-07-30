@@ -104,8 +104,8 @@ impl ModelCapabilityProfile {
             .max_files_per_batch
             .min(strategy_change_limit)
             .min(suitability_change_limit);
-        let recommended_plan_file_threshold = if context_class == ContextClass::Compact
-            || !reasoning
+        let recommended_plan_file_threshold = if tool_transport == ToolTransport::EmulatedJson
+            || context_class == ContextClass::Compact
             || coding_suitability == CodingSuitability::Limited
         {
             1
@@ -349,6 +349,19 @@ mod tests {
         assert_eq!(profile.recommended_plan_file_threshold, 4);
         assert!(profile.prompt_guidance().contains("context_window=300000"));
         assert!(profile.prompt_guidance().contains("tool_calling=unknown"));
+    }
+
+    #[test]
+    fn native_non_reasoning_models_keep_the_configured_planning_threshold() {
+        let mut model = ModelConfig::new("native");
+        model.context_limit = Some(128_000);
+        model.max_tokens = Some(4_096);
+        model.reasoning = Some(false);
+
+        let profile = ModelCapabilityProfile::detect(&model, &coding_config());
+
+        assert_eq!(profile.tool_transport, ToolTransport::Native);
+        assert_eq!(profile.recommended_plan_file_threshold, 4);
     }
 
     #[test]

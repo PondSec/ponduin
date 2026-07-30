@@ -215,10 +215,11 @@ impl Agent {
         }
 
         #[cfg(feature = "code-mode")]
-        let code_execution_active = self
-            .extension_manager
-            .is_extension_enabled(code_execution::EXTENSION_NAME)
-            .await;
+        let code_execution_active = coding_exposure != CodingToolExposure::Active
+            && self
+                .extension_manager
+                .is_extension_enabled(code_execution::EXTENSION_NAME)
+                .await;
         #[cfg(not(feature = "code-mode"))]
         let code_execution_active = false;
         #[cfg(feature = "code-mode")]
@@ -275,11 +276,16 @@ impl Agent {
         tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Prepare system prompt
-        let extensions_info = self
-            .extension_manager
-            .get_extensions_info(working_dir)
-            .await;
-        let (extension_count, _) = self.total_extension_and_tool_counts(session_id).await;
+        let extensions_info = if coding_exposure == CodingToolExposure::Active {
+            Vec::new()
+        } else {
+            self.extension_manager.get_extensions_info(working_dir).await
+        };
+        let (extension_count, _) = if coding_exposure == CodingToolExposure::Active {
+            (0, 0)
+        } else {
+            self.total_extension_and_tool_counts(session_id).await
+        };
         let tool_count = tools.len();
 
         let model_config = self.model_config_for_session(session_id).await?;

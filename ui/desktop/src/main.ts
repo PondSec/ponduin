@@ -56,6 +56,10 @@ import installExtension, { REACT_DEVELOPER_TOOLS } from 'electron-devtools-insta
 import { BLOCKED_PROTOCOLS, WEB_PROTOCOLS } from './utils/urlSecurity';
 import { buildCSP } from './utils/csp';
 
+if (process.env.PONDUIN_E2E_USER_DATA_DIR) {
+  app.setPath('userData', process.env.PONDUIN_E2E_USER_DATA_DIR);
+}
+
 function shouldSetupUpdater(): boolean {
   // Setup updater if either the flag is enabled OR dev updates are enabled
   return UPDATES_ENABLED || process.env.ENABLE_DEV_UPDATES === 'true';
@@ -1150,7 +1154,16 @@ const createChat = async (
         dir: workingDir,
         tls: true,
         env: {
-          PONDUIN_PATH_ROOT: appConfig.PONDUIN_PATH_ROOT as string | undefined,
+          PONDUIN_PATH_ROOT:
+            process.env.PONDUIN_E2E_PATH_ROOT ??
+            (appConfig.PONDUIN_PATH_ROOT as string | undefined),
+          PONDUIN_PROVIDER: process.env.PONDUIN_E2E_PATH_ROOT
+            ? process.env.PONDUIN_DEFAULT_PROVIDER
+            : undefined,
+          PONDUIN_MODEL: process.env.PONDUIN_E2E_PATH_ROOT
+            ? process.env.PONDUIN_DEFAULT_MODEL
+            : undefined,
+          PONDUIN_MODE: process.env.PONDUIN_E2E_PATH_ROOT ? 'auto' : undefined,
         },
         isPackaged: app.isPackaged,
         resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
