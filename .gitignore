@@ -107,3 +107,6 @@ ui/desktop/src/bin/*.app/
 **/* 3
 **/* 4
 **/* 5
+
+# Local source backups
+*.backup-*

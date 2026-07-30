@@ -510,9 +510,21 @@ async function runGitHubCli(
         windowsHide: true,
         env: githubCliEnvironment(),
       },
-      (error, stdout) => {
+      (error, stdout, stderr) => {
         if (error) {
-          reject(new Error('Authenticated GitHub CLI operation failed'));
+          const details = [
+            `command=${executable}`,
+            `args=${JSON.stringify(args)}`,
+            `exitCode=${error.code ?? 'unknown'}`,
+            `signal=${error.signal ?? 'none'}`,
+            `killed=${error.killed ?? false}`,
+            `message=${error.message}`,
+            `stderr=${String(stderr || '').trim() || '<empty>'}`,
+            `stdout=${String(stdout || '').trim() || '<empty>'}`,
+          ].join(' | ');
+
+          log.error(`GitHub CLI operation failed: ${details}`);
+          reject(new Error(`GitHub CLI operation failed: ${details}`));
         } else {
           resolve(stdout);
         }
