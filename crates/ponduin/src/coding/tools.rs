@@ -127,6 +127,14 @@ impl CodingToolState {
         definitions_for_workflow(context.as_ref())
     }
 
+    pub(crate) fn compact_native_definitions_for_workspace(
+        &self,
+        workspace_root: &Path,
+    ) -> Vec<Tool> {
+        let context = self.workflow_tool_context(workspace_root);
+        compact_native_definitions(definitions_for_workflow(context.as_ref()), context.as_ref())
+    }
+
     pub(crate) fn workflow_guidance_for_workspace(&self, workspace_root: &Path) -> Option<String> {
         let context = self.workflow_tool_context(workspace_root)?;
         let status = &context.status;
@@ -142,6 +150,7 @@ impl CodingToolState {
                  begin_editing; do not repeat a completed transition."
                     .to_string()
             }
+            WorkflowPhase::Editing if status.repair_pending => repair_pending_guidance(),
             WorkflowPhase::Editing if status.changed_files.is_empty() => {
                 "The workflow is in Editing with no retained change. Call \
                  coding__apply_changes now. Phase-transition tools are intentionally withheld \
@@ -164,8 +173,12 @@ impl CodingToolState {
                     .to_string()
             }
             WorkflowPhase::Testing => {
-                "Run an actual discovered validation or bounded process now. The review \
-                 transition remains withheld until current-revision evidence exists."
+                "Run an actual check now. Use coding__run_validation only with an exact command \
+                 id returned by coding__project_capabilities; a file path or command text is not \
+                 a command id. If no matching discovered command exists, call \
+                 coding__run_process with its executable in program and only following arguments \
+                 in args. The review transition remains withheld until successful current-revision \
+                 evidence exists."
                     .to_string()
             }
             WorkflowPhase::Debugging => {
@@ -767,6 +780,19 @@ impl CodingToolState {
     }
 }
 
+fn repair_pending_guidance() -> String {
+    "A repair is active. The diagnostic path is the primary repair target: read that existing \
+     file before changing it, and do not create or rewrite another existing file unless the \
+     diagnostic proves it is the cause. For an undefined symbol, repair the failing file's import \
+     or reference before changing the symbol definition. Read every existing file you will write \
+     to obtain each file's current digest, then apply one substantive correction that directly \
+     addresses the latest process diagnostic in the conversation. Each write needs that target \
+     file's own expected_digest from coding__read_file; never reuse a digest or omit one in a \
+     multi-file change. Do not make formatting-only changes, repeat the failed content, or begin \
+     validation until that correction is retained."
+        .to_string()
+}
+
 pub fn definitions() -> Vec<Tool> {
     vec![
         repository_profile_tool(),
@@ -803,6 +829,205 @@ pub fn definitions() -> Vec<Tool> {
         review_changes_tool(),
         lsp_query_tool(),
     ]
+}
+
+fn compact_native_definitions(
+    tools: Vec<Tool>,
+    context: Option<&WorkflowToolContext>,
+) -> Vec<Tool> {
+    let phase = context.map(|context| context.status.phase);
+    tools
+        .into_iter()
+        .filter(|tool| compact_native_tool_allowed(tool.name.as_ref(), phase))
+        .map(compact_native_tool_schema)
+        .collect()
+}
+
+fn compact_native_tool_allowed(name: &str, phase: Option<WorkflowPhase>) -> bool {
+    match phase {
+        None => matches!(
+            name,
+            REPOSITORY_PROFILE_TOOL_NAME
+                | REPOSITORY_INSTRUCTIONS_TOOL_NAME
+                | FIND_FILES_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | APPLY_CHANGES_TOOL_NAME
+                | RUN_PROCESS_TOOL_NAME
+                | PROJECT_CAPABILITIES_TOOL_NAME
+                | WORKFLOW_START_TOOL_NAME
+        ),
+        Some(WorkflowPhase::Analyzing | WorkflowPhase::Searching) => matches!(
+            name,
+            REPOSITORY_PROFILE_TOOL_NAME
+                | REPOSITORY_INSTRUCTIONS_TOOL_NAME
+                | FIND_FILES_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | PROJECT_CAPABILITIES_TOOL_NAME
+                | WORKFLOW_SET_PLAN_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+        ),
+        Some(WorkflowPhase::Planning) => matches!(
+            name,
+            FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | WORKFLOW_TRANSITION_TOOL_NAME
+        ),
+        Some(WorkflowPhase::Editing) => matches!(
+            name,
+            FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | APPLY_CHANGES_TOOL_NAME
+                | ROLLBACK_CHANGES_TOOL_NAME
+                | GIT_STATUS_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | WORKFLOW_TRANSITION_TOOL_NAME
+        ),
+        Some(WorkflowPhase::Testing) => matches!(
+            name,
+            READ_FILE_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | PROJECT_CAPABILITIES_TOOL_NAME
+                | RUN_PROCESS_TOOL_NAME
+                | RUN_VALIDATION_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | WORKFLOW_TRANSITION_TOOL_NAME
+        ),
+        Some(WorkflowPhase::Debugging) => matches!(
+            name,
+            FIND_FILES_TOOL_NAME
+                | SEARCH_TEXT_TOOL_NAME
+                | READ_FILE_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | WORKFLOW_TRANSITION_TOOL_NAME
+        ),
+        Some(WorkflowPhase::Reviewing) => matches!(
+            name,
+            READ_FILE_TOOL_NAME
+                | GIT_STATUS_TOOL_NAME
+                | GIT_DIFF_TOOL_NAME
+                | GIT_STAGE_OWNED_TOOL_NAME
+                | GIT_COMMIT_OWNED_TOOL_NAME
+                | GIT_CREATE_BRANCH_TOOL_NAME
+                | GIT_PUSH_OWNED_TOOL_NAME
+                | REVIEW_CHANGES_TOOL_NAME
+                | WORKFLOW_STATUS_TOOL_NAME
+                | WORKFLOW_COMPLETE_TOOL_NAME
+        ),
+        Some(WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed) => false,
+    }
+}
+
+fn compact_native_tool_schema(mut tool: Tool) -> Tool {
+    match tool.name.as_ref() {
+        PREVIEW_CHANGES_TOOL_NAME | APPLY_CHANGES_TOOL_NAME => {
+            tool.description = Some(
+                "Apply safe workspace changes. create uses operation, path, content. write uses \
+                 operation, path, content, expected_digest from coding__read_file. move uses \
+                 operation, path, destination, expected_digest. delete uses operation, path, \
+                 expected_digest."
+                    .into(),
+            );
+            tool.input_schema = object!({
+                "type": "object",
+                "required": ["changes"],
+                "properties": {
+                    "changes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["operation", "path"],
+                            "properties": {
+                                "operation": {
+                                    "type": "string",
+                                    "enum": ["create", "write", "replace", "delete", "move"]
+                                },
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                                "expected_digest": {"type": "string"},
+                                "destination": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            })
+            .into();
+        }
+        WORKFLOW_SET_PLAN_TOOL_NAME => {
+            tool.description = Some(
+                "Set the active workflow plan. Include every planned new file in relevant_files, \
+                 the required checks in validation, and a concrete rollback_strategy."
+                    .into(),
+            );
+            tool.input_schema = object!({
+                "type": "object",
+                "required": ["workflow_id", "plan"],
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "plan": {
+                        "type": "object",
+                        "required": [
+                            "affected_components",
+                            "relevant_files",
+                            "risks",
+                            "intended_changes",
+                            "tests",
+                            "validation",
+                            "rollback_strategy"
+                        ],
+                        "properties": {
+                            "affected_components": {"type": "array", "items": {"type": "string"}},
+                            "relevant_files": {"type": "array", "items": {"type": "string"}},
+                            "risks": {"type": "array", "items": {"type": "string"}},
+                            "intended_changes": {"type": "array", "items": {"type": "string"}},
+                            "tests": {"type": "array", "items": {"type": "string"}},
+                            "validation": {"type": "array", "items": {"type": "string"}},
+                            "rollback_strategy": {"type": "string"}
+                        }
+                    }
+                }
+            })
+            .into();
+        }
+        RUN_PROCESS_TOOL_NAME => {
+            tool.description = Some(
+                "Run one bounded, non-interactive workspace process. program is the executable; \
+                 args contains only arguments after program and must never repeat the executable. \
+                 For Python unittest use program `python3` and args [\"-m\", \"unittest\", \"-v\"]."
+                    .into(),
+            );
+            tool.input_schema = object!({
+                "type": "object",
+                "required": ["program"],
+                "properties": {
+                    "program": {"type": "string"},
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Arguments after program only; do not repeat program here."
+                    },
+                    "cwd": {"type": "string"},
+                    "environment": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "timeout_seconds": {"type": ["integer", "null"]}
+                }
+            })
+            .into();
+        }
+        _ => {}
+    }
+    tool
 }
 
 fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> {
@@ -1063,6 +1288,15 @@ pub(crate) fn is_async_tool(name: &str) -> bool {
     )
 }
 
+fn validate_process_invocation(program: &str, args: &[String]) -> Result<(), ErrorData> {
+    if args.first().is_some_and(|argument| argument == program) {
+        return Err(invalid_arguments(format!(
+            "args must contain only arguments after program `{program}`; remove the duplicate executable from args"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute_async(
     config: &CodingConfig,
     state: &CodingToolState,
@@ -1083,6 +1317,7 @@ pub(crate) async fn execute_async(
     match tool_call.name.as_ref() {
         RUN_PROCESS_TOOL_NAME => {
             let params: RunProcessParams = parse_arguments(&tool_call)?;
+            validate_process_invocation(&params.program, &params.args)?;
             let evidence_program = params.program.clone();
             let evidence_args = params.args.clone();
             let timeout = params
@@ -2506,8 +2741,10 @@ fn workflow_complete_tool() -> Tool {
 fn run_validation_tool() -> Tool {
     Tool::new(
         RUN_VALIDATION_TOOL_NAME.to_string(),
-        "Run exactly one validation command id returned by coding__project_capabilities. The \
-         command is rediscovered before execution and runs through the bounded process policy. \
+        "Run exactly one validation command id returned by coding__project_capabilities. Never \
+         pass a file path, executable name, or command text as command_id; use \
+         coding__run_process when no exact discovered id exists. The command is rediscovered \
+         before execution and runs through the bounded process policy. \
          Results distinguish passed, failed, missing, unavailable, blocked, timed out, and \
          incomplete checks and are automatically attached to an active testing workflow."
             .to_string(),
@@ -3584,6 +3821,27 @@ mod tests {
             root,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rejects_a_process_argument_that_repeats_the_program() {
+        let args = vec![
+            "python3".to_string(),
+            "-m".to_string(),
+            "unittest".to_string(),
+        ];
+
+        assert!(validate_process_invocation("python3", &args).is_err());
+        assert!(validate_process_invocation("python3", &args[1..]).is_ok());
+    }
+
+    #[test]
+    fn repair_guidance_prioritizes_the_diagnostic_file_and_per_file_digests() {
+        let guidance = repair_pending_guidance();
+
+        assert!(guidance.contains("diagnostic path is the primary repair target"));
+        assert!(guidance.contains("undefined symbol"));
+        assert!(guidance.contains("file's own expected_digest"));
     }
 
     #[test]

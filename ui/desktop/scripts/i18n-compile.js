@@ -20,8 +20,21 @@ for (const file of files) {
   const locale = path.basename(file, '.json');
   const inFile = path.join(messagesDir, file).split(path.sep).join('/');
   const outFile = path.join(compiledDir, `${locale}.json`);
-  execFileSync(process.execPath, [formatjs, 'compile', inFile, '--out-file', outFile], {
-    stdio: 'inherit',
-    cwd: projectDir,
-  });
+  const tempFile = `${outFile}.tmp`;
+  try {
+    execFileSync(process.execPath, [formatjs, 'compile', inFile, '--out-file', tempFile], {
+      stdio: 'inherit',
+      cwd: projectDir,
+    });
+    const unchanged = fs.existsSync(outFile) && fs.readFileSync(outFile).equals(fs.readFileSync(tempFile));
+    if (unchanged) {
+      fs.unlinkSync(tempFile);
+    } else {
+      fs.renameSync(tempFile, outFile);
+    }
+  } finally {
+    if (fs.existsSync(tempFile)) {
+      fs.unlinkSync(tempFile);
+    }
+  }
 }

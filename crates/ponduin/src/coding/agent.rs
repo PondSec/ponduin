@@ -38,13 +38,27 @@ impl CodingAgent {
     }
 
     pub fn tools_for_workspace(&self, ponduin_mode: PonduinMode, working_dir: &Path) -> Vec<Tool> {
+        self.tools_for_workspace_for_model(ponduin_mode, working_dir, &ModelConfig::new("unknown"))
+    }
+
+    pub fn tools_for_workspace_for_model(
+        &self,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        model_config: &ModelConfig,
+    ) -> Vec<Tool> {
         if !self.available(ponduin_mode) {
             return Vec::new();
         }
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return tools::definitions();
         };
-        self.tool_state.definitions_for_workspace(workspace.root())
+        if uses_compact_native_coding_tools(model_config) {
+            self.tool_state
+                .compact_native_definitions_for_workspace(workspace.root())
+        } else {
+            self.tool_state.definitions_for_workspace(workspace.root())
+        }
     }
 
     pub fn workflow_guidance(&self, working_dir: &Path) -> Option<String> {
@@ -59,6 +73,10 @@ impl CodingAgent {
         } else {
             Vec::new()
         }
+    }
+
+    pub(crate) fn uses_compact_history_for_model(&self, model_config: &ModelConfig) -> bool {
+        uses_compact_native_coding_tools(model_config)
     }
 
     pub fn tool_count(&self, ponduin_mode: PonduinMode) -> usize {
@@ -100,6 +118,13 @@ impl CodingAgent {
             next with coding__apply_changes. Never repeat an unchanged discovery call. After each \
             tool result, continue with the next unchecked requirement. A partial mutation is not a \
             completed request; run the requested validation before giving a final response.";
+        let compact_tool_guidance = if uses_compact_native_coding_tools(model_config) {
+            "When work remains, call exactly one suitable tool for the next smallest verified step \
+             and emit no prose before it. The compact tool contract is intentional: use only the \
+             fields it shows, then use the returned result before choosing the next action."
+        } else {
+            ""
+        };
         let emulated_tool_guidance = if capabilities.tool_transport
             == crate::coding::capabilities::ToolTransport::EmulatedJson
         {
@@ -138,13 +163,14 @@ impl CodingAgent {
              relevant_files must name the workspace-relative paths that will be created; it must \
              never be an empty array. Never claim a check passed from model text; process results \
              are recorded automatically. Optional local retrieval: LSP={}, feature_embeddings={}. \
-             {} {} {}",
+             {} {} {} {}",
             self.config.plan_file_threshold,
             self.config.lsp,
             self.config.embeddings,
             capabilities.prompt_guidance(),
             completion_guidance,
-            emulated_tool_guidance
+            emulated_tool_guidance,
+            compact_tool_guidance
         ))
     }
 
@@ -201,6 +227,11 @@ impl CodingAgent {
     }
 }
 
+fn uses_compact_native_coding_tools(model_config: &ModelConfig) -> bool {
+    let model = model_config.model_name.to_ascii_lowercase();
+    !model_config.toolshim && model.contains("qwen3") && !model.contains("qwen3-coder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +276,46 @@ mod tests {
         assert!(prompt.contains("Never claim a check passed"));
         assert!(prompt.contains("active for this model-selected request"));
         assert!(prompt.contains("Model capability profile"));
+    }
+
+    #[test]
+    fn qwen3_uses_a_compact_native_tool_contract() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let model = ModelConfig::new("qwen3:8b");
+
+        let tools = agent.tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &model);
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(tools.len(), 8);
+        assert!(names.contains(&tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(names.contains(&tools::WORKFLOW_START_TOOL_NAME));
+        assert!(!names.contains(&tools::LSP_QUERY_TOOL_NAME));
+
+        let apply = tools
+            .iter()
+            .find(|tool| tool.name == tools::APPLY_CHANGES_TOOL_NAME)
+            .unwrap();
+        let schema = Value::Object((*apply.input_schema).clone());
+        assert!(schema["properties"]["changes"]["items"]["properties"]
+            .get("replacements")
+            .is_none());
+
+        let prompt = agent
+            .system_prompt_for_model(PonduinMode::Auto, &model)
+            .unwrap();
+        assert!(prompt.contains("call exactly one suitable tool"));
+
+        let coder_model = ModelConfig::new("qwen3-coder:30b");
+        assert_eq!(
+            agent
+                .tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &coder_model)
+                .len(),
+            28
+        );
     }
 
     #[test]

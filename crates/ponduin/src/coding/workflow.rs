@@ -23,6 +23,7 @@ pub struct CodingWorkflow {
     limits: WorkflowLimits,
     iterations: u32,
     repair_attempts: u32,
+    repair_pending: bool,
     revision: u32,
     changes: Vec<ChangeEvidence>,
     validations: Vec<ValidationEvidence>,
@@ -47,6 +48,7 @@ impl CodingWorkflow {
             limits,
             iterations: 0,
             repair_attempts: 0,
+            repair_pending: false,
             revision: 0,
             changes: Vec::new(),
             validations: Vec::new(),
@@ -203,6 +205,7 @@ impl CodingWorkflow {
         });
         self.last_error_count = None;
         self.non_improving_failures = 0;
+        self.repair_pending = false;
         if repeated >= LOOP_THRESHOLD {
             self.block(WorkflowStopReason::RepeatedDiff {
                 repetitions: repeated,
@@ -362,6 +365,7 @@ impl CodingWorkflow {
             return Err(WorkflowError::RepairLimit(self.limits.max_repair_attempts));
         }
         self.repair_attempts += 1;
+        self.repair_pending = true;
         self.phase = WorkflowPhase::Editing;
         Ok(())
     }
@@ -378,7 +382,11 @@ impl CodingWorkflow {
                     .iter()
                     .filter(|validation| validation.revision == self.revision)
                     .collect::<Vec<_>>();
-                if validation_required && current.is_empty() {
+                if validation_required
+                    && !current
+                        .iter()
+                        .any(|validation| validation.outcome.is_success())
+                {
                     return Err(WorkflowError::ValidationRequired);
                 }
                 if current
@@ -431,6 +439,7 @@ impl CodingWorkflow {
             max_iterations: self.limits.max_iterations,
             repair_attempts: self.repair_attempts,
             max_repair_attempts: self.limits.max_repair_attempts,
+            repair_pending: self.repair_pending,
             revision: self.revision,
             changed_files: self.changed_files(),
             validation_count: self.validations.len(),
@@ -579,6 +588,7 @@ pub struct WorkflowStatus {
     pub max_iterations: u32,
     pub repair_attempts: u32,
     pub max_repair_attempts: u32,
+    pub repair_pending: bool,
     pub revision: u32,
     pub changed_files: Vec<PathBuf>,
     pub validation_count: usize,
@@ -1122,6 +1132,29 @@ mod tests {
     }
 
     #[test]
+    fn marks_a_repair_as_pending_until_a_corrective_change_is_recorded() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(false, "error"))
+            .unwrap();
+        workflow.begin_repair().unwrap();
+
+        assert!(workflow.status().repair_pending);
+
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("repair".to_string(), &preview("repair"))
+            .unwrap();
+
+        assert!(!workflow.status().repair_pending);
+    }
+
+    #[test]
     fn enforces_iteration_and_validation_gates() {
         let mut workflow = CodingWorkflow::new(
             "bounded".to_string(),
@@ -1171,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_validation_remains_explicitly_unverified() {
+    fn unavailable_validation_cannot_close_a_required_validation_plan() {
         let mut workflow = planned_workflow();
         workflow.authorize_change().unwrap();
         workflow
@@ -1186,16 +1219,10 @@ mod tests {
                 output: None,
             })
             .unwrap();
-        workflow.begin_review().unwrap();
-        let report = workflow
-            .complete(
-                "implemented but validation was unavailable".to_string(),
-                vec!["validation command was not present".to_string()],
-            )
-            .unwrap();
-
-        assert!(!report.verified);
-        assert_eq!(report.validations[0].outcome, ValidationOutcome::NotPresent);
+        assert!(matches!(
+            workflow.begin_review(),
+            Err(WorkflowError::ValidationRequired)
+        ));
     }
 
     #[test]
