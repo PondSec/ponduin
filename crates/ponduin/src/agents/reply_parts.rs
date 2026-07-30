@@ -199,14 +199,16 @@ impl Agent {
         coding_exposure: CodingToolExposure,
     ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
         let ponduin_mode = *self.current_ponduin_mode.lock().await;
+        let model_config = self.model_config_for_session(session_id).await?;
         let mut tools = self.list_tools(session_id, None).await;
         if coding_exposure == CodingToolExposure::Active {
             tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
             tools.retain(|tool| tool.name.as_ref() == FINAL_OUTPUT_TOOL_NAME);
-            tools.extend(
-                self.coding_agent
-                    .tools_for_workspace(ponduin_mode, working_dir),
-            );
+            tools.extend(self.coding_agent.tools_for_workspace_for_model(
+                ponduin_mode,
+                working_dir,
+                &model_config,
+            ));
         } else {
             tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
         }
@@ -279,7 +281,9 @@ impl Agent {
         let extensions_info = if coding_exposure == CodingToolExposure::Active {
             Vec::new()
         } else {
-            self.extension_manager.get_extensions_info(working_dir).await
+            self.extension_manager
+                .get_extensions_info(working_dir)
+                .await
         };
         let (extension_count, _) = if coding_exposure == CodingToolExposure::Active {
             (0, 0)
@@ -287,8 +291,6 @@ impl Agent {
             self.total_extension_and_tool_counts(session_id).await
         };
         let tool_count = tools.len();
-
-        let model_config = self.model_config_for_session(session_id).await?;
 
         if ponduin_mode == PonduinMode::SmartApprove {
             self.tool_inspection_manager.apply_tool_annotations(&tools);

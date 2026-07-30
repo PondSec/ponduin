@@ -47,6 +47,7 @@ const OLLAMA_MAX_RETRIES: usize = 10;
 const OLLAMA_INITIAL_RETRY_INTERVAL_MS: u64 = 2000;
 const OLLAMA_BACKOFF_MULTIPLIER: f64 = 1.5;
 const OLLAMA_MAX_RETRY_INTERVAL_MS: u64 = 15_000;
+const QWEN3_TOOL_WARMUP_TIMEOUT_SECS: u64 = 30;
 
 /// Provider settings resolved from `config::Config` at construction time.
 ///
@@ -185,11 +186,69 @@ impl OllamaProvider {
         self
     }
 
+    async fn warm_native_qwen3_tool_model(
+        &self,
+        model_config: &ModelConfig,
+        tools: &[Tool],
+    ) -> Result<(), ProviderError> {
+        if tools.is_empty() || !is_native_qwen3_tool_model(model_config) {
+            return Ok(());
+        }
+
+        let loaded = match self.api_client.request("api/ps").response_get().await {
+            Ok(response) => match handle_status(response).await {
+                Ok(response) => response.json::<Value>().await.ok().and_then(|value| {
+                    value["models"].as_array().map(|models| {
+                        models.iter().any(|model| {
+                            model["name"].as_str() == Some(model_config.model_name.as_str())
+                        })
+                    })
+                }),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        if loaded == Some(true) {
+            return Ok(());
+        }
+
+        let payload = json!({
+            "model": &model_config.model_name,
+            "messages": [{"role": "user", "content": "ready"}],
+            "stream": false,
+            "think": false,
+            "options": {"num_predict": 1}
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(QWEN3_TOOL_WARMUP_TIMEOUT_SECS),
+            self.api_client
+                .request("api/chat")
+                .model_headers(model_config)?
+                .response_post(&payload),
+        )
+        .await
+        .map_err(|_| {
+            ProviderError::NetworkError(format!(
+                "Ollama did not complete the initial Qwen tool warm-up for {} within {}s. \
+                 Restart the local model and retry the request.",
+                model_config.model_name, QWEN3_TOOL_WARMUP_TIMEOUT_SECS
+            ))
+        })??;
+        let response = handle_status(response).await?;
+        response.bytes().await?;
+        Ok(())
+    }
+
     async fn fetch_models_from_api(&self) -> Result<Vec<String>, ProviderError> {
         fetch_ollama_model_names(&self.api_client)
             .await?
             .ok_or_else(|| ProviderError::RequestFailed("No models array in response".to_string()))
     }
+}
+
+fn is_native_qwen3_tool_model(model_config: &ModelConfig) -> bool {
+    let model = model_config.model_name.to_ascii_lowercase();
+    !model_config.toolshim && model.contains("qwen3") && !model.contains("qwen3-coder")
 }
 
 pub async fn fetch_ollama_model_names(
@@ -455,6 +514,11 @@ impl Provider for OllamaProvider {
         apply_ollama_options(&mut payload, &self.options, model_config);
         let mut log = start_log(model_config, &payload)?;
 
+        if let Err(error) = self.warm_native_qwen3_tool_model(model_config, tools).await {
+            let _ = log.error(&error);
+            return Err(error);
+        }
+
         let response = self
             .with_retry(|| async {
                 let resp = self
@@ -719,6 +783,18 @@ mod tests {
         let system = ollama_system_prompt(&model_config, "Use tools directly.");
 
         assert_eq!(system, "Use tools directly.\n\n/no_think");
+    }
+
+    #[test]
+    fn warms_native_qwen3_tools_but_not_coder_or_toolshim_models() {
+        let native = ModelConfig::new("qwen3:8b");
+        let coder = ModelConfig::new("qwen3-coder:30b");
+        let mut toolshim = ModelConfig::new("qwen3.5:9b");
+        toolshim.toolshim = true;
+
+        assert!(is_native_qwen3_tool_model(&native));
+        assert!(!is_native_qwen3_tool_model(&coder));
+        assert!(!is_native_qwen3_tool_model(&toolshim));
     }
 
     #[test]
