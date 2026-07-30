@@ -186,6 +186,9 @@ mod tests {
     use rmcp::object;
     use serde_json::Value;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpStream};
+    use std::time::Duration;
 
     fn enabled_agent() -> CodingAgent {
         CodingAgent::new(CodingConfig::default())
@@ -344,5 +347,119 @@ mod tests {
             .unwrap()
             .text
             .contains("Continue the original user request"));
+    }
+
+    async fn run_docker(agent: &CodingAgent, working_dir: &Path, args: Vec<String>) {
+        let result = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::RUN_PROCESS_TOOL_NAME).with_arguments(object!({
+                    "program": "docker",
+                    "args": args,
+                    "timeout_seconds": 120
+                })),
+                working_dir,
+            )
+            .await
+            .unwrap();
+        let process: Value =
+            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(process["success"], true, "{process}");
+    }
+
+    #[ignore = "requires Docker Desktop and creates an isolated temporary image/container"]
+    #[tokio::test]
+    async fn auto_mode_builds_serves_and_cleans_up_a_docker_website() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let created = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
+                    "changes": [
+                        {
+                            "operation": "create",
+                            "path": "index.html",
+                            "content": "<h1>Ponduin Docker E2E</h1>"
+                        },
+                        {
+                            "operation": "create",
+                            "path": "Dockerfile",
+                            "content": "FROM nginx:alpine\nCOPY index.html /usr/share/nginx/html/index.html\n"
+                        }
+                    ]
+                })),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert!(!created.is_error.unwrap_or(false));
+
+        let unique = format!("ponduin-coding-e2e-{}", std::process::id());
+        let port_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = port_listener.local_addr().unwrap().port();
+        drop(port_listener);
+
+        run_docker(
+            &agent,
+            temp_dir.path(),
+            vec!["build".into(), "--tag".into(), unique.clone(), ".".into()],
+        )
+        .await;
+        run_docker(
+            &agent,
+            temp_dir.path(),
+            vec![
+                "run".into(),
+                "--detach".into(),
+                "--rm".into(),
+                "--name".into(),
+                unique.clone(),
+                "--publish".into(),
+                format!("127.0.0.1:{port}:80"),
+                unique.clone(),
+            ],
+        )
+        .await;
+
+        let mut response = None;
+        for _ in 0..30 {
+            if let Ok(mut stream) = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                Duration::from_millis(250),
+            ) {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+                let mut body = String::new();
+                stream.read_to_string(&mut body).unwrap();
+                if body.contains("Ponduin Docker E2E") {
+                    response = Some(body);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        run_docker(
+            &agent,
+            temp_dir.path(),
+            vec!["rm".into(), "--force".into(), unique.clone()],
+        )
+        .await;
+        run_docker(
+            &agent,
+            temp_dir.path(),
+            vec!["image".into(), "rm".into(), "--force".into(), unique],
+        )
+        .await;
+        assert!(
+            response.is_some(),
+            "Docker website did not serve expected content"
+        );
     }
 }

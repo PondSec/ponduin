@@ -540,7 +540,6 @@ fn classify_command(program: &str, args: &[String]) -> Result<(), ProcessError> 
         "telnet",
         "nc",
         "netcat",
-        "docker",
         "podman",
         "kubectl",
         "helm",
@@ -892,12 +891,13 @@ mod tests {
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
         let runner = runner(&workspace, Duration::from_secs(2), 1_024);
 
-        for blocked in ["sh", "git", "rm", "sudo", "curl", "docker"] {
+        for blocked in ["sh", "git", "rm", "sudo", "curl"] {
             assert!(matches!(
                 runner.run(request(blocked, &[])).await,
                 Err(ProcessError::BlockedCommand { .. })
             ));
         }
+        assert!(classify_command("docker", &[]).is_ok());
         assert!(matches!(
             runner.run(request(python_program(), &[])).await,
             Err(ProcessError::InteractiveCommand(_))

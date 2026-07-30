@@ -1860,8 +1860,9 @@ fn run_process_tool() -> Tool {
         "Run one bounded, non-interactive development process in the workspace using an executable \
          plus a literal argument array. Shell syntax is never evaluated. The environment is \
          cleared and rebuilt from a small safe baseline plus allowlisted overrides. Git, shells, \
-         recursive deletion, privilege escalation, network clients, deployment tools, and host \
-         administration commands are blocked in favor of dedicated safer workflows. Captures \
+         recursive deletion, privilege escalation, network clients, and host administration \
+         commands are blocked in favor of dedicated safer workflows. Docker commands remain \
+         available as mutation actions and follow the active session confirmation policy. Captures \
          stdout and stderr separately, enforces timeout and combined output limits, and terminates \
          lingering process groups."
             .to_string(),
