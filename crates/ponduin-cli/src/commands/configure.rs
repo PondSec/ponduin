@@ -1510,18 +1510,18 @@ pub fn configure_ponduin_mode_dialog() -> anyhow::Result<()> {
     let mode = cliclack::select("Which ponduin mode would you like to configure?")
         .item(
             PonduinMode::Auto,
-            "Auto Mode",
-            "Full file modification, extension usage, edit, create and delete files freely"
+            "Autonomous Mode",
+            "Run all tools, including internal coding actions, without confirmation; hard security blocks still apply"
         )
         .item(
             PonduinMode::Approve,
-            "Approve Mode",
-            "All tools, extensions and file modifications will require human approval"
+            "Manual Approval Mode",
+            "Every tool call, including read-only coding tools, requires human approval"
         )
         .item(
             PonduinMode::SmartApprove,
-            "Smart Approve Mode",
-            "Editing, creating, deleting files and using extensions will require human approval"
+            "Smart Approval Mode",
+            "Read-only tools run automatically; mutating and sensitive actions require human approval"
         )
         .item(
             PonduinMode::Chat,
@@ -1532,11 +1532,13 @@ pub fn configure_ponduin_mode_dialog() -> anyhow::Result<()> {
 
     config.set_ponduin_mode(mode)?;
     let msg = match mode {
-        PonduinMode::Auto => "Set to Auto Mode - full file modification enabled",
-        PonduinMode::Approve => {
-            "Set to Approve Mode - all tools and modifications require approval"
+        PonduinMode::Auto => {
+            "Set to Autonomous Mode - tools run without confirmation; hard security blocks remain"
         }
-        PonduinMode::SmartApprove => "Set to Smart Approve Mode - modifications require approval",
+        PonduinMode::Approve => "Set to Manual Approval Mode - every tool call requires approval",
+        PonduinMode::SmartApprove => {
+            "Set to Smart Approval Mode - mutations and sensitive actions require approval"
+        }
         PonduinMode::Chat => "Set to Chat Mode - no tools or modifications enabled",
     };
     cliclack::outro(msg)?;

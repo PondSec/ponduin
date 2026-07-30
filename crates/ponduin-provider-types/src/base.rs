@@ -15,6 +15,7 @@ use crate::{
     permission::PermissionConfirmation,
     ponduin_mode::PonduinMode,
     retry::RetryConfig,
+    thinking::ThinkingEffort,
 };
 
 /// Metadata about a provider's configuration requirements and capabilities
@@ -396,6 +397,16 @@ pub fn stream_from_single_message(message: Message, usage: ProviderUsage) -> Mes
 pub trait Provider: Send + Sync {
     /// Get the name of this provider instance
     fn get_name(&self) -> &str;
+
+    /// Default reasoning effort for an internally activated coding turn.
+    ///
+    /// Providers with reasoning-capable local models may prefer a tool-first
+    /// default so smaller models do not spend the whole turn producing hidden
+    /// reasoning. Callers must apply this as a default only: an explicit user
+    /// setting always takes precedence.
+    fn default_coding_thinking_effort(&self) -> Option<ThinkingEffort> {
+        None
+    }
 
     /// Primary streaming method that all providers must implement.
     async fn stream(

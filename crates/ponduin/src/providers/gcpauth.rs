@@ -576,7 +576,6 @@ impl GcpAuth {
 mod tests {
     use super::*;
     use mockall::predicate::eq;
-    use tokio::time::sleep;
     use wiremock::matchers::{header, method, path};
     // Only import what we need
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -794,55 +793,57 @@ iXVBc2YmAuU8hiOFUPxtyQfNzG5fQ0rhJSewdtyWxIadJSLj6fsK+AEsNQ==
 
     #[tokio::test]
     async fn test_token_refresh_race_condition() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "refreshed_token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut credentials = mock_service_account();
+        credentials.token_uri = format!("{}/token", server.uri());
         let auth = Arc::new(GcpAuth {
-            credentials: RwLock::new(AdcCredentials::ServiceAccount(mock_service_account())),
+            credentials: RwLock::new(AdcCredentials::ServiceAccount(credentials)),
             client: reqwest::Client::new(),
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
                 token: AuthToken {
                     token_type: "Bearer".to_string(),
-                    token_value: "about_to_expire".to_string(),
+                    token_value: "expired_token".to_string(),
                 },
-                expires_at: Instant::now() + Duration::from_millis(100),
+                expires_at: Instant::now() - Duration::from_secs(1),
             }))),
         });
 
         let mut handles = vec![];
 
-        for i in 0..5 {
+        for _ in 0..5 {
             let auth_clone = Arc::clone(&auth);
             handles.push(tokio::spawn(async move {
-                sleep(Duration::from_millis(i * 50)).await;
-                let result = auth_clone.get_token().await;
-                match result {
-                    Ok(token) => {
-                        // Should be the cached token since we can't actually exchange tokens in tests
-                        assert_eq!(
-                            token.token_value, "about_to_expire",
-                            "Expected cached token, got: {}",
-                            token.token_value
-                        );
-                    }
-                    Err(e) => {
-                        match e {
-                            AuthError::TokenExchange(err) => {
-                                // This is expected - we can't actually exchange tokens in tests
-                                assert!(
-                                    err.contains("invalid_scope") || err.contains("400"),
-                                    "Unexpected error message: {}",
-                                    err
-                                );
-                            }
-                            other => panic!("Unexpected error type: {:?}", other),
-                        }
-                    }
-                }
+                auth_clone
+                    .get_token()
+                    .await
+                    .expect("the local token exchange should succeed")
             }));
         }
 
-        // Wait for all handles
         for handle in handles {
-            handle.await.unwrap();
+            let token = handle.await.unwrap();
+            assert_eq!(token.token_value, "refreshed_token");
         }
+
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "double-checked locking must collapse concurrent refreshes"
+        );
     }
 
     #[tokio::test]

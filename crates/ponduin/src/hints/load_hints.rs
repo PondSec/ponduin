@@ -177,28 +177,25 @@ fn find_git_root(start_dir: &Path) -> Option<&Path> {
     None
 }
 
-fn get_local_directories(git_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
-    match git_root {
-        Some(git_root) => {
-            let mut directories = Vec::new();
-            let mut current_dir = cwd;
-
-            loop {
-                directories.push(current_dir.to_path_buf());
-                if current_dir == git_root {
-                    break;
-                }
-                if let Some(parent) = current_dir.parent() {
-                    current_dir = parent;
-                } else {
-                    break;
-                }
-            }
-            directories.reverse();
-            directories
-        }
-        None => vec![cwd.to_path_buf()],
+fn directories_within_boundary(boundary: &Path, cwd: &Path) -> Vec<PathBuf> {
+    if !cwd.starts_with(boundary) {
+        return Vec::new();
     }
+
+    let mut directories = Vec::new();
+    let mut current_dir = cwd;
+    loop {
+        directories.push(current_dir.to_path_buf());
+        if current_dir == boundary {
+            break;
+        }
+        let Some(parent) = current_dir.parent() else {
+            return Vec::new();
+        };
+        current_dir = parent;
+    }
+    directories.reverse();
+    directories
 }
 
 /// Build a `Gitignore` that includes `.gitignore` files from the git root
@@ -206,20 +203,60 @@ fn get_local_directories(git_root: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
 /// is no git root, only `cwd/.gitignore` is loaded.
 pub fn build_gitignore(cwd: &Path) -> Gitignore {
     let git_root = find_git_root(cwd);
-    let directories = get_local_directories(git_root, cwd);
+    build_gitignore_with_boundary(git_root.unwrap_or(cwd), cwd)
+}
 
-    let mut builder = GitignoreBuilder::new(cwd);
-    for dir in &directories {
+/// Build ignore rules without reading any parent outside `boundary`.
+pub fn build_gitignore_with_boundary(boundary: &Path, cwd: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(boundary);
+    for dir in directories_within_boundary(boundary, cwd) {
         let gitignore_path = dir.join(".gitignore");
         if gitignore_path.is_file() {
             builder.add(&gitignore_path);
         }
     }
     builder.build().unwrap_or_else(|_| {
-        GitignoreBuilder::new(cwd)
+        GitignoreBuilder::new(boundary)
             .build()
             .expect("Failed to build default gitignore")
     })
+}
+
+/// Load only project-owned hint files from `boundary` through `cwd`.
+///
+/// Global user hints are intentionally excluded so callers can keep trust
+/// provenance separate.
+pub fn load_project_hint_files(
+    cwd: &Path,
+    boundary: &Path,
+    hints_filenames: &[String],
+    ignore_patterns: &Gitignore,
+) -> String {
+    let mut contents = Vec::with_capacity(hints_filenames.len());
+    for directory in directories_within_boundary(boundary, cwd) {
+        for hints_filename in hints_filenames {
+            let relative = Path::new(hints_filename);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                tracing::warn!("Skipping unsafe context filename: {hints_filename}");
+                continue;
+            }
+
+            let hints_path = directory.join(relative);
+            if hints_path.is_file() {
+                let mut visited = HashSet::new();
+                let expanded_content =
+                    read_referenced_files(&hints_path, boundary, &mut visited, 0, ignore_patterns);
+                if !expanded_content.is_empty() {
+                    contents.push(expanded_content);
+                }
+            }
+        }
+    }
+    contents.join("\n")
 }
 
 pub fn load_hint_files(
@@ -261,27 +298,11 @@ pub fn load_hint_files(
         }
     }
     let git_root = find_git_root(cwd);
-    let local_directories = get_local_directories(git_root, cwd);
-
     let import_boundary = git_root.unwrap_or(cwd);
-
-    for directory in &local_directories {
-        for hints_filename in hints_filenames {
-            let hints_path = directory.join(hints_filename);
-            if hints_path.is_file() {
-                let mut visited = HashSet::new();
-                let expanded_content = read_referenced_files(
-                    &hints_path,
-                    import_boundary,
-                    &mut visited,
-                    0,
-                    ignore_patterns,
-                );
-                if !expanded_content.is_empty() {
-                    local_hints_contents.push(expanded_content);
-                }
-            }
-        }
+    let project_hints =
+        load_project_hint_files(cwd, import_boundary, hints_filenames, ignore_patterns);
+    if !project_hints.is_empty() {
+        local_hints_contents.push(project_hints);
     }
 
     let mut hints = String::new();

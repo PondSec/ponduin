@@ -84,9 +84,6 @@ import type {
   GetSessionInfoResponse_unstable,
   GetToolsRequest_unstable,
   GetToolsResponse_unstable,
-  PonduinSessionNotification_unstable,
-  PonduinToolCallRequest_unstable,
-  PonduinToolCallResponse_unstable,
   ImportSessionRequest_unstable,
   ImportSessionResponse_unstable,
   ImportSourcesRequest_unstable,
@@ -137,6 +134,9 @@ import type {
   ParseRecipeRequest_unstable,
   ParseRecipeResponse_unstable,
   PauseScheduleRequest_unstable,
+  PonduinSessionNotification_unstable,
+  PonduinToolCallRequest_unstable,
+  PonduinToolCallResponse_unstable,
   PreferencesReadRequest_unstable,
   PreferencesReadResponse_unstable,
   PreferencesRemoveRequest_unstable,
@@ -230,8 +230,6 @@ import {
   zGetSessionExtensionsResponse_unstable,
   zGetSessionInfoResponse_unstable,
   zGetToolsResponse_unstable,
-  zPonduinSessionNotification_unstable,
-  zPonduinToolCallResponse_unstable,
   zImportSessionResponse_unstable,
   zImportSourcesResponse_unstable,
   zInspectRunningJobResponse_unstable,
@@ -255,6 +253,8 @@ import {
   zOnboardingImportApplyResponse_unstable,
   zOnboardingImportScanResponse_unstable,
   zParseRecipeResponse_unstable,
+  zPonduinSessionNotification_unstable,
+  zPonduinToolCallResponse_unstable,
   zPreferencesReadResponse_unstable,
   zPromptOperationResponse_unstable,
   zProviderCatalogListResponse_unstable,
@@ -285,7 +285,10 @@ export class PonduinExtClient {
   async sessionExtensionsAdd_unstable(
     params: AddSessionExtensionRequest_unstable,
   ): Promise<void> {
-    await this.conn.extMethod("_ponduin/unstable/session/extensions/add", params);
+    await this.conn.extMethod(
+      "_ponduin/unstable/session/extensions/add",
+      params,
+    );
   }
 
   async sessionExtensionsRemove_unstable(
@@ -300,7 +303,10 @@ export class PonduinExtClient {
   async toolsList_unstable(
     params: GetToolsRequest_unstable,
   ): Promise<GetToolsResponse_unstable> {
-    const raw = await this.conn.extMethod("_ponduin/unstable/tools/list", params);
+    const raw = await this.conn.extMethod(
+      "_ponduin/unstable/tools/list",
+      params,
+    );
     return zGetToolsResponse_unstable.parse(raw) as GetToolsResponse_unstable;
   }
 
@@ -319,7 +325,10 @@ export class PonduinExtClient {
   async toolsCall_unstable(
     params: PonduinToolCallRequest_unstable,
   ): Promise<PonduinToolCallResponse_unstable> {
-    const raw = await this.conn.extMethod("_ponduin/unstable/tools/call", params);
+    const raw = await this.conn.extMethod(
+      "_ponduin/unstable/tools/call",
+      params,
+    );
     return zPonduinToolCallResponse_unstable.parse(
       raw,
     ) as PonduinToolCallResponse_unstable;
@@ -340,7 +349,10 @@ export class PonduinExtClient {
   async appsList_unstable(
     params: AppsListRequest_unstable,
   ): Promise<AppsListResponse_unstable> {
-    const raw = await this.conn.extMethod("_ponduin/unstable/apps/list", params);
+    const raw = await this.conn.extMethod(
+      "_ponduin/unstable/apps/list",
+      params,
+    );
     return zAppsListResponse_unstable.parse(raw) as AppsListResponse_unstable;
   }
 
@@ -499,7 +511,10 @@ export class PonduinExtClient {
   async configExtensionsAdd_unstable(
     params: AddConfigExtensionRequest_unstable,
   ): Promise<void> {
-    await this.conn.extMethod("_ponduin/unstable/config/extensions/add", params);
+    await this.conn.extMethod(
+      "_ponduin/unstable/config/extensions/add",
+      params,
+    );
   }
 
   async configExtensionsRemove_unstable(
@@ -964,7 +979,10 @@ export class PonduinExtClient {
   async recipesSlashCommand_unstable(
     params: SetRecipeSlashCommandRequest_unstable,
   ): Promise<void> {
-    await this.conn.extMethod("_ponduin/unstable/recipes/slash-command", params);
+    await this.conn.extMethod(
+      "_ponduin/unstable/recipes/slash-command",
+      params,
+    );
   }
 
   async recipesSave_unstable(
@@ -1129,7 +1147,10 @@ export class PonduinExtClient {
   async sessionProjectUpdate_unstable(
     params: UpdateSessionProjectRequest_unstable,
   ): Promise<void> {
-    await this.conn.extMethod("_ponduin/unstable/session/project/update", params);
+    await this.conn.extMethod(
+      "_ponduin/unstable/session/project/update",
+      params,
+    );
   }
 
   async sessionRename_unstable(
@@ -1267,7 +1288,10 @@ export class PonduinExtClient {
   async dictationSecretSave_unstable(
     params: DictationSecretSaveRequest_unstable,
   ): Promise<void> {
-    await this.conn.extMethod("_ponduin/unstable/dictation/secret/save", params);
+    await this.conn.extMethod(
+      "_ponduin/unstable/dictation/secret/save",
+      params,
+    );
   }
 
   async dictationSecretDelete_unstable(

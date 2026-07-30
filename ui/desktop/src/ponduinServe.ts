@@ -1,8 +1,11 @@
 import { spawn, type ChildProcess } from 'child_process';
 import fs from 'node:fs';
+import https from 'node:https';
 import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import type { TLSSocket } from 'node:tls';
+import { normalizeCertificateFingerprint } from './certificateFingerprint';
 import {
   appendTail as appendStartupTail,
   createPonduinServeStartupDiagnostics,
@@ -36,6 +39,7 @@ export interface StartPonduinServeOptions extends FindPonduinBinaryOptions {
   logger?: Logger;
   diagnosticsDir?: string;
   readinessFetch?: ReadinessFetch;
+  onCertFingerprint?: (fingerprint: string) => void;
 }
 
 export interface PonduinServeResult {
@@ -135,15 +139,65 @@ const appendErrorTail = (target: string[], lines: string[], maxLines = 100): voi
 const CERT_FINGERPRINT_PREFIX = 'PONDUIND_CERT_FINGERPRINT=';
 const TLS_FINGERPRINT_TIMEOUT_MS = 5000;
 
-const fetchStatus = async (statusUrl: string, readinessFetch: ReadinessFetch): Promise<boolean> => {
+interface ReadinessProbeResult {
+  ok: boolean;
+  status?: number;
+  error?: string;
+}
+
+export const createPinnedHttpsReadinessFetch = (expectedFingerprint: string): ReadinessFetch => {
+  const normalizedExpectedFingerprint = normalizeCertificateFingerprint(expectedFingerprint);
+
+  return async (input, init) =>
+    new Promise<Response>((resolve, reject) => {
+      const request = https.request(
+        input,
+        {
+          method: 'GET',
+          rejectUnauthorized: false,
+          signal: init?.signal ?? undefined,
+        },
+        (response) => {
+          const certificate = (response.socket as TLSSocket).getPeerCertificate();
+          const actualFingerprint = certificate.fingerprint256
+            ? normalizeCertificateFingerprint(certificate.fingerprint256)
+            : null;
+
+          if (!actualFingerprint || actualFingerprint !== normalizedExpectedFingerprint) {
+            response.resume();
+            reject(new Error('TLS certificate fingerprint mismatch during readiness check'));
+            return;
+          }
+
+          response.resume();
+          resolve(new Response(null, { status: response.statusCode ?? 500 }));
+        }
+      );
+
+      request.once('error', reject);
+      request.end();
+    });
+};
+
+const fetchStatus = async (
+  statusUrl: string,
+  readinessFetch: ReadinessFetch
+): Promise<ReadinessProbeResult> => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1000);
 
   try {
     const response = await readinessFetch(statusUrl, { signal: controller.signal });
-    return response.ok;
-  } catch {
-    return false;
+    return {
+      ok: response.ok,
+      status: response.status,
+      ...(!response.ok ? { error: `HTTP ${response.status}` } : {}),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    };
   } finally {
     clearTimeout(timeout);
   }
@@ -195,6 +249,7 @@ const waitForPonduinServeReady = async (
   });
 
   let attempt = 1;
+  let lastProbe: ReadinessProbeResult | null = null;
   while (Date.now() < deadline) {
     if (shouldStopWaiting()) {
       options.onEvent?.('healthcheck_fatal_error', {
@@ -214,10 +269,12 @@ const waitForPonduinServeReady = async (
       return false;
     }
 
-    if (await fetchStatus(statusUrl, options.readinessFetch)) {
+    lastProbe = await fetchStatus(statusUrl, options.readinessFetch);
+    if (lastProbe.ok) {
       options.onEvent?.('healthcheck_success', {
         ...probeDetails,
         attempt,
+        status: lastProbe.status,
       });
       return true;
     }
@@ -226,7 +283,13 @@ const waitForPonduinServeReady = async (
     attempt += 1;
   }
 
-  options.onEvent?.('healthcheck_timeout', { ...probeDetails, timeoutMs: timeout });
+  options.onEvent?.('healthcheck_timeout', {
+    ...probeDetails,
+    timeoutMs: timeout,
+    attempts: attempt - 1,
+    ...(lastProbe?.status !== undefined ? { lastStatus: lastProbe.status } : {}),
+    ...(lastProbe?.error ? { lastError: lastProbe.error } : {}),
+  });
   return false;
 };
 
@@ -323,7 +386,8 @@ export const startPonduinServe = async ({
   resourcesPath,
   logger = defaultLogger,
   diagnosticsDir,
-  readinessFetch = fetch,
+  readinessFetch,
+  onCertFingerprint,
 }: StartPonduinServeOptions): Promise<PonduinServeResult> => {
   const workingDir = dir || process.cwd();
   const startupTrace = createPonduinServeStartupDiagnostics(diagnosticsDir, workingDir);
@@ -431,6 +495,14 @@ export const startPonduinServe = async ({
     certFingerprint = fingerprint;
     logger.info(`Pinned cert fingerprint: ${certFingerprint}`);
     startupTrace?.record('fingerprint_received', { certFingerprint });
+    try {
+      onCertFingerprint?.(certFingerprint);
+    } catch (error) {
+      const message = `Failed to register ponduin serve TLS fingerprint: ${errorMessage(error)}`;
+      appendErrorTail(errorLog, [message]);
+      startupTrace?.record('fingerprint_registration_error', { message });
+      spawnFailed = true;
+    }
     resolveFingerprint(certFingerprint);
     stopStdoutCollection();
   };
@@ -526,32 +598,11 @@ export const startPonduinServe = async ({
     });
   };
 
-  const ready = await waitForPonduinServeReady(statusUrl, errorLog, () => exited || spawnFailed, {
-    healthUrl,
-    readinessFetch,
-    onEvent: startupTrace?.record,
-  });
-
   const stopOutputCollection = () => {
     stopStdoutCollection();
     ponduinProcess.stderr?.off('data', onStderrData);
     ponduinProcess.stderr?.resume();
   };
-
-  if (!ready) {
-    stopOutputCollection();
-    await cleanup();
-    const exitDetails = exited
-      ? ` Process exited with code ${exitCode} and signal ${exitSignal}.`
-      : '';
-    const stderrDetails = errorLog.length ? ` Stderr: ${errorLog.join('\n')}` : '';
-    throw new Error(
-      withStartupDiagnosticsPath(
-        `ponduin serve did not become ready on ${statusUrl}.${exitDetails}${stderrDetails}`,
-        startupDiagnosticsPath
-      )
-    );
-  }
 
   if (tls) {
     startupTrace?.record('fingerprint_wait_start', { timeoutMs: TLS_FINGERPRINT_TIMEOUT_MS });
@@ -576,6 +627,30 @@ export const startPonduinServe = async ({
         )
       );
     }
+  }
+
+  const effectiveReadinessFetch =
+    readinessFetch ??
+    (tls && certFingerprint ? createPinnedHttpsReadinessFetch(certFingerprint) : fetch);
+  const ready = await waitForPonduinServeReady(statusUrl, errorLog, () => exited || spawnFailed, {
+    healthUrl,
+    readinessFetch: effectiveReadinessFetch,
+    onEvent: startupTrace?.record,
+  });
+
+  if (!ready) {
+    stopOutputCollection();
+    await cleanup();
+    const exitDetails = exited
+      ? ` Process exited with code ${exitCode} and signal ${exitSignal}.`
+      : '';
+    const stderrDetails = errorLog.length ? ` Stderr: ${errorLog.join('\n')}` : '';
+    throw new Error(
+      withStartupDiagnosticsPath(
+        `ponduin serve did not become ready on ${statusUrl}.${exitDetails}${stderrDetails}`,
+        startupDiagnosticsPath
+      )
+    );
   }
 
   stopOutputCollection();

@@ -83,7 +83,7 @@ copy-binary-windows:
 run-ui:
     @just release-binary
     @echo "Running UI..."
-    cd ui/desktop && pnpm install && pnpm run start-gui
+    cd ui/desktop && CI=true pnpm install --frozen-lockfile && sh scripts/start-local-dev.sh
 
 run-ui-playwright:
     #!/usr/bin/env sh
@@ -92,19 +92,19 @@ run-ui-playwright:
     RUN_DIR="$HOME/ponduin-runs/$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$RUN_DIR"
     echo "Using isolated directory: $RUN_DIR"
-    cd ui/desktop && ENABLE_PLAYWRIGHT=true PONDUIN_PATH_ROOT="$RUN_DIR" pnpm run start-gui
+    cd ui/desktop && ENABLE_PLAYWRIGHT=true PONDUIN_PATH_ROOT="$RUN_DIR" sh scripts/start-local-dev.sh
 
 run-ui-only:
     @echo "Running UI..."
-    cd ui/desktop && pnpm install && pnpm run start-gui
+    cd ui/desktop && CI=true pnpm install --frozen-lockfile && sh scripts/start-local-dev.sh
 
 debug-ui:
     @echo "🚀 Starting ponduin frontend in external ACP backend mode"
     cd ui/desktop && \
     export PONDUIN_EXTERNAL_BACKEND=true && \
     export PONDUIN_SERVER__SECRET_KEY="${PONDUIN_SERVER__SECRET_KEY:-test}" && \
-    pnpm install && \
-    pnpm run start-gui
+    CI=true pnpm install --frozen-lockfile && \
+    sh scripts/start-local-dev.sh
 
 # Run UI with main process debugging enabled
 # To debug main process:
@@ -117,15 +117,15 @@ debug-ui-main-process:
 	@echo "🔍 Starting ponduin UI with main process debugging enabled"
 	@just release-binary
 	cd ui/desktop && \
-	pnpm install && \
-	pnpm run start-gui-debug
+	CI=true pnpm install --frozen-lockfile && \
+	sh scripts/start-local-dev.sh --debug
 
 # Package the desktop app locally for testing (macOS)
 # Applies ad-hoc code signing with entitlements (needed for mic access, etc.)
 package-ui:
     @just release-binary
     @echo "Packaging desktop app..."
-    cd ui/desktop && pnpm install && pnpm run package
+    cd ui/desktop && CI=true pnpm install --frozen-lockfile && sh scripts/start-local-dev.sh --package
     @echo "Signing with entitlements..."
     codesign --force --deep --sign - --entitlements ui/desktop/entitlements.plist ui/desktop/out/Ponduin-darwin-arm64/Ponduin.app
     @echo "Done! Launch with: open ui/desktop/out/Ponduin-darwin-arm64/Ponduin.app"
@@ -219,7 +219,7 @@ run-dev:
     cargo build
     @just copy-binary debug
     @echo "Running UI..."
-    cd ui/desktop && pnpm run start-gui
+    cd ui/desktop && sh scripts/start-local-dev.sh
 
 # Install all dependencies (run once after fresh clone)
 install-deps:

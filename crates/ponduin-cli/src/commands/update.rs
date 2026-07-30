@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use futures::StreamExt;
 use reqwest::{
     header::{HeaderValue, AUTHORIZATION},
     StatusCode,
@@ -10,7 +11,10 @@ use sigstore_verify::VerificationPolicy;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use tokio::process::Command as AsyncCommand;
+
+const MAX_UPDATE_ARCHIVE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Asset name for this platform (compile-time).
 fn asset_name() -> &'static str {
@@ -91,15 +95,32 @@ fn authorization_header_value(token: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("Bearer {token}")).ok()
 }
 
-fn github_token() -> Option<String> {
-    env::var("GITHUB_TOKEN")
+async fn github_token() -> Option<String> {
+    let environment_token = env::var("GITHUB_TOKEN")
         .ok()
         .and_then(|tok| sanitized_token(Some(&tok)).map(str::to_owned))
         .or_else(|| {
             env::var("GH_TOKEN")
                 .ok()
                 .and_then(|tok| sanitized_token(Some(&tok)).map(str::to_owned))
-        })
+        });
+    if environment_token.is_some() {
+        return environment_token;
+    }
+
+    let mut command = github_cli_command();
+    let output = command
+        .args(["auth", "token"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .and_then(|token| sanitized_token(Some(&token)).map(str::to_owned))
 }
 
 fn should_retry_attestations_without_token(status: StatusCode, token: Option<&str>) -> bool {
@@ -107,6 +128,16 @@ fn should_retry_attestations_without_token(status: StatusCode, token: Option<&st
         .and_then(authorization_header_value)
         .is_some()
         && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+fn matches_workflow_identity(
+    identity: &str,
+    workflow: &str,
+    expected_source_ref: Option<&str>,
+) -> bool {
+    let expected = format!("https://github.com/PondSec/ponduin/.github/workflows/{workflow}@");
+    identity.starts_with(&expected)
+        && expected_source_ref.is_none_or(|source_ref| identity.ends_with(source_ref))
 }
 
 async fn fetch_attestations(digest: &str, token: Option<&str>) -> Result<Vec<serde_json::Value>> {
@@ -162,6 +193,7 @@ fn verify_bundle(
     policy: &VerificationPolicy,
     trusted_root: &TrustedRoot,
     workflow: &str,
+    expected_source_ref: Option<&str>,
 ) -> Result<()> {
     let bundle_str = serde_json::to_string(bundle_json)?;
     let bundle = Bundle::from_json(&bundle_str)
@@ -179,8 +211,7 @@ fn verify_bundle(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("No identity in certificate"))?;
 
-    let expected = format!("/.github/workflows/{workflow}");
-    if !identity.contains(&expected) {
+    if !matches_workflow_identity(identity, workflow, expected_source_ref) {
         bail!("Workflow mismatch: expected {workflow}, got {identity}");
     }
 
@@ -196,8 +227,9 @@ async fn verify_provenance(archive_data: &[u8], tag: &str) -> Result<()> {
         "canary" => "canary.yml",
         _ => "release.yml",
     };
+    let expected_source_ref = (tag == "canary").then_some("refs/heads/main");
 
-    let token = github_token();
+    let token = github_token().await;
 
     println!("Verifying SLSA provenance via Sigstore...");
 
@@ -226,6 +258,7 @@ async fn verify_provenance(archive_data: &[u8], tag: &str) -> Result<()> {
             &policy,
             &trusted_root,
             workflow,
+            expected_source_ref,
         ) {
             Ok(()) => {
                 println!("Sigstore provenance verification passed.");
@@ -239,6 +272,129 @@ async fn verify_provenance(archive_data: &[u8], tag: &str) -> Result<()> {
         "Sigstore verification failed: {}\n\nAborting update due to security check failure.",
         last_err.unwrap()
     ))
+}
+
+fn github_cli_command() -> AsyncCommand {
+    let mut command = AsyncCommand::new("gh");
+    command.env_clear();
+    for name in [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "XDG_CONFIG_HOME",
+        "GH_CONFIG_DIR",
+        "GH_HOST",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "SystemRoot",
+        "WINDIR",
+    ] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+async fn download_archive_with_github_cli(tag: &str, asset: &str) -> Result<Vec<u8>> {
+    let temp_dir = tempfile::tempdir().context("Failed to create update download directory")?;
+    let mut command = github_cli_command();
+    let status = command
+        .args([
+            "release",
+            "download",
+            tag,
+            "--repo",
+            "PondSec/ponduin",
+            "--pattern",
+            asset,
+            "--dir",
+        ])
+        .arg(temp_dir.path())
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .context("Failed to run the authenticated GitHub CLI")?;
+    if !status.success() {
+        bail!("Authenticated GitHub CLI download failed; run `gh auth login` for PondSec/ponduin");
+    }
+
+    let archive_path = temp_dir.path().join(asset);
+    let metadata = fs::metadata(&archive_path)
+        .with_context(|| format!("GitHub CLI did not download the expected asset {asset}"))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        bail!("GitHub CLI downloaded an empty or invalid update archive");
+    }
+    if metadata.len() > MAX_UPDATE_ARCHIVE_BYTES as u64 {
+        bail!("Update archive exceeds the maximum allowed size");
+    }
+    fs::read(&archive_path).context("Failed to read the downloaded update archive")
+}
+
+async fn download_archive_with_https(url: &str) -> Result<Vec<u8>> {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(url)
+        .header("User-Agent", "ponduin-cli")
+        .header("Accept", "application/octet-stream");
+    if let Some(token) = github_token().await {
+        if let Some(value) = authorization_header_value(&token) {
+            request = request.header(AUTHORIZATION, value);
+        }
+    }
+    let response = request
+        .send()
+        .await
+        .context("Failed to download release archive")?;
+    if !response.status().is_success() {
+        bail!(
+            "Download failed with HTTP status {}. URL: {}",
+            response.status(),
+            url
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_UPDATE_ARCHIVE_BYTES as u64)
+    {
+        bail!("Update archive exceeds the maximum allowed size");
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read release archive response")?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_UPDATE_ARCHIVE_BYTES {
+            bail!("Update archive exceeds the maximum allowed size");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        bail!("Downloaded update archive is empty");
+    }
+    Ok(bytes)
+}
+
+async fn download_archive(tag: &str, asset: &str, url: &str) -> Result<Vec<u8>> {
+    if tag == "canary" {
+        match download_archive_with_github_cli(tag, asset).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(_) => {
+                println!(
+                    "Authenticated GitHub CLI download unavailable; trying authenticated HTTPS..."
+                );
+            }
+        }
+    }
+    download_archive_with_https(url).await
 }
 
 /// Update the ponduin binary to the latest release.
@@ -258,25 +414,11 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
         let asset = asset_name();
         let url = format!("https://github.com/PondSec/ponduin/releases/download/{tag}/{asset}");
 
-        println!("Downloading {asset} from {tag} release...");
+        let channel = if canary { "main" } else { "stable" };
+        println!("Downloading {asset} from the attested {channel} release ({tag})...");
 
         // --- Download -----------------------------------------------------------
-        let response = reqwest::get(&url)
-            .await
-            .context("Failed to download release archive")?;
-
-        if !response.status().is_success() {
-            bail!(
-                "Download failed with HTTP status {}. URL: {}",
-                response.status(),
-                url
-            );
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .context("Failed to read response body")?;
+        let bytes = download_archive(tag, asset, &url).await?;
 
         println!("Downloaded {} bytes.", bytes.len());
 
@@ -806,6 +948,27 @@ mod tests {
         assert!(!should_retry_attestations_without_token(
             StatusCode::UNAUTHORIZED,
             None
+        ));
+    }
+
+    #[test]
+    fn test_main_attestation_identity_is_repository_and_ref_bound() {
+        let expected =
+            "https://github.com/PondSec/ponduin/.github/workflows/canary.yml@refs/heads/main";
+        assert!(matches_workflow_identity(
+            expected,
+            "canary.yml",
+            Some("refs/heads/main")
+        ));
+        assert!(!matches_workflow_identity(
+            "https://github.com/attacker/ponduin/.github/workflows/canary.yml@refs/heads/main",
+            "canary.yml",
+            Some("refs/heads/main")
+        ));
+        assert!(!matches_workflow_identity(
+            "https://github.com/PondSec/ponduin/.github/workflows/canary.yml@refs/heads/dev",
+            "canary.yml",
+            Some("refs/heads/main")
         ));
     }
 

@@ -110,6 +110,8 @@ fn get_preprompt_context(messages: &Conversation) -> String {
 
 /// Generate a session name/description based on the conversation history
 /// Creates a prompt asking for a concise description in 4 words or less.
+const SESSION_NAME_MAX_TOKENS: i32 = 64;
+
 pub(crate) async fn generate_session_name(
     provider: &dyn Provider,
     model_config: &ponduin_providers::model::ModelConfig,
@@ -145,13 +147,14 @@ pub(crate) async fn generate_session_name(
         SESSION_NAME_SUFFIX,
     );
     let message = Message::user().with_text(&user_text);
-    let result = crate::model_config::complete_fast(
+    let result = crate::model_config::complete_fast_with_max_tokens(
         provider,
         model_config,
         session_id,
         &system,
         &[message],
         &[],
+        Some(SESSION_NAME_MAX_TOKENS),
     )
     .await?;
 
@@ -172,6 +175,73 @@ pub(crate) async fn generate_session_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use ponduin_providers::{
+        conversation::token_usage::{ProviderUsage, Usage},
+        errors::ProviderError,
+        model::ModelConfig,
+        thinking::ThinkingEffort,
+    };
+    use rmcp::model::Tool;
+
+    use crate::providers::base::MessageStream;
+
+    struct CapturingNamingProvider {
+        captured_config: Mutex<Option<ModelConfig>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingNamingProvider {
+        fn get_name(&self) -> &str {
+            "session-naming-test"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            unreachable!("session naming uses the provider's complete method")
+        }
+
+        async fn complete(
+            &self,
+            model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<(Message, ProviderUsage), ProviderError> {
+            *self.captured_config.lock().unwrap() = Some(model_config.clone());
+            Ok((
+                Message::assistant().with_text("Blue sky"),
+                ProviderUsage::new(model_config.model_name.clone(), Usage::default()),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_name_completion_disables_thinking_and_limits_output() {
+        let provider = CapturingNamingProvider {
+            captured_config: Mutex::new(None),
+        };
+        let model_config = ModelConfig::new("qwen3:8b")
+            .with_max_tokens(Some(4096))
+            .with_thinking_effort(ThinkingEffort::High);
+        let messages =
+            Conversation::new_unvalidated([Message::user().with_text("Why is the sky blue?")]);
+
+        let title =
+            generate_session_name(&provider, &model_config, "session-test", &messages).await;
+
+        assert_eq!(title.unwrap(), "Blue sky");
+        let captured = provider.captured_config.lock().unwrap();
+        let captured = captured.as_ref().unwrap();
+        assert_eq!(captured.max_tokens, Some(SESSION_NAME_MAX_TOKENS));
+        assert_eq!(captured.thinking_effort(), Some(ThinkingEffort::Off));
+    }
 
     #[test]
     fn test_strip_xml_tags() {

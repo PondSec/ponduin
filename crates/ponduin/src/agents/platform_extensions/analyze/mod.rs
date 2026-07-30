@@ -1,7 +1,6 @@
 pub mod format;
 pub mod graph;
-pub mod languages;
-pub mod parser;
+pub use crate::code_analysis::{languages, parser};
 
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};

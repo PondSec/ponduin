@@ -1,3 +1,5 @@
+//! Shared Tree-sitter language and query registry.
+
 use tree_sitter::Language;
 
 // ── Types ──────────────────────────────────────────────────────────────

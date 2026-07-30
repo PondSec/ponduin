@@ -11,7 +11,8 @@ const i18n = defineMessages({
   },
   autonomousDescription: {
     id: 'modeSelectionItem.autonomousDescription',
-    defaultMessage: 'Full file modification capabilities, edit, create, and delete files freely.',
+    defaultMessage:
+      'Run all tools, including internal coding actions, without confirmation. Hard security blocks still apply.',
   },
   manualLabel: {
     id: 'modeSelectionItem.manualLabel',
@@ -27,7 +28,8 @@ const i18n = defineMessages({
   },
   smartDescription: {
     id: 'modeSelectionItem.smartDescription',
-    defaultMessage: 'Intelligently determine which actions need approval based on risk level',
+    defaultMessage:
+      'Allow read-only coding tools automatically; coding changes and other sensitive actions require approval.',
   },
   chatOnlyLabel: {
     id: 'modeSelectionItem.chatOnlyLabel',

@@ -11,6 +11,7 @@ use crate::formats::ollama::{create_request, response_to_streaming_message_ollam
 use crate::images::ImageFormat;
 use crate::model::ModelConfig;
 use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
+use crate::thinking::ThinkingEffort;
 use anyhow::{Error, Result};
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -18,6 +19,7 @@ use futures::TryStreamExt;
 use reqwest::{Response, StatusCode};
 use rmcp::model::Tool;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::time::Duration;
 use tokio::pin;
 use tokio_stream::StreamExt;
@@ -245,6 +247,17 @@ fn apply_ollama_options(payload: &mut Value, options: &OllamaOptions, model_conf
             obj.remove("stream_options");
         }
 
+        // Ollama's OpenAI-compatible endpoint uses `reasoning_effort: "none"`
+        // to disable thinking. Honor an explicit off setting and also the
+        // canonical non-reasoning model capability when the user did not select
+        // an effort. An explicit enabled effort always wins.
+        let thinking_effort = model_config.thinking_effort();
+        if thinking_effort == Some(ThinkingEffort::Off)
+            || (thinking_effort.is_none() && model_config.reasoning == Some(false))
+        {
+            obj.insert("reasoning_effort".to_string(), json!("none"));
+        }
+
         // Convert max_completion_tokens / max_tokens to Ollama's options.num_predict.
         // Reasoning models emit max_completion_tokens; non-reasoning models emit max_tokens.
         let max_tokens = obj
@@ -264,6 +277,21 @@ fn apply_ollama_options(payload: &mut Value, options: &OllamaOptions, model_conf
                 options_obj.insert("num_ctx".to_string(), json!(limit));
             }
         }
+    }
+}
+
+fn ollama_system_prompt<'a>(model_config: &ModelConfig, system: &'a str) -> Cow<'a, str> {
+    let qwen3 = model_config
+        .model_name
+        .to_ascii_lowercase()
+        .contains("qwen3");
+    if qwen3
+        && model_config.thinking_effort() == Some(ThinkingEffort::Off)
+        && !system.contains("/no_think")
+    {
+        Cow::Owned(format!("{system}\n\n/no_think"))
+    } else {
+        Cow::Borrowed(system)
     }
 }
 
@@ -390,6 +418,10 @@ impl Provider for OllamaProvider {
         &self.name
     }
 
+    fn default_coding_thinking_effort(&self) -> Option<ThinkingEffort> {
+        Some(ThinkingEffort::Off)
+    }
+
     fn skip_canonical_filtering(&self) -> bool {
         self.skip_canonical_filtering
     }
@@ -411,9 +443,10 @@ impl Provider for OllamaProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        let system = ollama_system_prompt(model_config, system);
         let mut payload = create_request(
             model_config,
-            system,
+            &system,
             messages,
             tools,
             &ImageFormat::OpenAi,
@@ -666,6 +699,93 @@ mod tests {
         let mut payload = json!({});
         apply_ollama_options(&mut payload, &options, &model_config);
         assert!(payload.get("options").is_none());
+    }
+
+    #[test]
+    fn test_apply_ollama_options_disables_thinking_for_fast_tasks() {
+        let options = OllamaOptions::default();
+        let model_config = ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Off);
+        let mut payload = json!({});
+
+        apply_ollama_options(&mut payload, &options, &model_config);
+
+        assert_eq!(payload["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn test_qwen3_off_adds_native_no_think_control_to_system_prompt() {
+        let model_config = ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Off);
+
+        let system = ollama_system_prompt(&model_config, "Use tools directly.");
+
+        assert_eq!(system, "Use tools directly.\n\n/no_think");
+    }
+
+    #[test]
+    fn test_qwen3_no_think_control_is_not_duplicated() {
+        let model_config =
+            ModelConfig::new("qwen3-coder:30b").with_thinking_effort(ThinkingEffort::Off);
+
+        let system = ollama_system_prompt(&model_config, "Use tools directly.\n\n/no_think");
+
+        assert_eq!(system, "Use tools directly.\n\n/no_think");
+    }
+
+    #[test]
+    fn test_no_think_control_is_qwen3_off_specific() {
+        let enabled_qwen =
+            ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Medium);
+        let disabled_llama = ModelConfig::new("llama3.1").with_thinking_effort(ThinkingEffort::Off);
+
+        assert_eq!(
+            ollama_system_prompt(&enabled_qwen, "Use tools directly."),
+            "Use tools directly."
+        );
+        assert_eq!(
+            ollama_system_prompt(&disabled_llama, "Use tools directly."),
+            "Use tools directly."
+        );
+    }
+
+    #[test]
+    fn test_ollama_defaults_internal_coding_turns_to_tool_first_execution() {
+        let provider = from_declarative_config(
+            ollama_config(Some(false), vec![ModelInfo::new("qwen3:8b", 32_768)]),
+            None,
+            crate::declarative::EnvKeyResolver,
+        )
+        .expect("valid Ollama test config")
+        .build();
+
+        assert_eq!(
+            provider.default_coding_thinking_effort(),
+            Some(ThinkingEffort::Off)
+        );
+    }
+
+    #[test]
+    fn test_apply_ollama_options_disables_thinking_for_non_reasoning_models() {
+        let options = OllamaOptions::default();
+        let mut model_config = ModelConfig::new("qwen3:8b");
+        model_config.reasoning = Some(false);
+        let mut payload = json!({});
+
+        apply_ollama_options(&mut payload, &options, &model_config);
+
+        assert_eq!(payload["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn test_apply_ollama_options_does_not_override_enabled_thinking() {
+        let options = OllamaOptions::default();
+        let mut model_config =
+            ModelConfig::new("qwen3:8b").with_thinking_effort(ThinkingEffort::Medium);
+        model_config.reasoning = Some(false);
+        let mut payload = json!({});
+
+        apply_ollama_options(&mut payload, &options, &model_config);
+
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test]

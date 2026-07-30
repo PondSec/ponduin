@@ -18,7 +18,6 @@ import {
   Tray,
 } from 'electron';
 import { pathToFileURL, format as formatUrl, URLSearchParams } from 'node:url';
-import { Buffer } from 'node:buffer';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import started from 'electron-squirrel-startup';
@@ -27,6 +26,7 @@ import os from 'node:os';
 import { execFileSync, spawn, execFile } from 'child_process';
 import 'dotenv/config';
 import { checkBackendStatus } from './backendStatus';
+import { normalizeCertificateFingerprint } from './certificateFingerprint';
 import { startPonduinServe } from './ponduinServe';
 import { PonduinServeLeaseRegistry, type PonduinServeLease } from './ponduinServeLeaseRegistry';
 import { acpWebSocketUrlFromHttpBase, normalizeAcpHttpBaseUrl } from './acp/url';
@@ -55,6 +55,10 @@ import type { PonduinApp } from './types/apps';
 import installExtension, { REACT_DEVELOPER_TOOLS } from 'electron-devtools-installer';
 import { BLOCKED_PROTOCOLS, WEB_PROTOCOLS } from './utils/urlSecurity';
 import { buildCSP } from './utils/csp';
+
+if (process.env.PONDUIN_E2E_USER_DATA_DIR) {
+  app.setPath('userData', process.env.PONDUIN_E2E_USER_DATA_DIR);
+}
 
 function shouldSetupUpdater(): boolean {
   // Setup updater if either the flag is enabled OR dev updates are enabled
@@ -302,9 +306,9 @@ async function configureProxy() {
 
 if (started) app.quit();
 
-// Certificate trust for active backend leases. Renderer requests and
-// main-process net.fetch both pin to the exact cert fingerprint. Each backend
-// lease owns a trust record so old windows keep working after settings change.
+// Certificate trust for active backend leases. Renderer requests and external
+// main-process net.fetch calls pin to the exact cert fingerprint. Local startup
+// readiness uses its own pinned Node HTTPS probe in ponduinServe.ts.
 interface BackendCertificateTrust {
   hostname: string;
   fingerprint: string | null;
@@ -321,25 +325,13 @@ function normalizeHostname(hostname: string): string {
   return hostname.toLowerCase();
 }
 
-function normalizeFingerprint(fp: string): string {
-  if (fp.startsWith('sha256/')) {
-    const b64 = fp.slice('sha256/'.length);
-    const buf = Buffer.from(b64, 'base64');
-    return Array.from(buf)
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join(':')
-      .toUpperCase();
-  }
-  return fp.toUpperCase();
-}
-
 function trustBackendCertificate(
   hostname: string,
   fingerprint: string | null
 ): BackendCertificateTrustRegistration {
   const trust: BackendCertificateTrust = {
     hostname: normalizeHostname(hostname),
-    fingerprint: fingerprint ? normalizeFingerprint(fingerprint) : null,
+    fingerprint: fingerprint ? normalizeCertificateFingerprint(fingerprint) : null,
   };
   trustedBackendCertificates.add(trust);
   return {
@@ -356,7 +348,7 @@ function getBackendCertificateTrusts(hostname: string): BackendCertificateTrust[
 }
 
 function verifyBackendCertificate(hostname: string, fingerprint: string): boolean {
-  const normalizedFingerprint = normalizeFingerprint(fingerprint);
+  const normalizedFingerprint = normalizeCertificateFingerprint(fingerprint);
   const trusts = getBackendCertificateTrusts(hostname);
   if (trusts.length === 0) {
     return false;
@@ -1162,13 +1154,24 @@ const createChat = async (
         dir: workingDir,
         tls: true,
         env: {
-          PONDUIN_PATH_ROOT: appConfig.PONDUIN_PATH_ROOT as string | undefined,
+          PONDUIN_PATH_ROOT:
+            process.env.PONDUIN_E2E_PATH_ROOT ??
+            (appConfig.PONDUIN_PATH_ROOT as string | undefined),
+          PONDUIN_PROVIDER: process.env.PONDUIN_E2E_PATH_ROOT
+            ? process.env.PONDUIN_DEFAULT_PROVIDER
+            : undefined,
+          PONDUIN_MODEL: process.env.PONDUIN_E2E_PATH_ROOT
+            ? process.env.PONDUIN_DEFAULT_MODEL
+            : undefined,
+          PONDUIN_MODE: process.env.PONDUIN_E2E_PATH_ROOT ? 'auto' : undefined,
         },
         isPackaged: app.isPackaged,
         resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
         logger: log,
         diagnosticsDir: STARTUP_LOGS_DIR,
-        readinessFetch: net.fetch as unknown as typeof globalThis.fetch,
+        onCertFingerprint: (fingerprint) => {
+          localCertificateTrust.trust.fingerprint = normalizeCertificateFingerprint(fingerprint);
+        },
       });
       if (!ponduinServeResult.certFingerprint) {
         await ponduinServeResult.cleanup();
@@ -1177,7 +1180,9 @@ const createChat = async (
         );
       }
 
-      const localCertFingerprint = normalizeFingerprint(ponduinServeResult.certFingerprint);
+      const localCertFingerprint = normalizeCertificateFingerprint(
+        ponduinServeResult.certFingerprint
+      );
       if (
         localCertificateTrust.trust.fingerprint &&
         localCertificateTrust.trust.fingerprint !== localCertFingerprint

@@ -9,6 +9,8 @@ activities:
   - Test file operations (create, read, update, delete, undo)
   - Validate shell command execution and error handling
   - Analyze code structure and parsing capabilities
+  - Validate the internal coding agent across a polyglot fixture
+  - Validate version conflicts, atomic changes, rollback, security, and factual validation
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation (sync and async)
@@ -20,7 +22,7 @@ parameters:
     input_type: string
     requirement: optional
     default: "all"
-    description: "Which test phases to run: all, basic, extensions, delegation, advanced"
+    description: "Which test phases to run: all, basic, coding, extensions, delegation, advanced"
 
   - key: test_depth
     input_type: string
@@ -72,14 +74,25 @@ instructions: |
   - Code analysis capabilities
   - Error handling and recovery
 
-  ### Phase 2: Extension System Testing
+  ### Phase 2: Internal Coding Agent Testing
+  Test the internal `coding__` tools directly, without an extension:
+  - Repository and project discovery
+  - Search, symbols, references, and bounded context
+  - Versioned reads and atomic multi-file changes
+  - Conflict detection and rollback
+  - Bounded process execution and factual validation states
+  - Safe Git inspection
+  - Workflow planning, memory, review, and completion evidence
+  - Workspace, traversal, secret, and destructive-command boundaries
+
+  ### Phase 3: Extension System Testing
   Test dynamic extension management:
   - Discover available extensions
   - Enable/disable extensions
   - Test extension interactions
   - Verify isolation between extensions
 
-  ### Phase 3: Delegate & Load Testing
+  ### Phase 4: Delegate & Load Testing
   Test the unified delegation and knowledge-loading tools:
   - Load tool for discovery and knowledge injection
   - Delegate tool for synchronous task delegation
@@ -87,7 +100,7 @@ instructions: |
   - Parallel delegate execution
   - Nested delegation prevention (critical security test)
 
-  ### Phase 4: Advanced Self-Testing
+  ### Phase 5: Advanced Self-Testing
   Push boundaries and test limits:
   - Intentionally trigger errors
   - Test timeout scenarios
@@ -95,7 +108,7 @@ instructions: |
   - Measure performance metrics
   - Test resource constraints
 
-  ### Phase 5: Report Generation
+  ### Phase 6: Report Generation
   Compile comprehensive test results:
   - Aggregate all test outcomes
   - Calculate success metrics
@@ -159,8 +172,99 @@ prompt: |
   Log results to: {{ workspace_dir }}/phase1_basic_tools.md
   {% endif %}
 
+  {% if test_phases == "all" or "coding" in test_phases %}
+  ## 🧩 PHASE 2: Internal Coding Agent Validation
+
+  This phase must use the internal `coding__` tools. Do not substitute the
+  developer extension for repository analysis, versioned editing, validation,
+  review, workflow state, or Git inspection.
+
+  ### Polyglot fixture setup
+
+  Create `{{ workspace_dir }}/coding_fixture` as a small Git repository with:
+
+  - `Cargo.toml` and `src/lib.rs` containing one function and one unit test
+  - `web/package.json` and `web/src/index.ts` containing an exported function
+  - `python/pyproject.toml` and `python/app.py` containing a function
+  - `go/go.mod` and `go/main.go`
+  - `java/pom.xml` and `java/src/main/java/example/App.java`
+  - `node_modules/ignored.js` containing a unique marker that must never be indexed
+  - `.env` containing a fake marker that must never be returned
+
+  Initialize Git and commit the fixture baseline before starting the coding
+  workflow. Keep all paths below the configured workspace.
+
+  ### Repository intelligence
+
+  1. Use `coding__repository_profile` and verify Rust, TypeScript, Python, Go,
+     and Java are detected.
+  2. Use `coding__project_capabilities` and verify the manifests, dependencies,
+     and available validation commands are evidence-backed.
+  3. Use `coding__repository_map`, `coding__search_symbols`, and
+     `coding__find_references` on at least two languages.
+  4. Use `coding__find_files` and `coding__search_text`. Verify neither the
+     `.env` marker nor the `node_modules` marker is returned.
+  5. Use `coding__prepare_context` with an explicit token budget and verify the
+     reported context does not exceed it.
+
+  ### Workflow, versioning, and atomic editing
+
+  1. Start `coding__workflow_start` with a concrete goal.
+  2. Record a plan with `coding__workflow_set_plan`, including risks, tests, and
+     rollback.
+  3. Read three source files with `coding__read_file` and retain each complete
+     BLAKE3 digest.
+  4. Preview a three-file change with `coding__preview_changes`.
+  5. Modify one source file outside the prepared batch, then verify
+     `coding__apply_changes` rejects the entire stale batch and changes no
+     destination.
+  6. Read fresh versions, preview again, apply the complete batch, and verify
+     all three files changed.
+  7. Use `coding__rollback_changes` and verify all three files return to their
+     prior contents.
+
+  ### Validation, diagnostics, review, and Git
+
+  1. Use `coding__run_validation` with a current command id from
+     `coding__project_capabilities`; never construct an undiscovered validation
+     command id.
+  2. Verify a real successful command is recorded as `passed`.
+  3. Inject a Rust syntax error through a versioned patch and rerun the same
+     validation. Verify the status is `failed` and contains a bounded,
+     structured diagnostic.
+  4. Roll back the error and verify the validation becomes `passed` again.
+  5. Use `coding__review_changes` and verify findings, if any, contain severity,
+     file, and line without secret values.
+  6. Use `coding__git_status`, `coding__git_diff`, and
+     `coding__git_history`. Do not commit or push during this self-test.
+  7. Update bounded workflow memory, inspect `coding__workflow_status`, and
+     call `coding__workflow_complete` only after real validation evidence
+     exists.
+
+  ### Hard security boundaries
+
+  Verify each operation is rejected without changing the system:
+
+  - `coding__read_file` for `../../../etc/passwd`
+  - a path through a symlink that resolves outside the workspace
+  - an explicit `.env` read
+  - `coding__run_process` with an interactive shell
+  - `coding__run_process` with recursive deletion, root, account, package
+    administration, credential, or production commands
+
+  Hard denials must remain denials even when the active permission mode is
+  Autonomous.
+
+  Log exact observed outcomes to:
+  `{{ workspace_dir }}/phase2_internal_coding_agent.md`.
+
+  This phase fails critically if a stale batch partially writes files, a
+  protected path is returned, an unexecuted validation is reported as passed,
+  or a hard-denied command executes.
+  {% endif %}
+
   {% if test_phases == "all" or "extensions" in test_phases %}
-  ## 🔧 PHASE 2: Extension System Testing
+  ## 🔧 PHASE 3: Extension System Testing
 
   ### Todo Extension Testing (Built-in)
   1. Create initial todos and verify they persist
@@ -177,7 +281,7 @@ prompt: |
   {% endif %}
 
   {% if test_phases == "all" or "delegation" in test_phases %}
-  ## 🤖 PHASE 3: Summon Testing
+  ## 🤖 PHASE 4: Summon Testing
 
   ### Load Tool - Discovery Mode
   Call `load()` with no arguments to discover all available sources:
@@ -324,7 +428,7 @@ prompt: |
   {% endif %}
 
   {% if test_phases == "all" or "vision" in test_phases %}
-  ## 📷 PHASE 3B: Local Inference Vision Testing
+  ## 📷 PHASE 4B: Local Inference Vision Testing
 
   **Prerequisites**: A vision-capable local model must be downloaded (e.g., gemma-4-E4B).
   Skip this phase if no local vision model is available.
@@ -349,7 +453,7 @@ prompt: |
   {% endif %}
 
   {% if test_phases == "all" or "advanced" in test_phases %}
-  ## 🔬 PHASE 4: Advanced Testing
+  ## 🔬 PHASE 5: Advanced Testing
 
   ### Error Boundary Testing
   1. Create a file with an invalid path (should fail gracefully)
@@ -375,7 +479,7 @@ prompt: |
   Log results to: {{ workspace_dir }}/phase4_advanced.md
   {% endif %}
 
-  ## 📊 PHASE 5: Final Report Generation
+  ## 📊 PHASE 6: Final Report Generation
 
   Create TWO reports:
 
@@ -403,6 +507,9 @@ prompt: |
   • File operations: [✓/✗]
   • Shell commands: [✓/✗]
   • Code analysis: [✓/✗]
+  • Internal coding agent: [✓/✗]
+  • Atomic editing and rollback: [✓/✗]
+  • Validation evidence: [✓/✗]
   • Extensions: [✓/✗]
   • Load tool: [✓/✗]
   • Delegate (sync): [✓/✗]

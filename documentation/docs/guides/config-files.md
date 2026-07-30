@@ -191,7 +191,7 @@ Use the `available_tools` field to limit which tools are loaded from an extensio
 
 ## Search Path Configuration
 
-Extensions may need to execute external commands or tools. Ponduin builds the command search path from any `PONDUIN_SEARCH_PATHS` entries, built-in fallback paths, and then your system PATH. You can add additional search directories in your config file:
+Extensions may need to execute external commands or tools. ponduin builds the command search path from any `PONDUIN_SEARCH_PATHS` entries, built-in fallback paths, and then your system PATH. You can add additional search directories in your config file:
 
 ```yaml
 PONDUIN_SEARCH_PATHS:

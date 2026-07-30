@@ -8,6 +8,61 @@ use ponduin::config::extensions::{set_extension, ExtensionEntry};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use ponduin::conversation::message::Message;
+    use ponduin::providers::base::{stream_from_single_message, MessageStream, Provider};
+    use ponduin_providers::conversation::token_usage::{ProviderUsage, Usage};
+    use ponduin_providers::errors::ProviderError;
+    use ponduin_providers::model::ModelConfig;
+    use rmcp::model::{CallToolRequestParams, Tool};
+
+    /// Keeps tests focused on their intended provider behavior while satisfying
+    /// the production semantic routing preflight with a deterministic non-coding
+    /// decision. Dedicated routing tests exercise the preflight itself.
+    struct ContinueWithoutCodingRoutingProvider {
+        inner: Arc<dyn Provider>,
+    }
+
+    #[async_trait]
+    impl Provider for ContinueWithoutCodingRoutingProvider {
+        async fn stream(
+            &self,
+            model_config: &ModelConfig,
+            system_prompt: &str,
+            messages: &[Message],
+            tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let routing_request = tools
+                .iter()
+                .any(|tool| tool.name == ponduin::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+                && tools.iter().any(|tool| {
+                    tool.name == ponduin::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME
+                });
+            if routing_request {
+                let message = Message::assistant().with_tool_request(
+                    "test-continue-without-coding",
+                    Ok(CallToolRequestParams::new(
+                        ponduin::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME,
+                    )
+                    .with_arguments(serde_json::Map::new())),
+                );
+                let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+                Ok(stream_from_single_message(message, usage))
+            } else {
+                self.inner
+                    .stream(model_config, system_prompt, messages, tools)
+                    .await
+            }
+        }
+
+        fn get_name(&self) -> &str {
+            self.inner.get_name()
+        }
+    }
+
+    fn without_coding_routing(provider: Arc<dyn Provider>) -> Arc<dyn Provider> {
+        Arc::new(ContinueWithoutCodingRoutingProvider { inner: provider })
+    }
 
     #[cfg(test)]
     mod schedule_tool_tests {
@@ -501,7 +556,7 @@ mod tests {
         use ponduin_providers::conversation::token_usage::{ProviderUsage, Usage};
         use ponduin_providers::errors::ProviderError;
         use ponduin_providers::model::ModelConfig;
-        use rmcp::model::{CallToolRequestParams, Tool};
+        use rmcp::model::Tool;
         use rmcp::object;
         use std::path::PathBuf;
 
@@ -585,7 +640,11 @@ mod tests {
                 .await?;
 
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session.id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
                 .await?;
 
             let session_config = SessionConfig {
@@ -774,7 +833,7 @@ mod tests {
 
             agent
                 .update_provider(
-                    provider.clone(),
+                    without_coding_routing(provider.clone()),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -960,7 +1019,11 @@ mod tests {
                 .await?;
 
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session.id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
                 .await?;
 
             // Pre-populate 13 tool pairs (need > cutoff + batch_size = 12 to trigger).
@@ -1345,7 +1408,11 @@ mod tests {
 
             let session_id = session.id.clone();
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session_id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session_id,
+                )
                 .await?;
 
             // ── Single reply: tool call (call 0) → text stream (call 1) → cancelled text (call 2)
@@ -1593,7 +1660,11 @@ mod tests {
 
             let session_id = session.id.clone();
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session_id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session_id,
+                )
                 .await?;
 
             let session_config = SessionConfig {
@@ -1793,7 +1864,11 @@ mod tests {
 
             let session_id = session.id.clone();
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session_id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session_id,
+                )
                 .await?;
 
             let session_config = SessionConfig {
@@ -1954,7 +2029,11 @@ mod tests {
 
             let session_id = session.id.clone();
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session_id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session_id,
+                )
                 .await?;
 
             let session_config = SessionConfig {
@@ -2051,7 +2130,11 @@ mod tests {
 
             let session_id = session.id.clone();
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session_id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session_id,
+                )
                 .await?;
 
             let session_config = SessionConfig {
@@ -2235,7 +2318,7 @@ mod tests {
 
             agent
                 .update_provider(
-                    provider.clone(),
+                    without_coding_routing(provider.clone()),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -2317,7 +2400,7 @@ mod tests {
 
             agent
                 .update_provider(
-                    provider.clone(),
+                    without_coding_routing(provider.clone()),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -2413,7 +2496,7 @@ mod tests {
                 .await?;
             agent
                 .update_provider(
-                    provider.clone(),
+                    without_coding_routing(provider.clone()),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -2477,7 +2560,7 @@ mod tests {
                 .await?;
             agent
                 .update_provider(
-                    provider.clone(),
+                    without_coding_routing(provider.clone()),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -2604,7 +2687,7 @@ mod tests {
             let session_id = session.id.clone();
             agent
                 .update_provider(
-                    provider.clone(),
+                    without_coding_routing(provider.clone()),
                     ModelConfig::new("mock-model"),
                     &session_id,
                 )
@@ -2920,7 +3003,7 @@ mod tests {
             let session_id = session.id.clone();
             agent
                 .update_provider(
-                    provider.clone(),
+                    without_coding_routing(provider.clone()),
                     ModelConfig::new("mock-model"),
                     &session_id,
                 )
@@ -2986,6 +3069,10 @@ mod tests {
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        const EXPECTED_UNPRODUCTIVE_TURN_CONTINUATION: &str =
+            "Continue the current task now. Reasoning alone cannot complete a turn: call the appropriate tool or provide a user-visible final answer.";
+        const EXPECTED_UNPRODUCTIVE_TURN_RETRIES: usize = 3;
+
         fn usage() -> ProviderUsage {
             ProviderUsage::new(
                 "mock-model".to_string(),
@@ -2999,6 +3086,11 @@ mod tests {
             call_count: AtomicUsize,
             empty_count: usize,
             wrap_empty_text: bool,
+        }
+
+        struct ThinkingThenTextProvider {
+            main_call_count: AtomicUsize,
+            thinking_count: usize,
         }
 
         struct AssistantOnlyProvider;
@@ -3070,6 +3162,76 @@ mod tests {
                     empty_count,
                     wrap_empty_text: true,
                 }
+            }
+        }
+
+        impl ThinkingThenTextProvider {
+            fn new(thinking_count: usize) -> Self {
+                Self {
+                    main_call_count: AtomicUsize::new(0),
+                    thinking_count,
+                }
+            }
+        }
+
+        impl ponduin::providers::base::ProviderDescriptor for ThinkingThenTextProvider {
+            fn metadata() -> ProviderMetadata {
+                ProviderMetadata {
+                    name: "thinking-then-text-mock".to_string(),
+                    display_name: "Thinking Then Text Mock".to_string(),
+                    description: "Mock provider for reasoning-only turn tests".to_string(),
+                    default_model: "mock-model".to_string(),
+                    known_models: vec![],
+                    model_doc_link: "".to_string(),
+                    config_keys: vec![],
+                    setup_steps: vec![],
+                    model_selection_hint: None,
+                    fast_model: None,
+                }
+            }
+        }
+
+        impl ProviderDef for ThinkingThenTextProvider {
+            type Provider = Self;
+
+            fn from_env(
+                _extensions: Vec<ponduin::config::ExtensionConfig>,
+                _tls_config: Option<ponduin::providers::api_client::TlsConfig>,
+            ) -> futures::future::BoxFuture<'static, anyhow::Result<Self>> {
+                unimplemented!()
+            }
+        }
+
+        #[async_trait]
+        impl Provider for ThinkingThenTextProvider {
+            async fn stream(
+                &self,
+                _model_config: &ModelConfig,
+                _system_prompt: &str,
+                messages: &[Message],
+                _tools: &[Tool],
+            ) -> Result<MessageStream, ProviderError> {
+                if messages.iter().any(|message| {
+                    message
+                        .as_concat_text()
+                        .contains("Generate a short title for the above messages.")
+                }) {
+                    return Ok(stream_from_single_message(
+                        Message::assistant().with_text("Test session"),
+                        usage(),
+                    ));
+                }
+                let call = self.main_call_count.fetch_add(1, Ordering::SeqCst);
+                let message = if call < self.thinking_count {
+                    Message::assistant().with_thinking("I should continue with a tool.", "")
+                } else {
+                    Message::assistant().with_text("All done.")
+                };
+                Ok(stream_from_single_message(message, usage()))
+            }
+
+            fn get_name(&self) -> &str {
+                "thinking-then-text-mock"
             }
         }
 
@@ -3150,7 +3312,11 @@ mod tests {
                 )
                 .await?;
             agent
-                .update_provider(provider, ModelConfig::new("mock-model"), &session.id)
+                .update_provider(
+                    without_coding_routing(provider),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
                 .await?;
 
             let session_id = session.id.clone();
@@ -3237,6 +3403,53 @@ mod tests {
             Ok(())
         }
 
+        #[tokio::test]
+        async fn test_reasoning_only_turn_retries_then_recovers() -> Result<()> {
+            let provider = Arc::new(ThinkingThenTextProvider::new(1));
+            let (messages, persisted) = run_reply(provider.clone(), "reasoning-only-retry").await?;
+
+            assert_eq!(provider.main_call_count.load(Ordering::SeqCst), 2);
+            assert!(concat_text(&messages).contains("All done."));
+            assert!(
+                !concat_text(&messages).contains(EXPECTED_UNPRODUCTIVE_TURN_CONTINUATION),
+                "the continuation must remain hidden from the user"
+            );
+            assert!(
+                persisted.iter().any(|message| {
+                    message.role == rmcp::model::Role::Assistant
+                        && message
+                            .content
+                            .iter()
+                            .any(|content| matches!(content, MessageContent::Thinking(_)))
+                }),
+                "reasoning should remain available as provider context"
+            );
+            assert!(
+                persisted
+                    .iter()
+                    .any(|message| message.as_concat_text()
+                        == EXPECTED_UNPRODUCTIVE_TURN_CONTINUATION),
+                "the provider should receive an explicit continuation"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_persistent_reasoning_only_turn_surfaces_message() -> Result<()> {
+            let provider = Arc::new(ThinkingThenTextProvider::new(usize::MAX));
+            let (messages, _) = run_reply(provider.clone(), "reasoning-only-persistent").await?;
+
+            assert_eq!(
+                provider.main_call_count.load(Ordering::SeqCst),
+                EXPECTED_UNPRODUCTIVE_TURN_RETRIES + 1
+            );
+            assert!(
+                concat_text(&messages).contains("stopped after reasoning"),
+                "expected a visible reasoning-only failure, got: {messages:?}"
+            );
+            Ok(())
+        }
+
         /// A provider that only ever returns empty responses must not hang
         /// silently — after the retry budget it surfaces a visible message.
         #[tokio::test]
@@ -3313,7 +3526,7 @@ mod tests {
                 .await?;
             agent
                 .update_provider(
-                    Arc::new(EmptyThenTextProvider::new(1)),
+                    without_coding_routing(Arc::new(EmptyThenTextProvider::new(1))),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -3385,7 +3598,7 @@ mod tests {
                 .await?;
             agent
                 .update_provider(
-                    Arc::new(EmptyThenTextProvider::new(usize::MAX)),
+                    without_coding_routing(Arc::new(EmptyThenTextProvider::new(usize::MAX))),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -3451,7 +3664,7 @@ mod tests {
                 .await?;
             agent
                 .update_provider(
-                    Arc::new(EmptyThenTextProvider::new(usize::MAX)),
+                    without_coding_routing(Arc::new(EmptyThenTextProvider::new(usize::MAX))),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )
@@ -3513,7 +3726,7 @@ mod tests {
             let session_id = session.id.clone();
             agent
                 .update_provider(
-                    Arc::new(EmptyThenTextProvider::new(usize::MAX)),
+                    without_coding_routing(Arc::new(EmptyThenTextProvider::new(usize::MAX))),
                     ModelConfig::new("mock-model"),
                     &session.id,
                 )

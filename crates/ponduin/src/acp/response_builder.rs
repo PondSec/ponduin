@@ -488,11 +488,11 @@ mod tests {
             SessionModeId::new("auto"),
             vec![
                 SessionMode::new(SessionModeId::new("auto"), "auto")
-                    .description("Automatically approve tool calls"),
+                    .description("Run all tool calls without confirmation; hard security blocks still apply"),
                 SessionMode::new(SessionModeId::new("approve"), "approve")
                     .description("Ask before every tool call"),
                 SessionMode::new(SessionModeId::new("smart_approve"), "smart_approve")
-                    .description("Ask only for sensitive tool calls"),
+                    .description("Allow read-only tools; ask before mutating or sensitive tool calls"),
                 SessionMode::new(SessionModeId::new("chat"), "chat")
                     .description("Chat only, no tool calls"),
             ],
@@ -505,11 +505,11 @@ mod tests {
             SessionModeId::new("approve"),
             vec![
                 SessionMode::new(SessionModeId::new("auto"), "auto")
-                    .description("Automatically approve tool calls"),
+                    .description("Run all tool calls without confirmation; hard security blocks still apply"),
                 SessionMode::new(SessionModeId::new("approve"), "approve")
                     .description("Ask before every tool call"),
                 SessionMode::new(SessionModeId::new("smart_approve"), "smart_approve")
-                    .description("Ask only for sensitive tool calls"),
+                    .description("Allow read-only tools; ask before mutating or sensitive tool calls"),
                 SessionMode::new(SessionModeId::new("chat"), "chat")
                     .description("Chat only, no tool calls"),
             ],
@@ -584,9 +584,9 @@ mod tests {
             SessionConfigOption::select(
                 "mode", "Mode", "auto",
                 vec![
-                    SessionConfigSelectOption::new("auto", "auto").description("Automatically approve tool calls"),
+                    SessionConfigSelectOption::new("auto", "auto").description("Run all tool calls without confirmation; hard security blocks still apply"),
                     SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
-                    SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Ask only for sensitive tool calls"),
+                    SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Allow read-only tools; ask before mutating or sensitive tool calls"),
                     SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),
                 ],
             ).category(SessionConfigOptionCategory::Mode),
@@ -619,9 +619,9 @@ mod tests {
             SessionConfigOption::select(
                 "mode", "Mode", "approve",
                 vec![
-                    SessionConfigSelectOption::new("auto", "auto").description("Automatically approve tool calls"),
+                    SessionConfigSelectOption::new("auto", "auto").description("Run all tool calls without confirmation; hard security blocks still apply"),
                     SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
-                    SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Ask only for sensitive tool calls"),
+                    SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Allow read-only tools; ask before mutating or sensitive tool calls"),
                     SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),
                 ],
             ).category(SessionConfigOptionCategory::Mode),

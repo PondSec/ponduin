@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use super::super::agents::Agent;
+use crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
 #[cfg(feature = "code-mode")]
 use crate::agents::platform_extensions::code_execution;
 use crate::config::{Config, PonduinMode};
@@ -170,19 +171,55 @@ fn message_has_timing_content(message: &Message) -> bool {
         .any(|content| !matches!(content, MessageContent::SystemNotification(_)))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodingToolExposure {
+    Routed,
+    Active,
+    Inactive,
+}
+
 impl Agent {
     pub async fn prepare_tools_and_prompt(
         &self,
         session_id: &str,
         working_dir: &std::path::Path,
     ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
+        self.prepare_tools_and_prompt_with_coding(
+            session_id,
+            working_dir,
+            CodingToolExposure::Routed,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_tools_and_prompt_with_coding(
+        &self,
+        session_id: &str,
+        working_dir: &std::path::Path,
+        coding_exposure: CodingToolExposure,
+    ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
+        let ponduin_mode = *self.current_ponduin_mode.lock().await;
         let mut tools = self.list_tools(session_id, None).await;
+        if coding_exposure == CodingToolExposure::Active {
+            tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
+            tools.retain(|tool| tool.name.as_ref() == FINAL_OUTPUT_TOOL_NAME);
+            tools.extend(
+                self.coding_agent
+                    .tools_for_workspace(ponduin_mode, working_dir),
+            );
+        } else {
+            tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
+        }
+        if coding_exposure == CodingToolExposure::Routed {
+            tools.extend(self.coding_agent.routing_tools(ponduin_mode));
+        }
 
         #[cfg(feature = "code-mode")]
-        let code_execution_active = self
-            .extension_manager
-            .is_extension_enabled(code_execution::EXTENSION_NAME)
-            .await;
+        let code_execution_active = coding_exposure != CodingToolExposure::Active
+            && self
+                .extension_manager
+                .is_extension_enabled(code_execution::EXTENSION_NAME)
+                .await;
         #[cfg(not(feature = "code-mode"))]
         let code_execution_active = false;
         #[cfg(feature = "code-mode")]
@@ -198,11 +235,7 @@ impl Agent {
                         // in catalog & filesystem styles, progressive search is handled
                         // by pctx, so we want to omit all non-first-class extensions
                         // from the standard tool list
-                        if crate::agents::extension_manager::get_tool_owner(&t).is_some_and(|o| {
-                            crate::agents::extension_manager::is_first_class_extension(&o)
-                        }) || crate::agents::extension_manager::get_tool_resource_uri(&t)
-                            .is_some()
-                        {
+                        if should_keep_direct_tool_in_code_mode(&t) {
                             Some(t)
                         } else {
                             None
@@ -243,15 +276,19 @@ impl Agent {
         tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Prepare system prompt
-        let extensions_info = self
-            .extension_manager
-            .get_extensions_info(working_dir)
-            .await;
-        let (extension_count, tool_count) = self.total_extension_and_tool_counts(session_id).await;
+        let extensions_info = if coding_exposure == CodingToolExposure::Active {
+            Vec::new()
+        } else {
+            self.extension_manager.get_extensions_info(working_dir).await
+        };
+        let (extension_count, _) = if coding_exposure == CodingToolExposure::Active {
+            (0, 0)
+        } else {
+            self.total_extension_and_tool_counts(session_id).await
+        };
+        let tool_count = tools.len();
 
         let model_config = self.model_config_for_session(session_id).await?;
-
-        let ponduin_mode = *self.current_ponduin_mode.lock().await;
 
         if ponduin_mode == PonduinMode::SmartApprove {
             self.tool_inspection_manager.apply_tool_annotations(&tools);
@@ -267,6 +304,23 @@ impl Agent {
             .with_hints(working_dir)
             .with_ponduin_mode(ponduin_mode)
             .build();
+        let coding_prompt = match coding_exposure {
+            CodingToolExposure::Routed => self.coding_agent.routing_system_prompt(ponduin_mode),
+            CodingToolExposure::Active => self
+                .coding_agent
+                .system_prompt_for_model(ponduin_mode, &model_config),
+            CodingToolExposure::Inactive => None,
+        };
+        if let Some(coding_prompt) = coding_prompt {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&coding_prompt);
+        }
+        if coding_exposure == CodingToolExposure::Active {
+            if let Some(workflow_guidance) = self.coding_agent.workflow_guidance(working_dir) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&workflow_guidance);
+            }
+        }
 
         // Handle toolshim if enabled
         let mut toolshim_tools = vec![];
@@ -629,6 +683,31 @@ impl Agent {
     }
 }
 
+#[cfg(feature = "code-mode")]
+pub(crate) fn should_keep_direct_tool_in_code_mode(tool: &Tool) -> bool {
+    let owner = crate::agents::extension_manager::get_tool_owner(tool);
+
+    owner.is_none()
+        || owner
+            .is_some_and(|owner| crate::agents::extension_manager::is_first_class_extension(&owner))
+        || crate::agents::extension_manager::get_tool_resource_uri(tool).is_some()
+}
+
+#[cfg(all(test, feature = "code-mode"))]
+mod code_mode_tool_tests {
+    use super::should_keep_direct_tool_in_code_mode;
+
+    #[test]
+    fn keeps_host_owned_coding_tools_directly_callable() {
+        let tool = crate::coding::tools::definitions()
+            .into_iter()
+            .find(|tool| tool.name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME)
+            .expect("coding apply tool");
+
+        assert!(should_keep_direct_tool_in_code_mode(&tool));
+    }
+}
+
 fn user_visible_provider_content(content: &MessageContent) -> Option<MessageContent> {
     content.user_visible_content()
 }
@@ -921,18 +1000,62 @@ mod tests {
             .await
             .unwrap();
 
-        let (tools, _toolshim_tools, _system_prompt, _model_config) = agent
+        let (tools, _toolshim_tools, system_prompt, _model_config) = agent
             .prepare_tools_and_prompt(&session.id, session.working_dir.as_path())
             .await?;
 
         let names: Vec<String> = tools.iter().map(|t| t.name.clone().into_owned()).collect();
         assert!(names.iter().any(|n| n == "frontend__a_tool"));
         assert!(names.iter().any(|n| n == "frontend__z_tool"));
+        assert!(names
+            .iter()
+            .any(|n| n == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
+        assert!(names
+            .iter()
+            .any(|n| n == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
+        assert!(!names
+            .iter()
+            .any(|n| n == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(system_prompt.contains("bounded semantic routing decision"));
+        assert!(!system_prompt.contains("Internal coding capabilities are active"));
 
         // Verify the names are sorted ascending
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
+
+        let (active_tools, _, active_system_prompt, _) = agent
+            .prepare_tools_and_prompt_with_coding(
+                &session.id,
+                session.working_dir.as_path(),
+                CodingToolExposure::Active,
+            )
+            .await?;
+        let active_names: Vec<_> = active_tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert!(!active_names.contains(&crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
+        assert!(!active_names.contains(&crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
+        assert!(active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(!active_names.contains(&"frontend__a_tool"));
+        assert!(!active_names.contains(&"frontend__z_tool"));
+        assert!(active_names
+            .iter()
+            .all(|name| crate::coding::tools::is_reserved_name(name)));
+        assert!(active_system_prompt.contains("Internal coding capabilities are active"));
+        assert!(!active_system_prompt.contains("bounded semantic routing decision"));
+
+        let (inactive_tools, _, inactive_system_prompt, _) = agent
+            .prepare_tools_and_prompt_with_coding(
+                &session.id,
+                session.working_dir.as_path(),
+                CodingToolExposure::Inactive,
+            )
+            .await?;
+        assert!(inactive_tools
+            .iter()
+            .all(|tool| !crate::coding::tools::is_reserved_name(&tool.name)));
+        assert!(!inactive_system_prompt.contains("Internal coding capabilities are active"));
+        assert!(!inactive_system_prompt.contains("bounded semantic routing decision"));
 
         Ok(())
     }

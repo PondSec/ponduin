@@ -2112,7 +2112,7 @@
     "defaultMessage": "Testen"
   },
   "modeSelectionItem.autonomousDescription": {
-    "defaultMessage": "Vollständige Dateiänderungsfunktionen, Dateien frei bearbeiten, erstellen und löschen."
+    "defaultMessage": "Alle Werkzeuge einschließlich interner Coding-Aktionen ohne Bestätigung ausführen. Harte Sicherheitsblockaden gelten weiterhin."
   },
   "modeSelectionItem.autonomousLabel": {
     "defaultMessage": "Autonom"
@@ -2130,7 +2130,7 @@
     "defaultMessage": "Manuell"
   },
   "modeSelectionItem.smartDescription": {
-    "defaultMessage": "Intelligent bestimmen, welche Aktionen basierend auf dem Risikoniveau eine Genehmigung erfordern"
+    "defaultMessage": "Schreibgeschützte Coding-Werkzeuge automatisch zulassen; Coding-Änderungen und andere sensible Aktionen müssen bestätigt werden."
   },
   "modeSelectionItem.smartLabel": {
     "defaultMessage": "Intelligent"

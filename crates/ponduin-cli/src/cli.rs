@@ -1015,12 +1015,13 @@ enum Command {
     #[cfg(feature = "update")]
     #[command(about = "Update the ponduin CLI version")]
     Update {
-        /// Update to canary version
+        /// Update to the attested build produced from the main branch
         #[arg(
             short,
             long,
-            help = "Update to canary version",
-            long_help = "Update to the latest canary version of the ponduin CLI, otherwise updates to the latest stable version."
+            visible_alias = "main",
+            help = "Update to the latest attested main-branch build",
+            long_help = "Update to the latest attested build produced by the main branch (the canary release channel), otherwise update to the latest stable version."
         )]
         canary: bool,
 
@@ -2435,6 +2436,20 @@ mod tests {
 
         let help = String::from_utf8(buffer).expect("utf8");
         assert!(help.contains("nu"));
+    }
+
+    #[cfg(feature = "update")]
+    #[test]
+    fn update_command_accepts_main_channel_alias() {
+        let cli = Cli::try_parse_from(["ponduin", "update", "--main"]).expect("parse failed");
+
+        match cli.command {
+            Some(Command::Update {
+                canary: true,
+                reconfigure: false,
+            }) => {}
+            _ => panic!("expected main update channel"),
+        }
     }
 
     #[test]

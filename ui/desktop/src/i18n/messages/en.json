@@ -2052,7 +2052,7 @@
     "defaultMessage": "Test"
   },
   "modeSelectionItem.autonomousDescription": {
-    "defaultMessage": "Full file modification capabilities, edit, create, and delete files freely."
+    "defaultMessage": "Run all tools, including internal coding actions, without confirmation. Hard security blocks still apply."
   },
   "modeSelectionItem.autonomousLabel": {
     "defaultMessage": "Autonomous"
@@ -2070,7 +2070,7 @@
     "defaultMessage": "Manual"
   },
   "modeSelectionItem.smartDescription": {
-    "defaultMessage": "Intelligently determine which actions need approval based on risk level"
+    "defaultMessage": "Allow read-only coding tools automatically; coding changes and other sensitive actions require approval."
   },
   "modeSelectionItem.smartLabel": {
     "defaultMessage": "Smart"
