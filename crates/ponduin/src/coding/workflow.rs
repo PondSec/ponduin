@@ -154,6 +154,38 @@ impl CodingWorkflow {
         Ok(())
     }
 
+    pub fn set_repair_strategy(
+        &mut self,
+        approach: RepairApproach,
+        hypothesis: String,
+        target_files: Vec<PathBuf>,
+    ) -> Result<(), WorkflowError> {
+        self.require_phase(&[WorkflowPhase::Debugging])?;
+        validate_text("repair hypothesis", &hypothesis, false)?;
+        validate_paths(&target_files)?;
+        let diagnostic_fingerprint = self
+            .current_failed_validation()
+            .map(|validation| validation.diagnostic_fingerprint.clone())
+            .ok_or(WorkflowError::RepairStrategyWithoutFailure)?;
+        if self.memory.repair_strategies.iter().any(|strategy| {
+            strategy.diagnostic_fingerprint == diagnostic_fingerprint
+                && strategy.approach == approach
+        }) {
+            return Err(WorkflowError::RepeatedRepairStrategy(approach));
+        }
+        self.memory.repair_strategies.push(RepairStrategyEvidence {
+            revision: self.revision,
+            diagnostic_fingerprint,
+            approach,
+            hypothesis_fingerprint: content_digest(hypothesis.as_bytes()),
+            target_files,
+        });
+        if self.memory.repair_strategies.len() > MAX_EVIDENCE_RECORDS {
+            self.memory.repair_strategies.remove(0);
+        }
+        Ok(())
+    }
+
     pub fn set_plan(&mut self, plan: WorkflowPlan) -> Result<(), WorkflowError> {
         self.require_phase(&[WorkflowPhase::Analyzing, WorkflowPhase::Searching])?;
         plan.validate()?;
@@ -351,6 +383,7 @@ impl CodingWorkflow {
         if outcome.is_success() {
             self.non_improving_failures = 0;
             self.last_error_count = Some(0);
+            self.failure_counts.clear();
             return Ok(());
         }
         if let Some(validation) = self.validations.last() {
@@ -404,6 +437,23 @@ impl CodingWorkflow {
 
     pub fn begin_repair(&mut self) -> Result<(), WorkflowError> {
         self.require_phase(&[WorkflowPhase::Debugging])?;
+        let diagnostic_fingerprint = self
+            .current_failed_validation()
+            .map(|validation| validation.diagnostic_fingerprint.clone())
+            .ok_or(WorkflowError::RepairStrategyWithoutFailure)?;
+        let repetitions = self
+            .failure_counts
+            .get(&diagnostic_fingerprint)
+            .copied()
+            .unwrap_or_default();
+        if repetitions >= 2
+            && !self.memory.repair_strategies.iter().any(|strategy| {
+                strategy.revision == self.revision
+                    && strategy.diagnostic_fingerprint == diagnostic_fingerprint
+            })
+        {
+            return Err(WorkflowError::RepairStrategyRequired);
+        }
         if self.repair_attempts >= self.limits.max_repair_attempts {
             self.block(WorkflowStopReason::RepairLimit {
                 limit: self.limits.max_repair_attempts,
@@ -672,6 +722,12 @@ impl CodingWorkflow {
             .unwrap_or_default()
     }
 
+    fn current_failed_validation(&self) -> Option<&ValidationEvidence> {
+        self.validations.iter().rev().find(|validation| {
+            validation.revision == self.revision && validation.outcome.requires_repair()
+        })
+    }
+
     fn require_phase(&self, expected: &[WorkflowPhase]) -> Result<(), WorkflowError> {
         if expected.contains(&self.phase) {
             Ok(())
@@ -921,7 +977,26 @@ pub struct WorkflowMemory {
     pub relevant_symbols: Vec<RelevantSymbolEvidence>,
     pub executed_commands: Vec<CommandEvidence>,
     pub known_errors: Vec<KnownErrorEvidence>,
+    pub repair_strategies: Vec<RepairStrategyEvidence>,
     pub open_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairStrategyEvidence {
+    pub revision: u32,
+    pub diagnostic_fingerprint: String,
+    pub approach: RepairApproach,
+    pub hypothesis_fingerprint: String,
+    pub target_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairApproach {
+    LocalLogic,
+    DependencyBoundary,
+    Configuration,
+    TestFixture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1403,6 +1478,12 @@ pub enum WorkflowError {
     IterationLimit(u32),
     #[error("workflow repair attempt limit reached: {0}")]
     RepairLimit(u32),
+    #[error("a recorded validation failure is required before selecting a repair strategy")]
+    RepairStrategyWithoutFailure,
+    #[error("a distinct repair strategy is required after a repeated validation failure")]
+    RepairStrategyRequired,
+    #[error("repair strategy `{0:?}` was already used for the current diagnostic")]
+    RepeatedRepairStrategy(RepairApproach),
     #[error("unknown or already rolled back workflow change: {0}")]
     UnknownChange(String),
     #[error("could not encode workflow evidence: {0}")]
@@ -1684,6 +1765,29 @@ mod tests {
                     &output(false, "error 123: same failure"),
                 )
                 .unwrap();
+            if revision == 1 {
+                assert!(matches!(
+                    workflow.begin_repair(),
+                    Err(WorkflowError::RepairStrategyRequired)
+                ));
+                workflow
+                    .set_repair_strategy(
+                        RepairApproach::DependencyBoundary,
+                        "inspect the failing dependency boundary".to_string(),
+                        vec![PathBuf::from("src/lib.rs")],
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    workflow.set_repair_strategy(
+                        RepairApproach::DependencyBoundary,
+                        "repeat the same approach".to_string(),
+                        vec![PathBuf::from("src/lib.rs")],
+                    ),
+                    Err(WorkflowError::RepeatedRepairStrategy(
+                        RepairApproach::DependencyBoundary
+                    ))
+                ));
+            }
             if revision < 2 {
                 workflow.begin_repair().unwrap();
             }
@@ -1694,6 +1798,10 @@ mod tests {
             workflow.status().stop_reason,
             Some(WorkflowStopReason::RepeatedFailure { repetitions: 3 })
         ));
+        assert_eq!(
+            workflow.status().memory.repair_strategies[0].approach,
+            RepairApproach::DependencyBoundary
+        );
     }
 
     #[test]
@@ -1717,6 +1825,32 @@ mod tests {
             .unwrap();
 
         assert!(!workflow.status().repair_pending);
+    }
+
+    #[test]
+    fn successful_validation_resets_repeated_failure_detection() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(false, "error"))
+            .unwrap();
+        assert_eq!(workflow.failure_counts.len(), 1);
+
+        workflow.begin_repair().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("repair".to_string(), &preview("repair"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+
+        assert!(workflow.failure_counts.is_empty());
     }
 
     #[test]

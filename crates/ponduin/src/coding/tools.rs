@@ -19,7 +19,8 @@ use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
-    CodingWorkflow, WorkflowLimits, WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowStatus,
+    CodingWorkflow, RepairApproach, WorkflowLimits, WorkflowPhase, WorkflowPlan, WorkflowReport,
+    WorkflowStatus,
 };
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use rmcp::model::{
@@ -65,6 +66,7 @@ pub const PREPARE_CONTEXT_TOOL_NAME: &str = "coding__prepare_context";
 pub const WORKFLOW_START_TOOL_NAME: &str = "coding__workflow_start";
 pub const WORKFLOW_SET_PLAN_TOOL_NAME: &str = "coding__workflow_set_plan";
 pub const WORKFLOW_UPDATE_MEMORY_TOOL_NAME: &str = "coding__workflow_update_memory";
+pub const WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME: &str = "coding__workflow_set_repair_strategy";
 pub const WORKFLOW_TRANSITION_TOOL_NAME: &str = "coding__workflow_transition";
 pub const WORKFLOW_STATUS_TOOL_NAME: &str = "coding__workflow_status";
 pub const WORKFLOW_COMPLETE_TOOL_NAME: &str = "coding__workflow_complete";
@@ -183,7 +185,9 @@ impl CodingToolState {
                     .to_string()
             }
             WorkflowPhase::Debugging => {
-                "A validation failure is recorded. Inspect its evidence, then call \
+                "A validation failure is recorded. Inspect its evidence. For a repeated failure, \
+                 record a distinct hypothesis and repair approach with \
+                 coding__workflow_set_repair_strategy, then call \
                  coding__workflow_transition exactly once with begin_repair before applying a \
                  corrective change."
                     .to_string()
@@ -580,6 +584,26 @@ impl CodingToolState {
         })
     }
 
+    fn set_repair_strategy(
+        &self,
+        workspace_root: &Path,
+        workflow_id: &str,
+        approach: RepairApproach,
+        hypothesis: String,
+        target_files: Vec<PathBuf>,
+    ) -> Result<WorkflowStatus, ErrorData> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
+            workflow
+                .set_repair_strategy(approach, hypothesis, target_files)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            Ok(workflow.status())
+        })
+    }
+
     fn transition_workflow(
         &self,
         workspace_root: &Path,
@@ -838,6 +862,7 @@ pub fn definitions() -> Vec<Tool> {
         workflow_start_tool(),
         workflow_set_plan_tool(),
         workflow_update_memory_tool(),
+        workflow_set_repair_strategy_tool(),
         workflow_transition_tool(),
         workflow_status_tool(),
         workflow_complete_tool(),
@@ -921,6 +946,7 @@ fn compact_native_tool_allowed(name: &str, phase: Option<WorkflowPhase>) -> bool
                 | READ_FILE_TOOL_NAME
                 | GIT_DIFF_TOOL_NAME
                 | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
                 | WORKFLOW_STATUS_TOOL_NAME
                 | WORKFLOW_TRANSITION_TOOL_NAME
         ),
@@ -1067,6 +1093,7 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
                         | REVIEW_CHANGES_TOOL_NAME
                         | WORKFLOW_SET_PLAN_TOOL_NAME
                         | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                        | WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
                         | WORKFLOW_TRANSITION_TOOL_NAME
                         | WORKFLOW_STATUS_TOOL_NAME
                         | WORKFLOW_COMPLETE_TOOL_NAME
@@ -1170,6 +1197,7 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
                 | SELECT_CONTEXT_TOOL_NAME
                 | PREPARE_CONTEXT_TOOL_NAME
                 | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                | WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
                 | WORKFLOW_STATUS_TOOL_NAME
                 | LSP_QUERY_TOOL_NAME
         ),
@@ -1835,6 +1863,17 @@ pub(crate) fn execute_with_state(
                 &params.workflow_id,
                 params.assumptions,
                 params.open_points,
+            )?;
+            json_result(&status, config.output_limit)
+        }
+        WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME => {
+            let params: WorkflowSetRepairStrategyParams = parse_arguments(&tool_call)?;
+            let status = state.set_repair_strategy(
+                workspace.root(),
+                &params.workflow_id,
+                params.approach,
+                params.hypothesis,
+                params.target_files,
             )?;
             json_result(&status, config.output_limit)
         }
@@ -2681,6 +2720,37 @@ fn workflow_update_memory_tool() -> Tool {
         }),
     )
     .annotate(stateful_annotations("Update coding workflow memory"))
+}
+
+fn workflow_set_repair_strategy_tool() -> Tool {
+    Tool::new(
+        WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME.to_string(),
+        "Record a distinct, bounded repair hypothesis for the latest failed validation. The raw \
+         hypothesis is never retained in workflow memory; only its fingerprint, chosen approach, \
+         and workspace-relative target files are recorded. A repeated diagnostic requires this \
+         before repair can begin."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["workflow_id", "approach", "hypothesis", "target_files"],
+            "properties": {
+                "workflow_id": {"type": "string", "minLength": 1},
+                "approach": {
+                    "type": "string",
+                    "enum": ["local_logic", "dependency_boundary", "configuration", "test_fixture"]
+                },
+                "hypothesis": {"type": "string", "minLength": 1, "maxLength": 16384},
+                "target_files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 200,
+                    "items": {"type": "string", "minLength": 1}
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(stateful_annotations("Record coding repair strategy"))
 }
 
 fn workflow_transition_tool() -> Tool {
@@ -3637,6 +3707,15 @@ struct WorkflowUpdateMemoryParams {
     open_points: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSetRepairStrategyParams {
+    workflow_id: String,
+    approach: RepairApproach,
+    hypothesis: String,
+    target_files: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 enum WorkflowTransition {
     #[serde(rename = "begin_editing")]
@@ -4003,10 +4082,67 @@ mod tests {
         assert!(guidance.contains("file's own expected_digest"));
     }
 
+    #[tokio::test]
+    async fn records_a_redacted_repair_strategy_after_validation_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let workflow_id = begin_editing_workflow(&config, &state, temp_dir.path(), &["fixture.rs"]);
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
+                "changes": [{"operation": "create", "path": "fixture.rs", "content": "fn main() {}\n"}]
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        transition(
+            &config,
+            &state,
+            temp_dir.path(),
+            &workflow_id,
+            "begin_validation",
+        );
+        execute_async(
+            &config,
+            &state,
+            CallToolRequestParams::new(RUN_PROCESS_TOOL_NAME).with_arguments(object!({
+                "program": "rustc",
+                "args": ["--invalid-ponduin-flag"],
+                "timeout_seconds": 5
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+
+        assert!(exposed_tool_names(&state, temp_dir.path())
+            .contains(WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME));
+        let status = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME).with_arguments(
+                object!({
+                    "workflow_id": workflow_id,
+                    "approach": "local_logic",
+                    "hypothesis": "the parser rejects the unsupported invocation",
+                    "target_files": ["fixture.rs"]
+                }),
+            ),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let status = result_text(status);
+
+        assert!(status.contains("repair_strategies"));
+        assert!(!status.contains("the parser rejects the unsupported invocation"));
+    }
+
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 33);
+        assert_eq!(tools.len(), 34);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -4030,6 +4166,7 @@ mod tests {
                 WORKFLOW_START_TOOL_NAME
                     | WORKFLOW_SET_PLAN_TOOL_NAME
                     | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
+                    | WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
                     | WORKFLOW_TRANSITION_TOOL_NAME
                     | WORKFLOW_COMPLETE_TOOL_NAME
             );

@@ -251,9 +251,9 @@ mod tests {
 
         assert!(agent.tools(PonduinMode::Chat).is_empty());
         assert!(agent.routing_tools(PonduinMode::Chat).is_empty());
-        assert_eq!(agent.tool_count(PonduinMode::Auto), 33);
-        assert_eq!(agent.tool_count(PonduinMode::Approve), 33);
-        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 33);
+        assert_eq!(agent.tool_count(PonduinMode::Auto), 34);
+        assert_eq!(agent.tool_count(PonduinMode::Approve), 34);
+        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 34);
         assert_eq!(agent.routing_tools(PonduinMode::Auto).len(), 2);
     }
 
