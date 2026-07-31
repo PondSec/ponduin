@@ -1036,8 +1036,9 @@ mod tests {
         let active_names: Vec<_> = active_tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert!(!active_names.contains(&crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
         assert!(!active_names.contains(&crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
-        assert!(active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
-        assert!(active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(!active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(!active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(active_names.contains(&crate::coding::tools::WORKFLOW_START_TOOL_NAME));
         assert!(!active_names.contains(&"frontend__a_tool"));
         assert!(!active_names.contains(&"frontend__z_tool"));
         assert!(active_names

@@ -162,7 +162,8 @@ impl<'workspace> GitRepository<'workspace> {
             });
         }
 
-        let candidates = if request.paths.is_empty() {
+        let paths_were_omitted = request.paths.is_empty();
+        let mut candidates = if paths_were_omitted {
             self.changed_paths(request.staged).await?
         } else {
             request
@@ -171,6 +172,17 @@ impl<'workspace> GitRepository<'workspace> {
                 .map(validate_relative_path)
                 .collect::<Result<Vec<_>, _>>()?
         };
+        if !request.staged && paths_were_omitted {
+            candidates.extend(self.untracked_paths(None).await?);
+        }
+        candidates.sort();
+        candidates.dedup();
+        if candidates.len() > MAX_DIFF_PATHS {
+            return Err(GitError::TooManyPaths {
+                count: candidates.len(),
+                limit: MAX_DIFF_PATHS,
+            });
+        }
         let mut safe_paths = BTreeSet::new();
         let mut skipped_sensitive = BTreeSet::new();
         for path in candidates {
@@ -192,28 +204,54 @@ impl<'workspace> GitRepository<'workspace> {
             });
         }
 
-        let mut args = vec![
-            "diff".to_string(),
-            "--no-ext-diff".to_string(),
-            "--no-textconv".to_string(),
-            "--ignore-submodules=all".to_string(),
-            format!("--unified={}", request.context_lines),
-        ];
-        if request.staged {
-            args.push("--cached".to_string());
+        let untracked_paths = if request.staged {
+            BTreeSet::new()
+        } else {
+            self.untracked_paths(Some(&safe_paths)).await?
+        };
+        let tracked_paths = safe_paths
+            .difference(&untracked_paths)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut patch = String::new();
+        let mut truncated = false;
+        let mut lossy_output = false;
+        if !tracked_paths.is_empty() {
+            let mut args = vec![
+                "diff".to_string(),
+                "--no-ext-diff".to_string(),
+                "--no-textconv".to_string(),
+                "--ignore-submodules=all".to_string(),
+                format!("--unified={}", request.context_lines),
+            ];
+            if request.staged {
+                args.push("--cached".to_string());
+            }
+            args.push("--".to_string());
+            args.extend(tracked_paths.iter().map(|path| literal_pathspec(path)));
+            let output = self.run_with_filters_disabled(args).await?;
+            require_success(&output, "read repository diff")?;
+            truncated |= output.output_truncated;
+            lossy_output |= output.stdout_lossy;
+            patch.push_str(&output.stdout);
         }
-        args.push("--".to_string());
-        args.extend(safe_paths.iter().map(|path| literal_pathspec(path)));
-        let output = self.run_with_filters_disabled(args).await?;
-        require_success(&output, "read repository diff")?;
+        for path in &untracked_paths {
+            let output = self.untracked_diff(path, request.context_lines).await?;
+            if output.exit_code != Some(1) {
+                require_success(&output, "read untracked repository diff")?;
+            }
+            truncated |= output.output_truncated;
+            lossy_output |= output.stdout_lossy;
+            patch.push_str(&output.stdout);
+        }
 
         Ok(GitDiff {
             staged: request.staged,
             files: safe_paths.into_iter().collect(),
             skipped_sensitive: skipped_sensitive.into_iter().collect(),
-            patch: output.stdout,
-            truncated: output.output_truncated,
-            lossy_output: output.stdout_lossy,
+            patch,
+            truncated,
+            lossy_output,
         })
     }
 
@@ -758,6 +796,63 @@ impl<'workspace> GitRepository<'workspace> {
             });
         }
         paths.into_iter().map(validate_relative_path).collect()
+    }
+
+    async fn untracked_paths(
+        &self,
+        paths: Option<&BTreeSet<PathBuf>>,
+    ) -> Result<BTreeSet<PathBuf>, GitError> {
+        let mut args = vec![
+            "ls-files".to_string(),
+            "--others".to_string(),
+            "--exclude-standard".to_string(),
+            "-z".to_string(),
+        ];
+        if let Some(paths) = paths {
+            if paths.is_empty() {
+                return Ok(BTreeSet::new());
+            }
+            args.push("--".to_string());
+            args.extend(paths.iter().map(|path| literal_pathspec(path)));
+        }
+        let output = self.run_with_filters_disabled(args).await?;
+        require_success(&output, "list untracked files")?;
+        if output.output_truncated {
+            return Err(GitError::ChangedPathOutputTruncated);
+        }
+        let paths = output
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .take(MAX_DIFF_PATHS + 1)
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        if paths.len() > MAX_DIFF_PATHS {
+            return Err(GitError::TooManyPaths {
+                count: paths.len(),
+                limit: MAX_DIFF_PATHS,
+            });
+        }
+        paths.into_iter().map(validate_relative_path).collect()
+    }
+
+    async fn untracked_diff(
+        &self,
+        path: &Path,
+        context_lines: u32,
+    ) -> Result<ProcessOutput, GitError> {
+        let empty_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        self.run_with_filters_disabled(vec![
+            "diff".to_string(),
+            "--no-index".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-textconv".to_string(),
+            format!("--unified={context_lines}"),
+            "--".to_string(),
+            empty_path.to_string(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .await
     }
 
     async fn ahead_behind(&self) -> Result<(u64, u64), GitError> {
@@ -1395,6 +1490,7 @@ mod tests {
     async fn returns_unstaged_and_staged_diffs_without_sensitive_content() {
         let (_temp_dir, workspace) = fixture();
         fs::write(workspace.root().join("app.txt"), "after\n").unwrap();
+        fs::write(workspace.root().join("new.rs"), "fn main() {}\n").unwrap();
         fs::write(workspace.root().join(".env"), "TOKEN=secret\n").unwrap();
         let repository = GitRepository::open(&workspace, GitLimits::default())
             .await
@@ -1409,6 +1505,8 @@ mod tests {
             .await
             .unwrap();
         assert!(unstaged.patch.contains("+after"));
+        assert!(unstaged.patch.contains("+fn main() {}"));
+        assert!(unstaged.files.contains(&PathBuf::from("new.rs")));
         assert!(!unstaged.patch.contains("TOKEN=secret"));
         assert_eq!(unstaged.skipped_sensitive, vec![PathBuf::from(".env")]);
 
