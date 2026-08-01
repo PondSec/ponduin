@@ -1081,7 +1081,7 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
         match tool.name.as_ref() {
             REPOSITORY_PROFILE_TOOL_NAME => "Inspect repository.",
             REPOSITORY_INSTRUCTIONS_TOOL_NAME => "Read root instructions.",
-            FIND_FILES_TOOL_NAME => "Find files; query required.",
+            FIND_FILES_TOOL_NAME => "Find files; terms and globs allowed.",
             SEARCH_TEXT_TOOL_NAME => "Search text; pattern required.",
             READ_FILE_TOOL_NAME => "Read one relative path.",
             PROJECT_CAPABILITIES_TOOL_NAME => "Inspect capabilities.",
