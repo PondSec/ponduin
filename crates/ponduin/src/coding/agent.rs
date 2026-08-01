@@ -332,6 +332,10 @@ impl CodingAgent {
                     || error.message.contains("digest conflict")) => {
                 "Read the existing file with coding__read_file first, then retry the write with the exact expected_digest returned for that path."
             }
+            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+                && error.message.contains("missing field `changes`") => {
+                "Apply changes requires a non-empty changes array. Read the target file for its current digest, then send one write change with operation, path, content, and that exact expected_digest."
+            }
             1 if tool_name == tools::FIND_FILES_TOOL_NAME
                 && error.message.contains("search query must not be empty") => {
                 "Find-files requires a non-empty query. Search for a known filename such as \"lib.rs\" or a relevant symbol, never an empty string."
@@ -392,6 +396,10 @@ fn contract_failure_class(tool_name: &str, message: &str) -> &'static str {
         "missing_digest"
     } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME && message.contains("digest conflict") {
         "stale_digest"
+    } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+        && message.contains("missing field `changes`")
+    {
+        "missing_changes"
     } else if message.contains("requested path is unavailable") {
         "unavailable_path"
     } else if message.contains("missing field `objective`") {
@@ -695,6 +703,34 @@ mod tests {
         );
         assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
         assert!(error.message.contains("exact expected_digest"));
+    }
+
+    #[tokio::test]
+    async fn missing_changes_recovery_requires_a_versioned_change_batch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("lib.rs"), "pub fn label() {}\n").unwrap();
+        let agent = enabled_agent();
+        begin_editing_workflow(
+            &agent,
+            temp_dir.path(),
+            "repair lib.rs",
+            vec!["lib.rs".into()],
+        )
+        .await;
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("missing field `changes`"));
+        assert!(error.message.contains("non-empty changes array"));
+        assert!(error.message.contains("expected_digest"));
     }
 
     #[tokio::test]
