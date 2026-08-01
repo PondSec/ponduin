@@ -123,6 +123,37 @@ fn collect_coding_route_decisions(
     invalid_tool_request
 }
 
+fn retain_first_compact_coding_request(
+    remaining_requests: &mut Vec<ToolRequest>,
+    filtered_response: &mut Message,
+) {
+    let mut saw_coding_request = false;
+    let dropped_ids = remaining_requests
+        .iter()
+        .filter_map(|request| {
+            let tool_call = request.tool_call.as_ref().ok()?;
+            if !crate::coding::tools::is_reserved_name(&tool_call.name) {
+                return None;
+            }
+            if saw_coding_request {
+                Some(request.id.clone())
+            } else {
+                saw_coding_request = true;
+                None
+            }
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    if dropped_ids.is_empty() {
+        return;
+    }
+
+    remaining_requests.retain(|request| !dropped_ids.contains(&request.id));
+    filtered_response.content.retain(|content| {
+        !matches!(content, MessageContent::ToolRequest(request) if dropped_ids.contains(&request.id))
+    });
+}
+
 fn coding_routing_messages(conversation: &Conversation) -> Result<Vec<Message>> {
     let newest_user_turn = conversation
         .messages()
@@ -2449,8 +2480,8 @@ impl Agent {
 
                                 let ToolCategorizeResult {
                                     frontend_requests,
-                                    remaining_requests,
-                                    filtered_response,
+                                    mut remaining_requests,
+                                    mut filtered_response,
                                 } = self
                                     .categorize_tools(
                                         &response,
@@ -2458,6 +2489,17 @@ impl Agent {
                                         surfaced_thinking_in_turn,
                                     )
                                     .await;
+
+                                if coding_tools_active
+                                    && self
+                                        .coding_agent
+                                        .uses_compact_history_for_model(&model_config)
+                                {
+                                    retain_first_compact_coding_request(
+                                        &mut remaining_requests,
+                                        &mut filtered_response,
+                                    );
+                                }
 
                                 let filtered_response = if let Some(inference) = inference.as_ref() {
                                     filtered_response.with_inference(inference.clone())
@@ -4504,6 +4546,49 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             Ok(CallToolRequestParams::new("unknown__route").with_arguments(serde_json::Map::new())),
         );
         assert!(collect_coding_route_decisions(&unknown, &mut decisions));
+    }
+
+    #[test]
+    fn compact_coding_requests_run_one_workflow_action_per_model_turn() {
+        let mut filtered_response = Message::assistant()
+            .with_tool_request(
+                "read",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::READ_FILE_TOOL_NAME,
+                )),
+            )
+            .with_tool_request(
+                "write",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::APPLY_CHANGES_TOOL_NAME,
+                )),
+            )
+            .with_tool_request("other", Ok(CallToolRequestParams::new("other__tool")));
+        let mut remaining_requests = filtered_response
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::ToolRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        retain_first_compact_coding_request(&mut remaining_requests, &mut filtered_response);
+
+        let remaining_ids = remaining_requests
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_ids, vec!["read", "other"]);
+        let visible_ids = filtered_response
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::ToolRequest(request) => Some(request.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_ids, vec!["read", "other"]);
     }
 
     #[tokio::test]
