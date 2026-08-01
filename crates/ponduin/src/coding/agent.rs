@@ -305,13 +305,10 @@ impl CodingAgent {
         if error.code != ErrorCode::INVALID_PARAMS {
             return error;
         }
-        let Some(repetitions) = self.tool_state.record_tool_contract_failure(
-            workspace_root,
-            tool_name,
-            "invalid_tool_contract",
-        ) else {
-            return error;
-        };
+        let repetitions = self
+            .tool_state
+            .record_tool_contract_failure(workspace_root, tool_name, "invalid_tool_contract")
+            .unwrap_or(1);
         let workflow_hint = self
             .tool_state
             .active_workflow_id(workspace_root)
@@ -333,6 +330,10 @@ impl CodingAgent {
             1 if tool_name == tools::FIND_FILES_TOOL_NAME
                 && error.message.contains("search query must not be empty") => {
                 "Find-files requires a non-empty query. Search for a known filename such as \"lib.rs\" or a relevant symbol, never an empty string."
+            }
+            1 if tool_name == tools::WORKFLOW_START_TOOL_NAME
+                && error.message.contains("missing field `objective`") => {
+                "Start the workflow with a non-empty objective field, for example {\"objective\":\"Repair normalize_label in lib.rs so cargo test passes\"}."
             }
             1 if tool_name == tools::READ_FILE_TOOL_NAME
                 && error.message.contains("expected path string") => {
@@ -642,6 +643,25 @@ mod tests {
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         assert!(error.message.contains("Current workflow ID"));
         assert!(error.message.contains(workflow_id));
+    }
+
+    #[tokio::test]
+    async fn stateless_workflow_start_recovery_supplies_the_required_objective() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("missing field `objective`"));
+        assert!(error.message.contains("Repair normalize_label in lib.rs"));
     }
 
     #[tokio::test]
