@@ -321,11 +321,14 @@ impl CodingAgent {
             .tool_state
             .workflow_guidance_for_workspace(workspace_root);
         let recovery = match repetitions {
-            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-                && error.message.contains("not currently allowed") => {
+            1 if error.message.contains("not currently allowed") => {
                 next_step_guidance.as_deref().unwrap_or(
-                    "The write was blocked. Read the active workflow status and take its next allowed step before retrying.",
+                    "The request was blocked. Read the active workflow status and take its next allowed step before retrying.",
                 )
+            }
+            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+                && error.message.contains("missing field `expected_digest`") => {
+                "Read the existing file with coding__read_file first, then retry the write with the exact expected_digest returned for that path."
             }
             1 if tool_name == tools::FIND_FILES_TOOL_NAME
                 && error.message.contains("search query must not be empty") => {
@@ -574,6 +577,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_change_digest_recovery_requires_a_versioned_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("lib.rs"), "pub fn label() {}\n").unwrap();
+        let agent = enabled_agent();
+        begin_editing_workflow(
+            &agent,
+            temp_dir.path(),
+            "repair lib.rs",
+            vec!["lib.rs".into()],
+        )
+        .await;
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(
+                    object!({
+                        "changes": [{
+                            "operation": "write",
+                            "path": "lib.rs",
+                            "content": "pub fn label() { println!(\"fixed\"); }\n"
+                        }]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("missing field `expected_digest`"));
+        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
+        assert!(error.message.contains("expected_digest"));
+    }
+
+    #[tokio::test]
     async fn contract_recovery_repeats_the_active_workflow_id_after_a_wrong_id() {
         let temp_dir = tempfile::tempdir().unwrap();
         let agent = enabled_agent();
@@ -768,6 +806,7 @@ mod tests {
         assert!(names.contains(&tools::WORKFLOW_SET_PLAN_TOOL_NAME));
         assert!(names.contains(&tools::WORKFLOW_TRANSITION_TOOL_NAME));
         assert!(!names.contains(&tools::LSP_QUERY_TOOL_NAME));
+        assert!(serde_json::to_vec(&tools).unwrap().len() < 6_000);
 
         let prompt = agent
             .system_prompt_for_model(PonduinMode::Auto, &model)

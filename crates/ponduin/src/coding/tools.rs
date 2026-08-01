@@ -1077,94 +1077,111 @@ fn compact_native_tool_allowed(name: &str) -> bool {
 }
 
 fn compact_native_tool_schema(mut tool: Tool) -> Tool {
-    match tool.name.as_ref() {
-        PREVIEW_CHANGES_TOOL_NAME | APPLY_CHANGES_TOOL_NAME => {
-            tool.description = Some(
-                "Apply safe workspace changes. create uses operation, path, content. write uses \
-                 operation, path, content, expected_digest from coding__read_file. move uses \
-                 operation, path, destination, expected_digest. delete uses operation, path, \
-                 expected_digest."
-                    .into(),
-            );
-            tool.input_schema = object!({
-                "type": "object",
-                "required": ["changes"],
-                "properties": {
-                    "changes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["operation", "path"],
-                            "properties": {
-                                "operation": {
-                                    "type": "string",
-                                    "enum": ["create", "write", "replace", "delete", "move"]
-                                },
-                                "path": {"type": "string"},
-                                "content": {"type": "string"},
-                                "expected_digest": {"type": "string"},
-                                "destination": {"type": "string"}
-                            }
+    tool.description = Some("Compact coding workflow action.".into());
+    tool.input_schema = match tool.name.as_ref() {
+        REPOSITORY_PROFILE_TOOL_NAME | PROJECT_CAPABILITIES_TOOL_NAME => object!({
+            "type": "object",
+            "properties": {"max_files": {"type": "integer"}}
+        }),
+        REPOSITORY_INSTRUCTIONS_TOOL_NAME => object!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        }),
+        FIND_FILES_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {"query": {"type": "string"}}
+        }),
+        SEARCH_TEXT_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["pattern"],
+            "properties": {"pattern": {"type": "string"}, "scope": {"type": "string"}}
+        }),
+        READ_FILE_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {"path": {"type": "string"}}
+        }),
+        WORKFLOW_START_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["objective"],
+            "properties": {"objective": {"type": "string"}}
+        }),
+        PREVIEW_CHANGES_TOOL_NAME | APPLY_CHANGES_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["changes"],
+            "properties": {
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["operation", "path"],
+                        "properties": {
+                            "operation": {"type": "string", "enum": ["create", "write", "replace", "delete", "move"]},
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "expected_digest": {"type": "string"},
+                            "destination": {"type": "string"}
                         }
                     }
                 }
-            })
-            .into();
-        }
-        WORKFLOW_SET_PLAN_TOOL_NAME => {
-            tool.description = Some(
-                "Set the active workflow plan with a compact, non-nested contract. Use only \
-                 workspace-relative relevant_files, one intended_change, and one required \
-                 validation command. Do not send a nested plan object or serialized JSON."
-                    .into(),
-            );
-            tool.input_schema = object!({
-                "type": "object",
-                "required": [
-                    "workflow_id",
-                    "relevant_files",
-                    "intended_change",
-                    "validation_program"
-                ],
-                "properties": {
-                    "workflow_id": {"type": "string", "pattern": "^workflow_[0-9a-fA-F-]{36}$"},
-                    "relevant_files": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-                    "intended_change": {"type": "string", "minLength": 1},
-                    "validation_program": {"type": "string", "minLength": 1, "description": "For Rust tests use cargo."},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "For Rust tests use [\"test\"]."}
-                }
-            })
-            .into();
-        }
-        RUN_PROCESS_TOOL_NAME => {
-            tool.description = Some(
-                "Run one bounded, non-interactive workspace process. program is the executable; \
-                 args contains only arguments after program and must never repeat the executable. \
-                 For Python unittest use program `python3` and args [\"-m\", \"unittest\", \"-v\"]."
-                    .into(),
-            );
-            tool.input_schema = object!({
-                "type": "object",
-                "required": ["program"],
-                "properties": {
-                    "program": {"type": "string"},
-                    "args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Arguments after program only; do not repeat program here."
-                    },
-                    "cwd": {"type": "string"},
-                    "environment": {
-                        "type": "object",
-                        "additionalProperties": {"type": "string"}
-                    },
-                    "timeout_seconds": {"type": ["integer", "null"]}
-                }
-            })
-            .into();
-        }
-        _ => {}
+            }
+        }),
+        ROLLBACK_CHANGES_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["rollback_id"],
+            "properties": {"rollback_id": {"type": "string"}}
+        }),
+        RUN_PROCESS_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["program"],
+            "properties": {
+                "program": {"type": "string"},
+                "args": {"type": "array", "items": {"type": "string"}},
+                "timeout_seconds": {"type": "integer"}
+            }
+        }),
+        WORKFLOW_SET_PLAN_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["workflow_id", "relevant_files", "intended_change", "validation_program"],
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "relevant_files": {"type": "array", "items": {"type": "string"}},
+                "intended_change": {"type": "string"},
+                "validation_program": {"type": "string"},
+                "args": {"type": "array", "items": {"type": "string"}}
+            }
+        }),
+        WORKFLOW_TRANSITION_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["workflow_id", "transition"],
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "transition": {"type": "string", "enum": ["begin_editing", "begin_validation", "begin_repair", "begin_review"]}
+            }
+        }),
+        WORKFLOW_STATUS_TOOL_NAME => object!({
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}}
+        }),
+        WORKFLOW_COMPLETE_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["workflow_id", "summary", "remaining_risks"],
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "summary": {"type": "string"},
+                "remaining_risks": {"type": "array", "items": {"type": "string"}}
+            }
+        }),
+        RUN_VALIDATION_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["command_id"],
+            "properties": {"command_id": {"type": "string"}, "timeout_seconds": {"type": "integer"}}
+        }),
+        REVIEW_CHANGES_TOOL_NAME => object!({"type": "object"}),
+        _ => return tool,
     }
+    .into();
     tool
 }
 
