@@ -25,6 +25,7 @@ use crate::coding::workflow::{
     WorkflowTaskState,
 };
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
+use ponduin_providers::thinking::ThinkingEffort;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool,
     ToolAnnotations,
@@ -48,6 +49,7 @@ pub const SEARCH_TEXT_TOOL_NAME: &str = "coding__search_text";
 pub const READ_FILE_TOOL_NAME: &str = "coding__read_file";
 pub const PREVIEW_CHANGES_TOOL_NAME: &str = "coding__preview_changes";
 pub const APPLY_CHANGES_TOOL_NAME: &str = "coding__apply_changes";
+pub const WRITE_FILE_TOOL_NAME: &str = "coding__write_file";
 pub const ROLLBACK_CHANGES_TOOL_NAME: &str = "coding__rollback_changes";
 pub const RUN_PROCESS_TOOL_NAME: &str = "coding__run_process";
 pub const GIT_STATUS_TOOL_NAME: &str = "coding__git_status";
@@ -134,6 +136,19 @@ struct WorkflowToolContext {
 }
 
 impl CodingToolState {
+    pub(crate) fn next_action_thinking_effort(&self, workspace_root: &Path) -> ThinkingEffort {
+        match self.workflow_status(workspace_root, None) {
+            Ok(status)
+                if status.phase == WorkflowPhase::Debugging
+                    || status.repair_attempts > 0
+                    || !status.memory.tool_contract_errors.is_empty() =>
+            {
+                ThinkingEffort::Low
+            }
+            _ => ThinkingEffort::Off,
+        }
+    }
+
     pub(crate) fn definitions_for_workspace(&self, workspace_root: &Path) -> Vec<Tool> {
         let context = self.workflow_tool_context(workspace_root);
         definitions_for_workflow(context.as_ref())
@@ -166,8 +181,8 @@ impl CodingToolState {
             }
             WorkflowPhase::Editing if status.repair_pending => repair_pending_guidance(),
             WorkflowPhase::Editing if status.changed_files.is_empty() => {
-                "The workflow is in Editing with no retained change. Call \
-                 coding__apply_changes now. Phase-transition tools are intentionally withheld \
+                "The workflow is in Editing with no retained change. Use the currently exposed \
+                 mutation tool now. Phase-transition tools are intentionally withheld \
                  until a real change exists."
                     .to_string()
             }
@@ -581,7 +596,10 @@ impl CodingToolState {
     }
 
     pub(crate) fn recovery_instruction(&self, workspace_root: &Path) -> Option<String> {
-        let status = self.workflow_status(workspace_root, None).ok()?;
+        let status = match self.workflow_status(workspace_root, None) {
+            Ok(status) => status,
+            Err(_) => return self.workflow_continuation(workspace_root),
+        };
         if matches!(
             status.phase,
             WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
@@ -623,6 +641,21 @@ impl CodingToolState {
         ))
     }
 
+    pub(crate) fn workflow_continuation(&self, workspace_root: &Path) -> Option<String> {
+        if let Some(continuation) = self.active_workflow_continuation(workspace_root) {
+            return Some(continuation);
+        }
+        let task = self.pending_task_context(workspace_root)?;
+        Some(format!(
+            "A coding task is active but no workflow has been started yet. Retained objective: {}. \
+             Call coding__workflow_start now with a concise objective, then inspect only what is \
+             needed and set the concrete plan. Do not stop after narration, announce a tool, or \
+             use execute_typescript or an invented wrapper for direct file or process work; use \
+             the currently exposed coding__ tools.",
+            task.normalized_objective
+        ))
+    }
+
     pub(crate) fn terminal_workflow_message(&self, workspace_root: &Path) -> Option<String> {
         let status = self.workflow_status(workspace_root, None).ok()?;
         if !matches!(status.phase, WorkflowPhase::Blocked | WorkflowPhase::Failed) {
@@ -636,7 +669,18 @@ impl CodingToolState {
     }
 
     pub(crate) fn recovery_exhausted_message(&self, workspace_root: &Path) -> Option<String> {
-        let status = self.workflow_status(workspace_root, None).ok()?;
+        let status = match self.workflow_status(workspace_root, None) {
+            Ok(status) => status,
+            Err(_) => {
+                let task = self.pending_task_context(workspace_root)?;
+                return Some(format!(
+                    "The coding task remains preserved before workflow startup after repeated \
+                     unusable model responses. Retained objective: {}. No user resubmission is \
+                     required.",
+                    task.normalized_objective
+                ));
+            }
+        };
         if matches!(
             status.phase,
             WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
@@ -660,6 +704,16 @@ impl CodingToolState {
             .position(|entry| entry.workspace_root == workspace_root)
             .and_then(|position| contexts.remove(position))
             .map(|entry| entry.task)
+    }
+
+    pub(crate) fn pending_task_context(&self, workspace_root: &Path) -> Option<WorkflowTaskState> {
+        self.task_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|entry| entry.workspace_root == workspace_root)
+            .map(|entry| entry.task.clone())
     }
 
     fn note_repository_activity(&self, workspace_root: &Path) {
@@ -1016,6 +1070,7 @@ pub fn definitions() -> Vec<Tool> {
         read_file_tool(),
         preview_changes_tool(),
         apply_changes_tool(),
+        write_file_tool(),
         rollback_changes_tool(),
         run_process_tool(),
         git_status_tool(),
@@ -1068,7 +1123,7 @@ fn compact_native_tool_allowed(name: &str) -> bool {
             | WORKFLOW_TRANSITION_TOOL_NAME
             | WORKFLOW_STATUS_TOOL_NAME
             | WORKFLOW_COMPLETE_TOOL_NAME
-            | APPLY_CHANGES_TOOL_NAME
+            | WRITE_FILE_TOOL_NAME
             | ROLLBACK_CHANGES_TOOL_NAME
             | RUN_PROCESS_TOOL_NAME
             | RUN_VALIDATION_TOOL_NAME
@@ -1091,6 +1146,7 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
             WORKFLOW_STATUS_TOOL_NAME => "Read workflow status.",
             WORKFLOW_COMPLETE_TOOL_NAME => "Complete after review.",
             APPLY_CHANGES_TOOL_NAME => "Apply versioned changes.",
+            WRITE_FILE_TOOL_NAME => "Create or update one file.",
             ROLLBACK_CHANGES_TOOL_NAME => "Rollback change batch.",
             RUN_PROCESS_TOOL_NAME => "Run validation process.",
             RUN_VALIDATION_TOOL_NAME => "Run planned validation.",
@@ -1148,6 +1204,15 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
                 }
             }
         }),
+        WRITE_FILE_TOOL_NAME => object!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "expected_digest": {"type": "string"}
+            }
+        }),
         ROLLBACK_CHANGES_TOOL_NAME => object!({
             "type": "object",
             "required": ["rollback_id"],
@@ -1164,11 +1229,18 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
         }),
         WORKFLOW_SET_PLAN_TOOL_NAME => object!({
             "type": "object",
-            "required": ["workflow_id", "relevant_files", "intended_change", "validation_program"],
+            "required": ["workflow_id", "relevant_files", "intended_change", "validation_program", "plan_steps"],
             "properties": {
                 "workflow_id": {"type": "string"},
                 "relevant_files": {"type": "array", "items": {"type": "string"}},
                 "intended_change": {"type": "string"},
+                "plan_steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "description": "Concrete ordered task actions, never generic phases.",
+                    "items": {"type": "string"}
+                },
                 "validation_program": {"type": "string"},
                 "args": {"type": "array", "items": {"type": "string"}}
             }
@@ -1215,6 +1287,7 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
                     tool.name.as_ref(),
                     PREVIEW_CHANGES_TOOL_NAME
                         | APPLY_CHANGES_TOOL_NAME
+                        | WRITE_FILE_TOOL_NAME
                         | ROLLBACK_CHANGES_TOOL_NAME
                         | RUN_PROCESS_TOOL_NAME
                         | GIT_STAGE_OWNED_TOOL_NAME
@@ -1302,6 +1375,7 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
                 | READ_FILE_TOOL_NAME
                 | PREVIEW_CHANGES_TOOL_NAME
                 | APPLY_CHANGES_TOOL_NAME
+                | WRITE_FILE_TOOL_NAME
                 | ROLLBACK_CHANGES_TOOL_NAME
                 | GIT_STATUS_TOOL_NAME
                 | GIT_DIFF_TOOL_NAME
@@ -1453,6 +1527,7 @@ pub(crate) fn canonical_native_tool_name(name: &str) -> Option<&'static str> {
         "workflow_status" => Some(WORKFLOW_STATUS_TOOL_NAME),
         "workflow_complete" => Some(WORKFLOW_COMPLETE_TOOL_NAME),
         "apply_changes" => Some(APPLY_CHANGES_TOOL_NAME),
+        "write_file" => Some(WRITE_FILE_TOOL_NAME),
         "rollback_changes" => Some(ROLLBACK_CHANGES_TOOL_NAME),
         "run_process" => Some(RUN_PROCESS_TOOL_NAME),
         "run_validation" => Some(RUN_VALIDATION_TOOL_NAME),
@@ -1874,6 +1949,43 @@ pub(crate) fn execute_with_state(
             state.record_mutation_locked(workspace.root(), change_id, &applied.result.preview)?;
             state.invalidate_intelligence(workspace.root());
             json_result(&applied.result, config.output_limit)
+        }
+        WRITE_FILE_TOOL_NAME => {
+            let params: WriteFileParams = parse_arguments(&tool_call)?;
+            let mut change = serde_json::Map::new();
+            change.insert(
+                "operation".to_string(),
+                Value::String(
+                    if params.expected_digest.is_some() {
+                        "write"
+                    } else {
+                        "create"
+                    }
+                    .to_string(),
+                ),
+            );
+            change.insert(
+                "path".to_string(),
+                Value::String(params.path.to_string_lossy().into_owned()),
+            );
+            change.insert("content".to_string(), Value::String(params.content));
+            if let Some(expected_digest) = params.expected_digest {
+                change.insert(
+                    "expected_digest".to_string(),
+                    Value::String(expected_digest),
+                );
+            }
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(
+                "changes".to_string(),
+                Value::Array(vec![Value::Object(change)]),
+            );
+            execute_with_state(
+                config,
+                state,
+                CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(arguments),
+                working_dir,
+            )
         }
         ROLLBACK_CHANGES_TOOL_NAME => {
             let params: RollbackChangesParams = parse_arguments(&tool_call)?;
@@ -2302,6 +2414,27 @@ fn apply_changes_tool() -> Tool {
         mutation_batch_schema(),
     )
     .annotate(mutation_annotations("Apply versioned coding changes"))
+}
+
+fn write_file_tool() -> Tool {
+    Tool::new(
+        WRITE_FILE_TOOL_NAME.to_string(),
+        "Create one new workspace file or update one versioned file. Existing files require the \
+         complete BLAKE3 digest returned by coding__read_file. This applies the same guarded \
+         mutation contract as coding__apply_changes with a smaller single-file input."
+            .to_string(),
+        object!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "expected_digest": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+    )
+    .annotate(mutation_annotations("Create or update one coding file"))
 }
 
 fn rollback_changes_tool() -> Tool {
@@ -3837,6 +3970,15 @@ impl<'a> From<&'a RepositoryIndex> for RepositoryMapResult<'a> {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WriteFileParams {
+    path: PathBuf,
+    content: String,
+    #[serde(default)]
+    expected_digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RollbackChangesParams {
     rollback_id: String,
 }
@@ -3876,6 +4018,8 @@ struct WorkflowCompactPlanParams {
     workflow_id: WorkflowId,
     relevant_files: Vec<PathBuf>,
     intended_change: String,
+    #[serde(default, alias = "steps", alias = "planned_steps")]
+    plan_steps: Vec<String>,
     validation_program: String,
     #[serde(default, alias = "validation_args")]
     args: Vec<String>,
@@ -3888,9 +4032,16 @@ impl WorkflowCompactPlanParams {
         let mut args = command_parts
             .map(|part| part.to_string())
             .collect::<Vec<_>>();
-        args.extend(self.args);
+        if args.is_empty() || !self.args.starts_with(&args) {
+            args.extend(self.args);
+        }
         let validation_id = "required-validation".to_string();
         let expected_files = self.relevant_files.clone();
+        let intended_changes = if self.plan_steps.is_empty() {
+            vec![self.intended_change]
+        } else {
+            self.plan_steps
+        };
         WorkflowPlan {
             affected_components: self
                 .relevant_files
@@ -3902,18 +4053,22 @@ impl WorkflowCompactPlanParams {
                 "The declared change must remain limited to the planned files and pass validation."
                     .to_string(),
             ],
-            intended_changes: vec![self.intended_change.clone()],
-            requirements: vec![WorkflowRequirement {
-                id: "declared-change".to_string(),
-                description: self.intended_change,
-                source: RequirementSource::User,
-                priority: RequirementPriority::Critical,
-                mandatory: true,
-                verification: RequirementVerification {
-                    expected_files,
-                    check_ids: vec![validation_id.clone()],
-                },
-            }],
+            intended_changes: intended_changes.clone(),
+            requirements: intended_changes
+                .into_iter()
+                .enumerate()
+                .map(|(index, description)| WorkflowRequirement {
+                    id: format!("planned-change-{}", index + 1),
+                    description,
+                    source: RequirementSource::User,
+                    priority: RequirementPriority::Critical,
+                    mandatory: true,
+                    verification: RequirementVerification {
+                        expected_files: expected_files.clone(),
+                        check_ids: vec![validation_id.clone()],
+                    },
+            })
+            .collect(),
             tests: Vec::new(),
             validation: vec![WorkflowCheck {
                 id: validation_id,
@@ -4377,7 +4532,7 @@ mod tests {
     #[test]
     fn definitions_distinguish_read_only_and_mutating_tools() {
         let tools = definitions();
-        assert_eq!(tools.len(), 34);
+        assert_eq!(tools.len(), 35);
         assert!(tools
             .iter()
             .all(|tool| is_reserved_name(&tool.name) && tool.annotations.is_some()));
@@ -4386,6 +4541,7 @@ mod tests {
             let destructive = matches!(
                 tool.name.as_ref(),
                 APPLY_CHANGES_TOOL_NAME
+                    | WRITE_FILE_TOOL_NAME
                     | ROLLBACK_CHANGES_TOOL_NAME
                     | RUN_PROCESS_TOOL_NAME
                     | GIT_STAGE_OWNED_TOOL_NAME
@@ -4409,6 +4565,37 @@ mod tests {
             assert_eq!(annotations.destructive_hint, Some(destructive));
             assert_eq!(annotations.open_world_hint, Some(false));
         }
+    }
+
+    #[test]
+    fn write_file_uses_the_guarded_single_file_mutation_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["index.html"]);
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "index.html",
+                "content": "<h1>America</h1>\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
+            "<h1>America</h1>\n"
+        );
+        assert_eq!(
+            state
+                .workflow_status(CodingWorkspace::new(temp_dir.path()).unwrap().root(), None)
+                .unwrap()
+                .changed_files,
+            vec![PathBuf::from("index.html")]
+        );
     }
 
     #[test]
@@ -4572,6 +4759,10 @@ mod tests {
                 "workflow_id": started["id"].as_str().unwrap(),
                 "relevant_files": ["lib.rs"],
                 "intended_change": "normalize labels as lowercase",
+                "plan_steps": [
+                    "Update lib.rs to normalize labels as lowercase",
+                    "Run the library test suite"
+                ],
                 "validation_program": "cargo test --lib",
                 "args": ["--no-fail-fast"]
             })),
@@ -4583,12 +4774,39 @@ mod tests {
         assert_eq!(planned["phase"], "planning");
         assert_eq!(planned["plan"]["requirements"][0]["mandatory"], true);
         assert_eq!(
+            planned["plan"]["intended_changes"],
+            serde_json::json!([
+                "Update lib.rs to normalize labels as lowercase",
+                "Run the library test suite"
+            ])
+        );
+        assert_eq!(planned["plan"]["requirements"].as_array().unwrap().len(), 2);
+        assert_eq!(
             planned["plan"]["validation"][0]["command"]["program"],
             "cargo"
         );
         assert_eq!(
             planned["plan"]["validation"][0]["command"]["args"],
             serde_json::json!(["test", "--lib", "--no-fail-fast"])
+        );
+    }
+
+    #[test]
+    fn compact_plan_deduplicates_program_arguments_repeated_in_args() {
+        let plan = WorkflowCompactPlanParams {
+            workflow_id: serde_json::from_str("\"workflow_00000000-0000-7000-8000-000000000000\"")
+                .unwrap(),
+            relevant_files: vec![PathBuf::from("script.js")],
+            intended_change: "validate script.js".to_string(),
+            plan_steps: Vec::new(),
+            validation_program: "node --check script.js".to_string(),
+            args: vec!["--check".to_string(), "script.js".to_string()],
+        }
+        .into_plan();
+
+        assert_eq!(
+            plan.validation[0].command.args,
+            vec!["--check".to_string(), "script.js".to_string()]
         );
     }
 
@@ -4914,7 +5132,7 @@ mod tests {
         let canonical_root = temp_dir.path().canonicalize().unwrap();
         assert!(state
             .workflow_guidance_for_workspace(&canonical_root)
-            .is_some_and(|guidance| guidance.contains("Call coding__apply_changes now")));
+            .is_some_and(|guidance| guidance.contains("exposed mutation tool now")));
         let apply = CallToolRequestParams::new(APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
             "changes": [
                 {"operation": "create", "path": "one.txt", "content": "one\n"},

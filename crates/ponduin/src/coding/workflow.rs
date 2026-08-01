@@ -898,7 +898,17 @@ pub enum TaskIntent {
 impl TaskIntent {
     pub fn detect(request: &str) -> Self {
         let request = request.to_ascii_lowercase();
-        if [
+        if ["repair", "fix", "beheb", "reparier", "bug"]
+            .iter()
+            .any(|term| request.contains(term))
+        {
+            Self::Repair
+        } else if ["create", "erstelle", "neu", "new project", "anlegen"]
+            .iter()
+            .any(|term| request.contains(term))
+        {
+            Self::Create
+        } else if [
             "analyse",
             "analys",
             "analyze",
@@ -923,16 +933,6 @@ impl TaskIntent {
         .any(|term| request.contains(term))
         {
             Self::Verify
-        } else if ["repair", "fix", "beheb", "reparier", "bug"]
-            .iter()
-            .any(|term| request.contains(term))
-        {
-            Self::Repair
-        } else if ["create", "erstelle", "neu", "new project", "anlegen"]
-            .iter()
-            .any(|term| request.contains(term))
-        {
-            Self::Create
         } else {
             Self::Modify
         }
@@ -2235,6 +2235,16 @@ mod tests {
         );
         assert_eq!(status.task.interaction_mode, TaskInteractionMode::ReadOnly);
         assert_eq!(status.task.intent, TaskIntent::Inspect);
+    }
+
+    #[test]
+    fn creation_intent_wins_over_inspection_and_validation_steps() {
+        assert_eq!(
+            TaskIntent::detect(
+                "Create index.html, styles.css, and script.js. Work through inspection and validation."
+            ),
+            TaskIntent::Create
+        );
     }
 
     #[test]

@@ -11,22 +11,17 @@ export type WorkflowProgress = {
   changedFiles: number;
   currentStep: number;
   deletions?: number;
+  phaseCount: number;
   steps: WorkflowProgressStep[];
 };
+
+const WORKFLOW_PHASE_COUNT = 5;
 
 type CodingToolCall = {
   arguments: Record<string, unknown>;
   id: string;
   name: string;
 };
-
-const STEP_LABELS = [
-  'Arbeitsbereich analysieren',
-  'Plan festlegen',
-  'Änderung umsetzen',
-  'Prüfen und reviewen',
-  'Ergebnis abschließen',
-] as const;
 
 export function getWorkflowProgress(messages: Message[]): WorkflowProgress | undefined {
   const successfulToolIds = successfulToolResponseIds(messages);
@@ -38,20 +33,21 @@ export function getWorkflowProgress(messages: Message[]): WorkflowProgress | und
     return undefined;
   }
 
-  const names = new Set(workflowCalls.map((call) => call.name));
   const plan = [...workflowCalls].reverse().find((call) => call.name === 'workflow_set_plan');
   const changedFiles = changedFileCount(workflowCalls);
-  const currentStep = currentStepFor(names);
+  const currentStep = currentStepFor(workflowCalls);
   const lineCounts = diffLineCounts(messages, workflowCalls);
-  const planDetail = plan ? planSummary(plan.arguments) : undefined;
-  const steps = STEP_LABELS.map((label, index) => ({
+  const planSteps = plan ? concretePlanSteps(plan.arguments) : [];
+  const fallbackStep = workflowObjective(workflowCalls);
+  const steps = (planSteps.length > 0 ? planSteps : [fallbackStep]).map((label, index, all) => ({
     label,
-    detail: stepDetail(index + 1, planDetail, changedFiles),
-    status: stepStatus(index + 1, currentStep),
+    detail: stepDetail(index, all.length, currentStep, changedFiles),
+    status: stepStatus(index, all.length, currentStep),
   }));
 
   return {
     currentStep,
+    phaseCount: WORKFLOW_PHASE_COUNT,
     changedFiles,
     steps,
     ...(lineCounts ? lineCounts : {}),
@@ -102,11 +98,20 @@ function toolResponseSucceeded(response: ToolResponse): boolean {
   return response.toolResult.status === 'success';
 }
 
-function currentStepFor(names: Set<string>): number {
+function currentStepFor(calls: CodingToolCall[]): number {
+  const names = new Set(calls.map((call) => call.name));
+  const transitions = new Set(
+    calls
+      .filter((call) => call.name === 'workflow_transition')
+      .map((call) => call.arguments.transition)
+  );
   if (names.has('workflow_complete')) {
     return 5;
   }
-  if (names.has('review_changes') || names.has('workflow_transition')) {
+  if (names.has('review_changes') || transitions.has('begin_review')) {
+    return 4;
+  }
+  if (names.has('run_validation') || names.has('run_process') || transitions.has('begin_validation')) {
     return 4;
   }
   if (names.has('apply_changes')) {
@@ -118,28 +123,46 @@ function currentStepFor(names: Set<string>): number {
   return 1;
 }
 
-function stepStatus(step: number, currentStep: number): WorkflowProgressStep['status'] {
-  if (step < currentStep || currentStep === 5) {
+function stepStatus(
+  index: number,
+  stepCount: number,
+  currentStep: number
+): WorkflowProgressStep['status'] {
+  if (currentStep === 5) {
     return 'complete';
   }
-  return step === currentStep ? 'active' : 'pending';
+  const activeIndex = Math.min(Math.max(currentStep - 1, 0), stepCount - 1);
+  if (index < activeIndex) {
+    return 'complete';
+  }
+  return index === activeIndex ? 'active' : 'pending';
 }
 
-function stepDetail(step: number, planDetail: string | undefined, changedFiles: number): string {
-  switch (step) {
-    case 1:
-      return 'Relevante Dateien und Projekthinweise werden gelesen.';
-    case 2:
-      return planDetail ?? 'Der Agent legt Ziel, Dateien und Prüfungen fest.';
-    case 3:
-      return changedFiles > 0
-        ? `${changedFiles} Datei${changedFiles === 1 ? ' wurde' : 'en wurden'} geändert.`
-        : 'Die geplante Änderung wird versionsgesichert angewendet.';
-    case 4:
-      return 'Tests, Validierung und Änderungsreview laufen mit aktuellen Ergebnissen.';
-    default:
-      return 'Der Agent schließt erst nach erfolgreicher Prüfung ab.';
+function stepDetail(
+  index: number,
+  stepCount: number,
+  currentStep: number,
+  changedFiles: number
+): string {
+  const activeIndex = Math.min(Math.max(currentStep - 1, 0), stepCount - 1);
+  if (currentStep === 5) {
+    return 'Abgeschlossen und durch den Workflow belegt.';
   }
+  if (index !== activeIndex) {
+    return '';
+  }
+  if (currentStep === 1) {
+    return 'Der Agent erfasst die dafür notwendigen Projektinformationen.';
+  }
+  if (currentStep === 3) {
+    return changedFiles > 0
+      ? `${changedFiles} Datei${changedFiles === 1 ? ' wurde' : 'en wurden'} bereits geändert.`
+      : 'Die Änderung wird vorbereitet.';
+  }
+  if (currentStep === 4) {
+    return 'Die aktuelle Revision wird geprüft.';
+  }
+  return 'Der konkrete Plan wurde akzeptiert.';
 }
 
 function changedFileCount(calls: CodingToolCall[]): number {
@@ -162,19 +185,40 @@ function changedFileCount(calls: CodingToolCall[]): number {
   return paths.size;
 }
 
-function planSummary(argumentsValue: Record<string, unknown>): string | undefined {
+function concretePlanSteps(argumentsValue: Record<string, unknown>): string[] {
   const plan = record(argumentsValue.plan);
-  const intendedChange = argumentsValue.intended_change ?? plan?.intended_changes;
-  if (typeof intendedChange === 'string' && intendedChange.trim()) {
-    return intendedChange.trim();
-  }
-  if (Array.isArray(intendedChange)) {
-    const changes = intendedChange.filter((item): item is string => typeof item === 'string');
-    if (changes.length > 0) {
-      return changes.join(' ');
+  return firstNonEmptyStringArray(
+    argumentsValue.plan_steps,
+    argumentsValue.steps,
+    plan?.plan_steps,
+    plan?.steps,
+    plan?.intended_changes,
+    argumentsValue.intended_change
+  );
+}
+
+function workflowObjective(calls: CodingToolCall[]): string {
+  const start = [...calls].reverse().find((call) => call.name === 'workflow_start');
+  const objective = start?.arguments.objective;
+  return typeof objective === 'string' && objective.trim()
+    ? objective.trim()
+    : 'Der Agent konkretisiert den Auftrag.';
+}
+
+function firstNonEmptyStringArray(...values: unknown[]): string[] {
+  for (const value of values) {
+    const items = Array.isArray(value)
+      ? value.filter(
+          (item): item is string => typeof item === 'string' && item.trim().length > 0
+        )
+      : typeof value === 'string' && value.trim()
+        ? [value]
+        : [];
+    if (items.length > 0) {
+      return [...new Set(items.map((item) => item.trim()))];
     }
   }
-  return undefined;
+  return [];
 }
 
 function diffLineCounts(

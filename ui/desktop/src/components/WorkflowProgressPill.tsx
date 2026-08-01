@@ -20,12 +20,12 @@ export default function WorkflowProgressPill({
   }
 
   return (
-    <div className="relative z-20 -mb-1 flex justify-center px-4" aria-live="polite">
+    <div className="relative z-20 mb-3 flex justify-center px-4" aria-live="polite">
       <Tooltip>
         <TooltipTrigger asChild>
           <button
             type="button"
-            aria-label={`Workflow, Schritt ${progress.currentStep} von ${progress.steps.length}`}
+            aria-label={`Workflow, Schritt ${progress.currentStep} von ${progress.phaseCount}`}
             className="flex items-center gap-2 rounded-full border border-border-primary bg-background-secondary px-4 py-2 text-sm text-text-secondary shadow-sm transition-colors hover:bg-background-tertiary"
           >
             <LoaderCircle
@@ -33,7 +33,7 @@ export default function WorkflowProgressPill({
               aria-hidden="true"
             />
             <span>
-              Schritt {progress.currentStep}/{progress.steps.length}
+              Schritt {progress.currentStep}/{progress.phaseCount}
             </span>
             <span aria-hidden="true">·</span>
             <span>
@@ -48,6 +48,9 @@ export default function WorkflowProgressPill({
           </button>
         </TooltipTrigger>
         <TooltipContent side="top" className="w-[min(28rem,calc(100vw-2rem))] p-3 text-left">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-inverse/60">
+            Konkreter Plan
+          </p>
           <ol className="space-y-2">
             {progress.steps.map((step, index) => (
               <li key={step.label} className="flex items-start gap-2">
@@ -56,7 +59,7 @@ export default function WorkflowProgressPill({
                   <p className="font-medium">
                     {index + 1}. {step.label}
                   </p>
-                  <p className="mt-0.5 text-text-inverse/70">{step.detail}</p>
+                  {step.detail && <p className="mt-0.5 text-text-inverse/70">{step.detail}</p>}
                 </div>
               </li>
             ))}

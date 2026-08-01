@@ -43,7 +43,11 @@ describe('getWorkflowProgress', () => {
         request('start', 'workflow_start'),
         response('start'),
         request('plan', 'workflow_set_plan', {
-          intended_change: 'Normalize labels to lowercase.',
+          plan_steps: [
+            'Normalize labels to lowercase.',
+            'Run the library test suite.',
+            'Review the changed implementation.',
+          ],
         }),
         response('plan'),
         request('apply', 'apply_changes', {
@@ -71,10 +75,12 @@ describe('getWorkflowProgress', () => {
       'complete',
       'complete',
       'complete',
-      'complete',
-      'complete',
     ]);
-    expect(progress?.steps[1].detail).toBe('Normalize labels to lowercase.');
+    expect(progress?.steps.map((step) => step.label)).toEqual([
+      'Normalize labels to lowercase.',
+      'Run the library test suite.',
+      'Review the changed implementation.',
+    ]);
   });
 
   it('shows the active analysis step before a plan has been accepted', () => {
@@ -84,7 +90,7 @@ describe('getWorkflowProgress', () => {
 
     expect(progress?.currentStep).toBe(1);
     expect(progress?.steps[0].status).toBe('active');
-    expect(progress?.steps.slice(1).every((step) => step.status === 'pending')).toBe(true);
+    expect(progress?.steps[0].label).toBe('Der Agent konkretisiert den Auftrag.');
   });
 
   it('only shows the latest workflow in a session', () => {

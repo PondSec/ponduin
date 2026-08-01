@@ -2162,8 +2162,10 @@ impl Agent {
             )
             .await?;
         if coding_exposure == super::reply_parts::CodingToolExposure::Active {
-            model_config = model_config
-                .with_default_thinking_effort(provider.default_coding_thinking_effort());
+            model_config = model_config.with_thinking_effort(
+                self.coding_agent
+                    .next_action_thinking_effort(&session.working_dir),
+            );
             if let Some(original_user_request) = latest_user_request(&conversation) {
                 self.coding_agent.register_task_context(
                     ponduin_mode,
@@ -2261,6 +2263,12 @@ impl Agent {
                 coding_exposure == super::reply_parts::CodingToolExposure::Active;
 
             loop {
+                if coding_tools_active {
+                    model_config = model_config.with_thinking_effort(
+                        self.coding_agent
+                            .next_action_thinking_effort(&session.working_dir),
+                    );
+                }
                 if is_token_cancelled(&cancel_token) {
                     break;
                 }
@@ -2525,7 +2533,7 @@ impl Agent {
                                 let suppress_user_visible_response = coding_tools_active
                                     && self
                                         .coding_agent
-                                        .active_workflow_continuation(&session.working_dir)
+                                        .workflow_continuation(&session.working_dir)
                                         .is_some();
 
                                 if !suppress_user_visible_response
@@ -3151,7 +3159,7 @@ impl Agent {
                         None if coding_tools_active => {
                             if let Some(continuation) = self
                                 .coding_agent
-                                .active_workflow_continuation(&session.working_dir)
+                                .workflow_continuation(&session.working_dir)
                             {
                                 messages_to_add.push(
                                     Message::user()

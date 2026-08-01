@@ -4,9 +4,11 @@ use crate::coding::tools;
 use crate::coding::{CodingWorkspace, ModelCapabilityProfile, TaskInteractionMode};
 use crate::config::PonduinMode;
 use ponduin_providers::model::ModelConfig;
+use ponduin_providers::thinking::ThinkingEffort;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool,
 };
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -106,6 +108,19 @@ impl CodingAgent {
             .active_workflow_continuation(workspace.root())
     }
 
+    pub(crate) fn workflow_continuation(&self, working_dir: &Path) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        self.tool_state.workflow_continuation(workspace.root())
+    }
+
+    pub(crate) fn next_action_thinking_effort(&self, working_dir: &Path) -> ThinkingEffort {
+        let Ok(workspace) = CodingWorkspace::new(working_dir) else {
+            return ThinkingEffort::Off;
+        };
+        self.tool_state
+            .next_action_thinking_effort(workspace.root())
+    }
+
     pub(crate) fn terminal_workflow_message(&self, working_dir: &Path) -> Option<String> {
         let workspace = CodingWorkspace::new(working_dir).ok()?;
         self.tool_state.terminal_workflow_message(workspace.root())
@@ -164,16 +179,26 @@ impl CodingAgent {
         }
 
         let capabilities = ModelCapabilityProfile::detect(model_config, &self.config);
-        let completion_guidance = "For an explicit implementation request, turn every named file, \
+        let mutation_tool = if uses_compact_qwen_coding_tools(model_config) {
+            "coding__write_file"
+        } else {
+            "coding__apply_changes"
+        };
+        let completion_guidance = format!(
+            "For an explicit implementation request, turn every named file, \
             mutation, validation, and repository action into a completion checklist. In an empty \
             workspace, one initial repository inspection is sufficient: create every named file \
-            next with coding__apply_changes. Never repeat an unchanged discovery call. After each \
+            next with {mutation_tool}. Never repeat an unchanged discovery call. After each \
             tool result, continue with the next unchecked requirement. A partial mutation is not a \
-            completed request; run the requested validation before giving a final response.";
+            completed request; run the requested validation before giving a final response."
+        );
         let compact_tool_guidance = if uses_compact_qwen_coding_tools(model_config) {
             "When work remains, call exactly one suitable tool for the next smallest verified step \
-             and emit no prose before it. The compact tool contract is intentional: use only the \
-             fields it shows, then use the returned result before choosing the next action."
+             and emit no prose before it. Do not announce a tool or wait for a helper: only a \
+             valid call from the disclosed tools advances the task. The compact tool contract is \
+             intentional: use only the fields it shows, then use the returned result before \
+             choosing the next action. For a file creation or update, use coding__write_file for \
+             one file at a time; do not serialize a change batch inside a string."
         } else {
             ""
         };
@@ -185,7 +210,7 @@ impl CodingAgent {
              the required mutation and run the relevant validation. After a read or search, \
              immediately take the next required action; never finish after read-only calls, and \
              never repeat an unchanged search. In an empty workspace, create the requested files \
-             with coding__apply_changes rather than searching again. If a change is blocked, use \
+             with the exposed mutation tool rather than searching again. If a change is blocked, use \
              the returned error to repair the request or report the concrete blocker."
         } else {
             ""
@@ -213,7 +238,10 @@ impl CodingAgent {
              then complete with the evidence-backed report. In a new or empty project, the plan's \
              relevant_files must name the workspace-relative paths that will be created; it must \
              never be an empty array. Never claim a check passed from model text; process results \
-             are recorded automatically. Optional local retrieval: LSP={}, feature_embeddings={}. \
+             are recorded automatically. For direct workspace work, use the currently exposed \
+             coding__ tools. execute_typescript and invented wrappers never replace the exposed \
+             mutation tool or coding__run_process. Optional local retrieval: LSP={}, \
+             feature_embeddings={}. \
              {} {} {} {}",
             self.config.lsp,
             self.config.embeddings,
@@ -227,7 +255,7 @@ impl CodingAgent {
     pub async fn execute(
         &self,
         ponduin_mode: PonduinMode,
-        tool_call: CallToolRequestParams,
+        mut tool_call: CallToolRequestParams,
         working_dir: &Path,
     ) -> Result<CallToolResult, ErrorData> {
         if !tools::is_reserved_name(&tool_call.name) {
@@ -253,6 +281,8 @@ impl CodingAgent {
         }
         let workspace = CodingWorkspace::new(working_dir)
             .map_err(|error| ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None))?;
+        self.fill_missing_workflow_objective(&mut tool_call, workspace.root());
+        normalize_structured_tool_arguments(&mut tool_call);
         let exposed = self.tool_state.definitions_for_workspace(workspace.root());
         if !exposed.iter().any(|tool| tool.name == tool_call.name) {
             let next_tools = exposed
@@ -327,14 +357,23 @@ impl CodingAgent {
                     "The request was blocked. Read the active workflow status and take its next allowed step before retrying.",
                 )
             }
-            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+            1 if is_versioned_mutation_tool(tool_name)
                 && (error.message.contains("missing field `expected_digest`")
-                    || error.message.contains("digest conflict")) => {
+                    || error.message.contains("digest conflict")
+                    || error.message.contains("file already exists")) => {
                 "Read the existing file with coding__read_file first, then retry the write with the exact expected_digest returned for that path."
             }
             1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
                 && error.message.contains("missing field `changes`") => {
                 "Apply changes requires a non-empty changes array. Read the target file for its current digest, then send one write change with operation, path, content, and that exact expected_digest."
+            }
+            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+                && error.message.contains("expected a sequence") => {
+                "The changes field must be a JSON array, not a quoted JSON string. Send changes: [{\"operation\":\"create\",\"path\":\"index.html\",\"content\":\"...\"}] directly, without JSON.stringify or extra quotes."
+            }
+            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
+                && error.message.contains("expected a sequence") => {
+                "The compact plan fields relevant_files, plan_steps, and args must be JSON arrays, never a formatted text block. Send intended_change as one plain sentence and send plan_steps: [\"Create index.html\",\"Style the page\",\"Add the button behavior\"] directly in the tool arguments."
             }
             1 if tool_name == tools::FIND_FILES_TOOL_NAME
                 && error.message.contains("search query must not be empty") => {
@@ -385,17 +424,103 @@ impl CodingAgent {
     fn available(&self, ponduin_mode: PonduinMode) -> bool {
         ponduin_mode != PonduinMode::Chat
     }
+
+    fn fill_missing_workflow_objective(
+        &self,
+        tool_call: &mut CallToolRequestParams,
+        workspace_root: &Path,
+    ) {
+        if tool_call.name != tools::WORKFLOW_START_TOOL_NAME {
+            return;
+        }
+        let has_objective = tool_call
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("objective"))
+            .and_then(Value::as_str)
+            .is_some_and(|objective| !objective.trim().is_empty());
+        if has_objective {
+            return;
+        }
+        let Some(task) = self.tool_state.pending_task_context(workspace_root) else {
+            return;
+        };
+        tool_call
+            .arguments
+            .get_or_insert_with(Default::default)
+            .insert(
+                "objective".to_string(),
+                Value::String(task.normalized_objective),
+            );
+    }
+}
+
+fn normalize_structured_tool_arguments(tool_call: &mut CallToolRequestParams) {
+    let fields: &[(&str, bool)] = match tool_call.name.as_ref() {
+        tools::APPLY_CHANGES_TOOL_NAME | tools::PREVIEW_CHANGES_TOOL_NAME => &[("changes", false)],
+        tools::WORKFLOW_SET_PLAN_TOOL_NAME => &[
+            ("plan", true),
+            ("relevant_files", false),
+            ("plan_steps", false),
+            ("args", false),
+        ],
+        _ => return,
+    };
+    let Some(arguments) = tool_call.arguments.as_mut() else {
+        return;
+    };
+    for (field, object) in fields {
+        let Some(Value::String(serialized)) = arguments.get(*field) else {
+            continue;
+        };
+        let value = serde_json::from_str::<Value>(serialized).ok().or_else(|| {
+            (!*object)
+                .then(|| serde_json::from_str(&format!("[{serialized}]")).ok())
+                .flatten()
+        });
+        let Some(value) = value else {
+            continue;
+        };
+        if (*object && value.is_object()) || (!*object && value.is_array()) {
+            arguments.insert((*field).to_string(), value);
+        }
+    }
+    if tool_call.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
+        && !arguments.contains_key("plan")
+        && (arguments.contains_key("affected_components") || arguments.contains_key("requirements"))
+    {
+        let plan = [
+            "affected_components",
+            "relevant_files",
+            "risks",
+            "intended_changes",
+            "requirements",
+            "tests",
+            "validation",
+            "rollback_strategy",
+        ]
+        .into_iter()
+        .filter_map(|field| {
+            arguments
+                .remove(field)
+                .map(|value| (field.to_string(), value))
+        })
+        .collect();
+        arguments.insert("plan".to_string(), Value::Object(plan));
+    }
 }
 
 fn contract_failure_class(tool_name: &str, message: &str) -> &'static str {
     if message.contains("not currently allowed") {
         "workflow_phase"
-    } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+    } else if is_versioned_mutation_tool(tool_name)
         && message.contains("missing field `expected_digest`")
     {
         "missing_digest"
-    } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME && message.contains("digest conflict") {
+    } else if is_versioned_mutation_tool(tool_name) && message.contains("digest conflict") {
         "stale_digest"
+    } else if is_versioned_mutation_tool(tool_name) && message.contains("file already exists") {
+        "missing_digest"
     } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME
         && message.contains("missing field `changes`")
     {
@@ -411,6 +536,13 @@ fn contract_failure_class(tool_name: &str, message: &str) -> &'static str {
     } else {
         "invalid_tool_contract"
     }
+}
+
+fn is_versioned_mutation_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        tools::APPLY_CHANGES_TOOL_NAME | tools::WRITE_FILE_TOOL_NAME
+    )
 }
 
 fn uses_compact_qwen_coding_tools(model_config: &ModelConfig) -> bool {
@@ -439,9 +571,9 @@ mod tests {
 
         assert!(agent.tools(PonduinMode::Chat).is_empty());
         assert!(agent.routing_tools(PonduinMode::Chat).is_empty());
-        assert_eq!(agent.tool_count(PonduinMode::Auto), 34);
-        assert_eq!(agent.tool_count(PonduinMode::Approve), 34);
-        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 34);
+        assert_eq!(agent.tool_count(PonduinMode::Auto), 35);
+        assert_eq!(agent.tool_count(PonduinMode::Approve), 35);
+        assert_eq!(agent.tool_count(PonduinMode::SmartApprove), 35);
         assert_eq!(agent.routing_tools(PonduinMode::Auto).len(), 2);
     }
 
@@ -460,8 +592,61 @@ mod tests {
         assert!(prompt.contains("relevant_files"));
         assert!(prompt.contains("paths that will be created"));
         assert!(prompt.contains("Never claim a check passed"));
+        assert!(prompt.contains("execute_typescript"));
         assert!(prompt.contains("active for this model-selected request"));
         assert!(prompt.contains("Model capability profile"));
+    }
+
+    #[test]
+    fn retained_task_continues_before_the_model_starts_a_workflow() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent.register_task_context(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Create index.html, styles.css, and script.js for an America information website."
+                .to_string(),
+        );
+
+        let continuation = agent.workflow_continuation(temp_dir.path()).unwrap();
+
+        assert!(continuation.contains("Create index.html, styles.css, and script.js"));
+        assert!(continuation.contains(tools::WORKFLOW_START_TOOL_NAME));
+        assert!(continuation.contains("execute_typescript"));
+        assert!(continuation.contains("Do not stop after narration"));
+        assert!(agent
+            .active_workflow_continuation(temp_dir.path())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_task_supplies_a_missing_workflow_objective() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent.register_task_context(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Create index.html, styles.css, and script.js for an America information website."
+                .to_string(),
+        );
+
+        let started = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let status: Value =
+            serde_json::from_str(&started.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(status["phase"], "analyzing");
+        assert!(status["objective"]
+            .as_str()
+            .unwrap()
+            .contains("Create index.html, styles.css, and script.js"));
     }
 
     #[tokio::test]
@@ -661,6 +846,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_single_file_write_recovery_requires_a_versioned_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("index.html"), "<h1>before</h1>\n").unwrap();
+        let agent = enabled_agent();
+        begin_editing_workflow(
+            &agent,
+            temp_dir.path(),
+            "repair index.html",
+            vec!["index.html".into()],
+        )
+        .await;
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                    "path": "index.html",
+                    "content": "<h1>after</h1>\n"
+                })),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("file already exists"));
+        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
+        assert!(error.message.contains("expected_digest"));
+    }
+
+    #[tokio::test]
     async fn empty_change_digest_recovery_requires_a_versioned_read() {
         let temp_dir = tempfile::tempdir().unwrap();
         fs::write(temp_dir.path().join("lib.rs"), "pub fn label() {}\n").unwrap();
@@ -731,6 +946,150 @@ mod tests {
         assert!(error.message.contains("missing field `changes`"));
         assert!(error.message.contains("non-empty changes array"));
         assert!(error.message.contains("expected_digest"));
+    }
+
+    #[tokio::test]
+    async fn serialized_change_batches_are_normalized_before_validation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        begin_editing_workflow(
+            &agent,
+            temp_dir.path(),
+            "create index.html",
+            vec!["index.html".into()],
+        )
+        .await;
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(
+                    object!({
+                        "changes": "[{\"operation\":\"create\",\"path\":\"index.html\",\"content\":\"hello\"}]"
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn flat_workflow_plan_is_wrapped_without_model_specific_rules() {
+        let mut call = CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+            .with_arguments(object!({
+                "workflow_id": "workflow_00000000-0000-7000-8000-000000000000",
+                "affected_components": ["src/lib.rs"],
+                "relevant_files": ["src/lib.rs"],
+                "risks": [],
+                "intended_changes": ["Update src/lib.rs"],
+                "requirements": [],
+                "tests": [],
+                "validation": [],
+                "rollback_strategy": "revert the change"
+            }));
+
+        normalize_structured_tool_arguments(&mut call);
+
+        let arguments = call.arguments.unwrap();
+        assert_eq!(
+            arguments["workflow_id"],
+            "workflow_00000000-0000-7000-8000-000000000000"
+        );
+        assert_eq!(
+            arguments["plan"]["relevant_files"],
+            serde_json::json!(["src/lib.rs"])
+        );
+        assert!(!arguments.contains_key("affected_components"));
+    }
+
+    #[tokio::test]
+    async fn serialized_compact_plan_lists_receive_a_schema_specific_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let started = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "create index.html"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let workflow_id: Value =
+            serde_json::from_str(&started.content[0].as_text().unwrap().text).unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(
+                    object!({
+                        "workflow_id": workflow_id["id"],
+                        "relevant_files": "not valid JSON",
+                        "intended_change": "Create index.html.",
+                        "plan_steps": "[\"Create index.html\"]",
+                        "validation_program": "node"
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("expected a sequence"));
+        assert!(error.message.contains("compact plan fields relevant_files"));
+        assert!(error.message.contains("formatted text block"));
+    }
+
+    #[tokio::test]
+    async fn comma_separated_structured_array_is_normalized() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let started = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "create index.html"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let workflow_id: Value =
+            serde_json::from_str(&started.content[0].as_text().unwrap().text).unwrap();
+
+        let planned = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(
+                    object!({
+                        "workflow_id": workflow_id["id"],
+                        "relevant_files": ["index.html"],
+                        "intended_change": "Create index.html.",
+                        "plan_steps": "\"Create index.html\", \"Validate index.html\"",
+                        "validation_program": "node",
+                        "args": ["--version"]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let planned: Value =
+            serde_json::from_str(&planned.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(planned["phase"], "planning");
+        assert_eq!(
+            planned["plan"]["intended_changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -919,7 +1278,7 @@ mod tests {
             .execute(
                 PonduinMode::Auto,
                 CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
-                    .with_arguments(object!({"workflow_id": "workflow_00000000-0000-7000-8000-000000000000", "plan": "{}"})),
+                    .with_arguments(object!({"workflow_id": "workflow_00000000-0000-7000-8000-000000000000", "plan": "<plan>{}</plan>"})),
                 temp_dir.path(),
             )
             .await
@@ -970,7 +1329,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(tools.len(), 16);
-        assert!(names.contains(&tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(names.contains(&tools::WRITE_FILE_TOOL_NAME));
+        assert!(!names.contains(&tools::APPLY_CHANGES_TOOL_NAME));
         assert!(names.contains(&tools::RUN_PROCESS_TOOL_NAME));
         assert!(names.contains(&tools::WORKFLOW_START_TOOL_NAME));
         assert!(names.contains(&tools::WORKFLOW_SET_PLAN_TOOL_NAME));
@@ -982,6 +1342,7 @@ mod tests {
             .system_prompt_for_model(PonduinMode::Auto, &model)
             .unwrap();
         assert!(prompt.contains("call exactly one suitable tool"));
+        assert!(prompt.contains("coding__write_file"));
 
         let emulated_model = model.clone().with_toolshim(true);
         let emulated_tools = agent.tools_for_workspace_for_model(
@@ -1075,7 +1436,7 @@ mod tests {
         assert!(prompt.contains("Change at most 1 files"));
         assert!(prompt.contains("one initial repository inspection is sufficient"));
         assert!(prompt.contains("never finish after read-only calls"));
-        assert!(prompt.contains("create the requested files with coding__apply_changes"));
+        assert!(prompt.contains("create the requested files with the exposed mutation tool"));
     }
 
     #[tokio::test]

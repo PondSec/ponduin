@@ -39,7 +39,9 @@ function workflowMessages(): Message[] {
       content: [
         tool('start', 'workflow_start'),
         result('start'),
-        tool('plan', 'workflow_set_plan', { intended_change: 'Normalize labels to lowercase.' }),
+        tool('plan', 'workflow_set_plan', {
+          plan_steps: ['Normalize labels to lowercase.', 'Run the library test suite.'],
+        }),
         result('plan'),
         tool('apply', 'apply_changes', {
           changes: [{ operation: 'write', path: 'lib.rs', content: 'updated' }],
@@ -70,8 +72,9 @@ describe('WorkflowProgressPill', () => {
     await user.hover(trigger);
 
     const tooltip = within(await screen.findByRole('tooltip'));
-    expect(tooltip.getByText(/Plan festlegen/)).toBeInTheDocument();
-    expect(tooltip.getByText('Normalize labels to lowercase.')).toBeInTheDocument();
+    expect(tooltip.getByText('Konkreter Plan')).toBeInTheDocument();
+    expect(tooltip.getByText(/Normalize labels to lowercase\./)).toBeInTheDocument();
+    expect(tooltip.getByText(/Run the library test suite\./)).toBeInTheDocument();
     expect(tooltip.getByText('Running final checks')).toBeInTheDocument();
   });
 });
