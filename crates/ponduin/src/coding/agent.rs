@@ -307,7 +307,11 @@ impl CodingAgent {
         }
         let repetitions = self
             .tool_state
-            .record_tool_contract_failure(workspace_root, tool_name, "invalid_tool_contract")
+            .record_tool_contract_failure(
+                workspace_root,
+                tool_name,
+                contract_failure_class(tool_name, &error.message),
+            )
             .unwrap_or(1);
         let workflow_hint = self
             .tool_state
@@ -325,8 +329,7 @@ impl CodingAgent {
             }
             1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
                 && (error.message.contains("missing field `expected_digest`")
-                    || (error.message.contains("digest conflict")
-                        && error.message.contains("expected ,"))) => {
+                    || error.message.contains("digest conflict")) => {
                 "Read the existing file with coding__read_file first, then retry the write with the exact expected_digest returned for that path."
             }
             1 if tool_name == tools::FIND_FILES_TOOL_NAME
@@ -377,6 +380,28 @@ impl CodingAgent {
 
     fn available(&self, ponduin_mode: PonduinMode) -> bool {
         ponduin_mode != PonduinMode::Chat
+    }
+}
+
+fn contract_failure_class(tool_name: &str, message: &str) -> &'static str {
+    if message.contains("not currently allowed") {
+        "workflow_phase"
+    } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+        && message.contains("missing field `expected_digest`")
+    {
+        "missing_digest"
+    } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME && message.contains("digest conflict") {
+        "stale_digest"
+    } else if message.contains("requested path is unavailable") {
+        "unavailable_path"
+    } else if message.contains("missing field `objective`") {
+        "missing_objective"
+    } else if message.contains("expected path string") {
+        "malformed_path"
+    } else if message.contains("search query must not be empty") {
+        "empty_file_query"
+    } else {
+        "invalid_tool_contract"
     }
 }
 
@@ -598,6 +623,12 @@ mod tests {
             vec!["lib.rs".into()],
         )
         .await;
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        agent.tool_state.record_tool_contract_failure(
+            workspace.root(),
+            tools::APPLY_CHANGES_TOOL_NAME,
+            "workflow_phase",
+        );
 
         let error = agent
             .execute(
@@ -633,6 +664,13 @@ mod tests {
             vec!["lib.rs".into()],
         )
         .await;
+
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        agent.tool_state.record_tool_contract_failure(
+            workspace.root(),
+            tools::APPLY_CHANGES_TOOL_NAME,
+            "workflow_phase",
+        );
 
         let error = agent
             .execute(
