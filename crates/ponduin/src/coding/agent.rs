@@ -324,7 +324,9 @@ impl CodingAgent {
                 )
             }
             1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-                && error.message.contains("missing field `expected_digest`") => {
+                && (error.message.contains("missing field `expected_digest`")
+                    || (error.message.contains("digest conflict")
+                        && error.message.contains("expected ,"))) => {
                 "Read the existing file with coding__read_file first, then retry the write with the exact expected_digest returned for that path."
             }
             1 if tool_name == tools::FIND_FILES_TOOL_NAME
@@ -617,6 +619,44 @@ mod tests {
         assert!(error.message.contains("missing field `expected_digest`"));
         assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
         assert!(error.message.contains("expected_digest"));
+    }
+
+    #[tokio::test]
+    async fn empty_change_digest_recovery_requires_a_versioned_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("lib.rs"), "pub fn label() {}\n").unwrap();
+        let agent = enabled_agent();
+        begin_editing_workflow(
+            &agent,
+            temp_dir.path(),
+            "repair lib.rs",
+            vec!["lib.rs".into()],
+        )
+        .await;
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(
+                    object!({"changes": [{
+                        "operation": "write",
+                        "path": "lib.rs",
+                        "expected_digest": "",
+                        "content": "pub fn label() { println!(\"fixed\"); }\n"
+                    }]}),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.message.contains("digest conflict"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
+        assert!(error.message.contains("exact expected_digest"));
     }
 
     #[tokio::test]
