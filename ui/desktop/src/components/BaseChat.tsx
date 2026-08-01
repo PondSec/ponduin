@@ -8,6 +8,7 @@ import ProgressiveMessageList from './ProgressiveMessageList';
 import { MainPanelLayout } from './Layout/MainPanelLayout';
 import ChatInput from './ChatInput';
 import { ChatInputCard } from './ChatInputCard';
+import WorkflowProgressPill from './WorkflowProgressPill';
 import { ScrollArea, ScrollAreaHandle } from './ui/scroll-area';
 import { useFileDrop } from '../hooks/useFileDrop';
 import { ChatState } from '../types/chatState';
@@ -510,6 +511,8 @@ export default function BaseChat({
             {intl.formatMessage(i18n.reconnecting)}
           </div>
         )}
+
+        <WorkflowProgressPill messages={messages} progressMessage={progressMessage} />
 
         <ChatInputCard
           className={cn(
