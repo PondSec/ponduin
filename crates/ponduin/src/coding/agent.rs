@@ -339,10 +339,17 @@ impl CodingAgent {
                 && error.message.contains("expected path string") => {
                 "The read path must be a plain string, for example {\"path\":\"lib.rs\"}. Do not wrap path in an object."
             }
-            1 if tool_name == tools::READ_FILE_TOOL_NAME
-                && error.message.contains("requested path is unavailable") => {
-                "The file does not exist. Do not guess paths; call coding__find_files, then read only a returned workspace-relative file path."
-            }
+            1 if error.message.contains("requested path is unavailable") => match tool_name {
+                tools::REPOSITORY_INSTRUCTIONS_TOOL_NAME => {
+                    "Repository-instructions accepts one existing workspace-relative path. Retry it with no path to inspect the workspace root, or supply exactly one existing relative path; never use /workspace or a comma-separated list."
+                }
+                tools::READ_FILE_TOOL_NAME => {
+                    "The file does not exist. Do not guess paths; call coding__find_files, then read only one returned workspace-relative file path."
+                }
+                _ => {
+                    "Use exactly one existing workspace-relative path, never /workspace or a comma-separated list. Call coding__find_files first if the path is unknown."
+                }
+            },
             1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
                 && error.message.contains("expected struct WorkflowPlan") => {
                 "The plan argument must be a JSON object, not serialized JSON inside a string. Use plan: {...}; use command program \"cargo\" with args [\"test\"]."
@@ -356,7 +363,7 @@ impl CodingAgent {
                 "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"] with the current workflow_id."
             }
             1 => "The request was not executed. Correct the tool name and arguments from the currently exposed schema before retrying.",
-            2 => "Do not repeat this tool contract. Re-read the active workflow guidance and choose a different currently allowed next step.",
+            2 => "Do not repeat this tool contract. Call coding__find_files with one concrete filename or symbol next, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
             _ => "The workflow is now blocked after repeated identical tool-contract failures. Report the recorded stop reason and do not claim success.",
         };
         ErrorData::new(
@@ -691,6 +698,35 @@ mod tests {
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         assert!(error.message.contains("Do not guess paths"));
         assert!(error.message.contains(tools::FIND_FILES_TOOL_NAME));
+    }
+
+    #[tokio::test]
+    async fn unavailable_instruction_path_recovery_rejects_combined_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "inspect the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::REPOSITORY_INSTRUCTIONS_TOOL_NAME)
+                    .with_arguments(object!({"path": "/workspace/lib.rs,README.md"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("with no path"));
+        assert!(error.message.contains("comma-separated list"));
     }
 
     #[tokio::test]
