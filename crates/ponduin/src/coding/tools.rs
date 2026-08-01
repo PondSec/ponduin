@@ -3864,6 +3864,7 @@ struct WorkflowStartParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowSetPlanParams {
+    #[serde(alias = "flow_id")]
     workflow_id: WorkflowId,
     plan: WorkflowPlan,
 }
