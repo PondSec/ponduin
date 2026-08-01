@@ -14,7 +14,7 @@ export interface UpdateManifest {
   files: UpdateManifestFile[];
 }
 
-export const DEFAULT_UPDATE_CHANNEL: UpdateChannel = 'stable';
+export const DEFAULT_UPDATE_CHANNEL: UpdateChannel = 'main';
 
 export function resolveUpdateChannel(value: string | undefined): UpdateChannel {
   const normalized = value?.trim().toLowerCase();
