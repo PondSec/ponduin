@@ -1077,7 +1077,28 @@ fn compact_native_tool_allowed(name: &str) -> bool {
 }
 
 fn compact_native_tool_schema(mut tool: Tool) -> Tool {
-    tool.description = Some("Compact coding workflow action.".into());
+    tool.description = Some(
+        match tool.name.as_ref() {
+            REPOSITORY_PROFILE_TOOL_NAME => "Inspect repository.",
+            REPOSITORY_INSTRUCTIONS_TOOL_NAME => "Read root instructions.",
+            FIND_FILES_TOOL_NAME => "Find files; query required.",
+            SEARCH_TEXT_TOOL_NAME => "Search text; pattern required.",
+            READ_FILE_TOOL_NAME => "Read one relative path.",
+            PROJECT_CAPABILITIES_TOOL_NAME => "Inspect capabilities.",
+            WORKFLOW_START_TOOL_NAME => "Start workflow; objective required.",
+            WORKFLOW_SET_PLAN_TOOL_NAME => "Set inspected plan.",
+            WORKFLOW_TRANSITION_TOOL_NAME => "Advance workflow phase.",
+            WORKFLOW_STATUS_TOOL_NAME => "Read workflow status.",
+            WORKFLOW_COMPLETE_TOOL_NAME => "Complete after review.",
+            APPLY_CHANGES_TOOL_NAME => "Apply versioned changes.",
+            ROLLBACK_CHANGES_TOOL_NAME => "Rollback change batch.",
+            RUN_PROCESS_TOOL_NAME => "Run validation process.",
+            RUN_VALIDATION_TOOL_NAME => "Run planned validation.",
+            REVIEW_CHANGES_TOOL_NAME => "Review retained changes.",
+            _ => "Compact coding workflow action.",
+        }
+        .into(),
+    );
     tool.input_schema = match tool.name.as_ref() {
         REPOSITORY_PROFILE_TOOL_NAME | PROJECT_CAPABILITIES_TOOL_NAME => object!({
             "type": "object",
