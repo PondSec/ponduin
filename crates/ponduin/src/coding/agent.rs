@@ -1,7 +1,7 @@
 use crate::coding::config::CodingConfig;
 use crate::coding::strategy::MODEL_ROUTING_GUIDANCE;
 use crate::coding::tools;
-use crate::coding::{CodingWorkspace, ModelCapabilityProfile};
+use crate::coding::{CodingWorkspace, ModelCapabilityProfile, TaskInteractionMode};
 use crate::config::PonduinMode;
 use ponduin_providers::model::ModelConfig;
 use rmcp::model::{
@@ -53,7 +53,7 @@ impl CodingAgent {
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return tools::definitions();
         };
-        if uses_compact_native_coding_tools(model_config) {
+        if uses_compact_qwen_coding_tools(model_config) {
             self.tool_state
                 .compact_native_definitions_for_workspace(workspace.root())
         } else {
@@ -67,6 +67,58 @@ impl CodingAgent {
             .workflow_guidance_for_workspace(workspace.root())
     }
 
+    pub(crate) fn register_task_context(
+        &self,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        original_user_request: String,
+    ) {
+        let Ok(workspace) = CodingWorkspace::new(working_dir) else {
+            return;
+        };
+        let interaction_mode = match ponduin_mode {
+            PonduinMode::Chat => TaskInteractionMode::ReadOnly,
+            PonduinMode::Approve | PonduinMode::SmartApprove => TaskInteractionMode::Ask,
+            PonduinMode::Auto => TaskInteractionMode::Autonomous,
+        };
+        if let Err(error) = self.tool_state.register_task_context(
+            workspace.root(),
+            original_user_request,
+            interaction_mode,
+        ) {
+            tracing::warn!("could not retain coding task context: {}", error.message);
+        }
+    }
+
+    pub(crate) fn recovery_instruction(&self, working_dir: &Path) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        self.tool_state.recovery_instruction(workspace.root())
+    }
+
+    pub(crate) fn recovery_exhausted_message(&self, working_dir: &Path) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        self.tool_state.recovery_exhausted_message(workspace.root())
+    }
+
+    pub(crate) fn active_workflow_continuation(&self, working_dir: &Path) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        self.tool_state
+            .active_workflow_continuation(workspace.root())
+    }
+
+    pub(crate) fn terminal_workflow_message(&self, working_dir: &Path) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        self.tool_state.terminal_workflow_message(workspace.root())
+    }
+
+    pub(crate) fn block_for_action_limit(&self, working_dir: &Path, limit: u32) {
+        let Ok(workspace) = CodingWorkspace::new(working_dir) else {
+            return;
+        };
+        self.tool_state
+            .block_for_action_limit(workspace.root(), limit);
+    }
+
     pub fn routing_tools(&self, ponduin_mode: PonduinMode) -> Vec<Tool> {
         if self.available(ponduin_mode) {
             tools::routing_definitions()
@@ -76,7 +128,7 @@ impl CodingAgent {
     }
 
     pub(crate) fn uses_compact_history_for_model(&self, model_config: &ModelConfig) -> bool {
-        uses_compact_native_coding_tools(model_config)
+        uses_compact_qwen_coding_tools(model_config)
     }
 
     pub fn tool_count(&self, ponduin_mode: PonduinMode) -> usize {
@@ -118,7 +170,7 @@ impl CodingAgent {
             next with coding__apply_changes. Never repeat an unchanged discovery call. After each \
             tool result, continue with the next unchecked requirement. A partial mutation is not a \
             completed request; run the requested validation before giving a final response.";
-        let compact_tool_guidance = if uses_compact_native_coding_tools(model_config) {
+        let compact_tool_guidance = if uses_compact_qwen_coding_tools(model_config) {
             "When work remains, call exactly one suitable tool for the next smallest verified step \
              and emit no prose before it. The compact tool contract is intentional: use only the \
              fields it shows, then use the returned result before choosing the next action."
@@ -199,25 +251,115 @@ impl CodingAgent {
                  the request or confirm ordinary in-scope work.",
             )]));
         }
-        if tools::is_async_tool(&tool_call.name) {
-            return tools::execute_async(&self.config, &self.tool_state, tool_call, working_dir)
-                .await;
+        let workspace = CodingWorkspace::new(working_dir)
+            .map_err(|error| ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None))?;
+        let exposed = self.tool_state.definitions_for_workspace(workspace.root());
+        if !exposed.iter().any(|tool| tool.name == tool_call.name) {
+            let next_tools = exposed
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(self.with_contract_recovery(
+                workspace.root(),
+                tool_call.name.as_ref(),
+                ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                    "internal coding tool `{}` is not currently allowed by the active workflow; \
+                     choose one of: {next_tools}",
+                    tool_call.name
+                ),
+                    None,
+                ),
+            ));
         }
+        let tool_name = tool_call.name.to_string();
+        let result = if tools::is_async_tool(&tool_call.name) {
+            tools::execute_async(&self.config, &self.tool_state, tool_call, working_dir).await
+        } else {
+            let config = self.config.clone();
+            let tool_state = Arc::clone(&self.tool_state);
+            let working_dir = PathBuf::from(working_dir);
+            tokio::task::spawn_blocking(move || {
+                tools::execute_with_state(&config, &tool_state, tool_call, &working_dir)
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("internal coding tool task failed: {error}"),
+                    None,
+                )
+            })?
+        };
+        result.map_err(|error| self.with_contract_recovery(workspace.root(), &tool_name, error))
+    }
 
-        let config = self.config.clone();
-        let tool_state = Arc::clone(&self.tool_state);
-        let working_dir = PathBuf::from(working_dir);
-        tokio::task::spawn_blocking(move || {
-            tools::execute_with_state(&config, &tool_state, tool_call, &working_dir)
-        })
-        .await
-        .map_err(|error| {
-            ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("internal coding tool task failed: {error}"),
-                None,
-            )
-        })?
+    fn with_contract_recovery(
+        &self,
+        workspace_root: &Path,
+        tool_name: &str,
+        error: ErrorData,
+    ) -> ErrorData {
+        if error.code != ErrorCode::INVALID_PARAMS {
+            return error;
+        }
+        let Some(repetitions) = self.tool_state.record_tool_contract_failure(
+            workspace_root,
+            tool_name,
+            "invalid_tool_contract",
+        ) else {
+            return error;
+        };
+        let workflow_hint = self
+            .tool_state
+            .active_workflow_id(workspace_root)
+            .map(|workflow_id| format!(" Current workflow ID: `{workflow_id}`."))
+            .unwrap_or_default();
+        let next_step_guidance = self
+            .tool_state
+            .workflow_guidance_for_workspace(workspace_root);
+        let recovery = match repetitions {
+            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
+                && error.message.contains("not currently allowed") => {
+                next_step_guidance.as_deref().unwrap_or(
+                    "The write was blocked. Read the active workflow status and take its next allowed step before retrying.",
+                )
+            }
+            1 if tool_name == tools::FIND_FILES_TOOL_NAME
+                && error.message.contains("search query must not be empty") => {
+                "Find-files requires a non-empty query. Search for a known filename such as \"lib.rs\" or a relevant symbol, never an empty string."
+            }
+            1 if tool_name == tools::READ_FILE_TOOL_NAME
+                && error.message.contains("expected path string") => {
+                "The read path must be a plain string, for example {\"path\":\"lib.rs\"}. Do not wrap path in an object."
+            }
+            1 if tool_name == tools::READ_FILE_TOOL_NAME
+                && error.message.contains("requested path is unavailable") => {
+                "The file does not exist. Do not guess paths; call coding__find_files, then read only a returned workspace-relative file path."
+            }
+            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
+                && error.message.contains("expected struct WorkflowPlan") => {
+                "The plan argument must be a JSON object, not serialized JSON inside a string. Use plan: {...}; use command program \"cargo\" with args [\"test\"]."
+            }
+            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
+                && error.message.contains("invalid workflow plan path") => {
+                "Plan relevant_files must contain individual workspace-relative files, never a directory or an absolute path. Use a returned file path such as src/lib.rs."
+            }
+            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
+                && error.message.contains("plan field `intended changes`") => {
+                "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"] with the current workflow_id."
+            }
+            1 => "The request was not executed. Correct the tool name and arguments from the currently exposed schema before retrying.",
+            2 => "Do not repeat this tool contract. Re-read the active workflow guidance and choose a different currently allowed next step.",
+            _ => "The workflow is now blocked after repeated identical tool-contract failures. Report the recorded stop reason and do not claim success.",
+        };
+        ErrorData::new(
+            error.code,
+            format!("{}{} Recovery: {recovery}", error.message, workflow_hint),
+            None,
+        )
     }
 
     fn available(&self, ponduin_mode: PonduinMode) -> bool {
@@ -225,9 +367,9 @@ impl CodingAgent {
     }
 }
 
-fn uses_compact_native_coding_tools(model_config: &ModelConfig) -> bool {
+fn uses_compact_qwen_coding_tools(model_config: &ModelConfig) -> bool {
     let model = model_config.model_name.to_ascii_lowercase();
-    !model_config.toolshim && model.contains("qwen3") && !model.contains("qwen3-coder")
+    model.contains("qwen3") && !model.contains("qwen3-coder")
 }
 
 #[cfg(test)]
@@ -276,8 +418,339 @@ mod tests {
         assert!(prompt.contains("Model capability profile"));
     }
 
-    #[test]
-    fn qwen3_uses_a_compact_native_tool_contract() {
+    #[tokio::test]
+    async fn recovery_uses_the_host_retained_task_instead_of_requesting_resubmission() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent.register_task_context(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Create a small interactive web project with HTML, CSS, JavaScript, and tests."
+                .to_string(),
+        );
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "create the requested web project"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let recovery = agent.recovery_instruction(temp_dir.path()).unwrap();
+
+        assert!(recovery.contains("Create a small interactive web project"));
+        assert!(recovery.contains("Do not ask the user to repeat the task"));
+        assert!(!recovery.contains("Please resend"));
+        assert!(agent
+            .active_workflow_continuation(temp_dir.path())
+            .unwrap()
+            .contains("Do not provide a final prose response"));
+        assert!(agent
+            .recovery_exhausted_message(temp_dir.path())
+            .unwrap()
+            .contains("no user resubmission is required"));
+    }
+
+    #[tokio::test]
+    async fn reports_the_recorded_contract_stop_reason_instead_of_an_action_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+
+        for _ in 0..3 {
+            agent.tool_state.record_tool_contract_failure(
+                workspace.root(),
+                tools::WORKFLOW_SET_PLAN_TOOL_NAME,
+                "invalid_tool_contract",
+            );
+        }
+
+        let message = agent.terminal_workflow_message(temp_dir.path()).unwrap();
+        assert!(message.contains("RepeatedToolContract"));
+        assert!(message.contains(tools::WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(!message.contains("ActionLimit"));
+    }
+
+    #[tokio::test]
+    async fn blocked_write_after_plan_names_the_required_editing_transition() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let started = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair lib.rs"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let ContentBlock::Text(started_text) = &started.content[0] else {
+            panic!("expected workflow status text");
+        };
+        let started: Value = serde_json::from_str(&started_text.text).unwrap();
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(
+                    object!({
+                        "workflow_id": started["id"].as_str().unwrap(),
+                        "relevant_files": ["lib.rs"],
+                        "intended_change": "normalize the label",
+                        "validation_program": "cargo",
+                        "args": ["test"]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME)
+                    .with_arguments(object!({"changes": []})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("The plan is accepted"));
+        assert!(error.message.contains("coding__workflow_transition"));
+        assert!(error.message.contains("begin_editing"));
+    }
+
+    #[tokio::test]
+    async fn compact_plan_recovery_requires_a_nonempty_intended_change() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let started = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair lib.rs"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let ContentBlock::Text(started_text) = &started.content[0] else {
+            panic!("expected workflow status text");
+        };
+        let started: Value = serde_json::from_str(&started_text.text).unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(
+                    object!({
+                        "workflow_id": started["id"].as_str().unwrap(),
+                        "relevant_files": ["lib.rs"],
+                        "intended_change": "",
+                        "validation_program": "cargo",
+                        "args": ["test"]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .message
+            .contains("intended_change must be one non-empty sentence"));
+        assert!(error.message.contains("validation_program \"cargo\""));
+    }
+
+    #[tokio::test]
+    async fn contract_recovery_repeats_the_active_workflow_id_after_a_wrong_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let started = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let status: Value =
+            serde_json::from_str(&started.content[0].as_text().unwrap().text).unwrap();
+        let workflow_id = status["id"].as_str().unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(
+                    object!({"workflow_id": "rollback_00000000-0000-7000-8000-000000000000"}),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("Current workflow ID"));
+        assert!(error.message.contains(workflow_id));
+    }
+
+    #[tokio::test]
+    async fn unavailable_read_recovery_tells_the_model_to_discover_real_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "inspect the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::READ_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": "missing.rs"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("Do not guess paths"));
+        assert!(error.message.contains(tools::FIND_FILES_TOOL_NAME));
+    }
+
+    #[tokio::test]
+    async fn empty_file_search_recovery_requires_a_concrete_query() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "inspect the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::FIND_FILES_TOOL_NAME)
+                    .with_arguments(object!({"query": ""})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("non-empty query"));
+        assert!(error.message.contains("lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn malformed_read_path_recovery_shows_the_scalar_schema() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "inspect the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::READ_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": {"value": "lib.rs"}})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("plain string"));
+        assert!(error.message.contains("\"path\":\"lib.rs\""));
+    }
+
+    #[tokio::test]
+    async fn stringified_plan_recovery_requires_a_plan_object() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+                    .with_arguments(object!({"workflow_id": "workflow_00000000-0000-7000-8000-000000000000", "plan": "{}"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("JSON object"));
+        assert!(error.message.contains("program \"cargo\""));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_tool_that_is_not_exposed_for_the_current_workflow_step() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let error = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(
+                    object!({
+                        "changes": [{
+                            "operation": "create",
+                            "path": "must-not-exist.txt",
+                            "content": "blocked"
+                        }]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("not currently allowed"));
+        assert!(error.message.contains(tools::WORKFLOW_START_TOOL_NAME));
+        assert!(!temp_dir.path().join("must-not-exist.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn qwen3_uses_a_compact_tool_contract_for_native_and_emulated_transport() {
         let temp_dir = tempfile::tempdir().unwrap();
         let agent = enabled_agent();
         let model = ModelConfig::new("qwen3:8b");
@@ -288,10 +761,12 @@ mod tests {
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
 
-        assert_eq!(tools.len(), 6);
-        assert!(!names.contains(&tools::APPLY_CHANGES_TOOL_NAME));
-        assert!(!names.contains(&tools::RUN_PROCESS_TOOL_NAME));
+        assert_eq!(tools.len(), 16);
+        assert!(names.contains(&tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(names.contains(&tools::RUN_PROCESS_TOOL_NAME));
         assert!(names.contains(&tools::WORKFLOW_START_TOOL_NAME));
+        assert!(names.contains(&tools::WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(names.contains(&tools::WORKFLOW_TRANSITION_TOOL_NAME));
         assert!(!names.contains(&tools::LSP_QUERY_TOOL_NAME));
 
         let prompt = agent
@@ -299,12 +774,55 @@ mod tests {
             .unwrap();
         assert!(prompt.contains("call exactly one suitable tool"));
 
+        let emulated_model = model.clone().with_toolshim(true);
+        let emulated_tools = agent.tools_for_workspace_for_model(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            &emulated_model,
+        );
+        assert_eq!(emulated_tools.len(), 16);
+        let emulated_prompt = agent
+            .system_prompt_for_model(PonduinMode::Auto, &emulated_model)
+            .unwrap();
+        assert!(emulated_prompt.contains("call exactly one suitable tool"));
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair the fixture"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let planning_tools = agent
+            .tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &model)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let planning_names = planning_tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(planning_names.len(), 16);
+        assert!(planning_names.contains(&tools::WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(planning_names.contains(&tools::WORKFLOW_STATUS_TOOL_NAME));
+        let plan_tool = planning_tools
+            .into_iter()
+            .find(|tool| tool.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+            .unwrap();
+        let plan_schema = Value::Object((*plan_tool.input_schema).clone());
+        assert!(plan_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("intended_change".to_string())));
+        assert!(plan_schema["properties"].get("plan").is_none());
+
         let coder_model = ModelConfig::new("qwen3-coder:30b");
-        assert_eq!(
+        assert!(
             agent
                 .tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &coder_model)
-                .len(),
-            16
+                .len()
+                > tools.len()
         );
     }
 
@@ -405,21 +923,12 @@ mod tests {
                 "args": ["--version"],
                 "timeout_seconds": 5
             }));
-        let process_result = agent
+        let process_error = agent
             .execute(PonduinMode::Auto, process, temp_dir.path())
             .await
-            .unwrap();
-        let process_json: Value = serde_json::from_str(
-            &process_result.content[0]
-                .as_text()
-                .expect("expected text result")
-                .text,
-        )
-        .unwrap();
-        assert_eq!(process_json["success"], true);
-        assert!(process_json["stdout"]
-            .as_str()
-            .is_some_and(|stdout| stdout.starts_with("rustc ")));
+            .unwrap_err();
+        assert_eq!(process_error.code, ErrorCode::INVALID_PARAMS);
+        assert!(process_error.message.contains("not currently allowed"));
     }
 
     #[tokio::test]

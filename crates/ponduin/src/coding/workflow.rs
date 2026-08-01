@@ -4,7 +4,7 @@ use crate::coding::patch::MutationPreview;
 use crate::coding::process::ProcessOutput;
 use crate::coding::review::{ReviewReport, ReviewSeverity};
 use crate::coding::validation::{ValidationExecution, ValidationStatus};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
@@ -17,8 +17,9 @@ const LOOP_THRESHOLD: usize = 3;
 /// Auditable state machine for multi-step coding tasks.
 #[derive(Debug, Clone)]
 pub struct CodingWorkflow {
-    id: String,
+    id: WorkflowId,
     objective: String,
+    task: WorkflowTaskState,
     phase: WorkflowPhase,
     plan: Option<WorkflowPlan>,
     limits: WorkflowLimits,
@@ -40,11 +41,27 @@ pub struct CodingWorkflow {
 
 impl CodingWorkflow {
     pub fn new(objective: String, limits: WorkflowLimits) -> Result<Self, WorkflowError> {
+        Self::new_with_task(
+            objective.clone(),
+            WorkflowTaskState::new(objective, TaskInteractionMode::Autonomous, PathBuf::new())?,
+            limits,
+        )
+    }
+
+    pub fn new_with_task(
+        objective: String,
+        task: WorkflowTaskState,
+        limits: WorkflowLimits,
+    ) -> Result<Self, WorkflowError> {
         limits.validate()?;
         validate_text("objective", &objective, false)?;
+        if task.normalized_objective != objective {
+            return Err(WorkflowError::TaskObjectiveMismatch);
+        }
         Ok(Self {
-            id: Uuid::now_v7().to_string(),
+            id: WorkflowId::new(),
             objective,
+            task,
             phase: WorkflowPhase::Analyzing,
             plan: None,
             limits,
@@ -65,7 +82,7 @@ impl CodingWorkflow {
         })
     }
 
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &WorkflowId {
         &self.id
     }
 
@@ -154,6 +171,45 @@ impl CodingWorkflow {
         Ok(())
     }
 
+    pub fn record_tool_contract_failure(&mut self, tool_name: &str, error_class: &str) -> usize {
+        if self.is_terminal() {
+            return 0;
+        }
+        let diagnostic_fingerprint =
+            content_digest(format!("{tool_name}\0{error_class}").as_bytes());
+        let repetitions = self
+            .memory
+            .tool_contract_errors
+            .iter()
+            .filter(|error| error.diagnostic_fingerprint == diagnostic_fingerprint)
+            .count()
+            + 1;
+        self.memory
+            .tool_contract_errors
+            .push(ToolContractErrorEvidence {
+                revision: self.revision,
+                tool_name: tool_name.to_string(),
+                diagnostic_fingerprint,
+                repetitions,
+            });
+        if self.memory.tool_contract_errors.len() > MAX_EVIDENCE_RECORDS {
+            self.memory.tool_contract_errors.remove(0);
+        }
+        if repetitions >= LOOP_THRESHOLD {
+            self.block(WorkflowStopReason::RepeatedToolContract {
+                tool_name: tool_name.to_string(),
+                repetitions,
+            });
+        }
+        repetitions
+    }
+
+    pub fn block_for_action_limit(&mut self, limit: u32) {
+        if !self.is_terminal() {
+            self.block(WorkflowStopReason::ActionLimit { limit });
+        }
+    }
+
     pub fn set_repair_strategy(
         &mut self,
         approach: RepairApproach,
@@ -205,6 +261,9 @@ impl CodingWorkflow {
 
     pub fn authorize_change(&mut self) -> Result<(), WorkflowError> {
         self.require_phase(&[WorkflowPhase::Editing])?;
+        if matches!(self.task.intent, TaskIntent::Inspect | TaskIntent::Verify) {
+            return Err(WorkflowError::MutationForbiddenForIntent(self.task.intent));
+        }
         if self.iterations >= self.limits.max_iterations {
             self.fail(WorkflowStopReason::IterationLimit {
                 limit: self.limits.max_iterations,
@@ -567,6 +626,7 @@ impl CodingWorkflow {
         WorkflowStatus {
             id: self.id.clone(),
             objective: self.objective.clone(),
+            task: self.task.clone(),
             phase: self.phase,
             plan: self.plan.clone(),
             iterations: self.iterations,
@@ -602,6 +662,7 @@ impl CodingWorkflow {
         WorkflowReport {
             id: self.id.clone(),
             objective: self.objective.clone(),
+            task: self.task.clone(),
             phase: self.phase,
             changed_files: self.changed_files(),
             iterations: self.iterations,
@@ -768,6 +829,151 @@ impl WorkflowLimits {
     }
 }
 
+/// A distinct, externally serialized identity for one coding workflow.
+///
+/// The `workflow_` prefix prevents a rollback UUID or another identifier class
+/// from being accepted at the tool boundary as a workflow identifier.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WorkflowId(String);
+
+impl WorkflowId {
+    fn new() -> Self {
+        Self(format!("workflow_{}", Uuid::now_v7()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for WorkflowId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for WorkflowId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let Some(uuid) = value.strip_prefix("workflow_") else {
+            return Err(D::Error::custom(
+                "workflow_id must start with `workflow_`; rollback and other IDs are not valid workflow IDs",
+            ));
+        };
+        Uuid::parse_str(uuid).map_err(|_| {
+            D::Error::custom("workflow_id must contain a valid UUID after `workflow_`")
+        })?;
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskInteractionMode {
+    ReadOnly,
+    Ask,
+    Autonomous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIntent {
+    Create,
+    Modify,
+    Repair,
+    Inspect,
+    Verify,
+}
+
+impl TaskIntent {
+    pub fn detect(request: &str) -> Self {
+        let request = request.to_ascii_lowercase();
+        if [
+            "analyse",
+            "analys",
+            "analyze",
+            "untersuche",
+            "inspect",
+            "read-only",
+            "read only",
+        ]
+        .iter()
+        .any(|term| request.contains(term))
+        {
+            Self::Inspect
+        } else if [
+            "verify",
+            "verif",
+            "prüfe",
+            "pruefe",
+            "testen ohne",
+            "test only",
+        ]
+        .iter()
+        .any(|term| request.contains(term))
+        {
+            Self::Verify
+        } else if ["repair", "fix", "beheb", "reparier", "bug"]
+            .iter()
+            .any(|term| request.contains(term))
+        {
+            Self::Repair
+        } else if ["create", "erstelle", "neu", "new project", "anlegen"]
+            .iter()
+            .any(|term| request.contains(term))
+        {
+            Self::Create
+        } else {
+            Self::Modify
+        }
+    }
+}
+
+/// Durable, compact task information supplied by the host before a model can
+/// simplify the request into a plan. The surrounding workflow owns plans,
+/// evidence, errors, and state transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTaskState {
+    pub original_user_request: String,
+    pub normalized_objective: String,
+    pub intent: TaskIntent,
+    pub interaction_mode: TaskInteractionMode,
+    pub workspace: PathBuf,
+}
+
+impl WorkflowTaskState {
+    pub fn new(
+        original_user_request: String,
+        interaction_mode: TaskInteractionMode,
+        workspace: PathBuf,
+    ) -> Result<Self, WorkflowError> {
+        validate_text("original user request", &original_user_request, false)?;
+        Ok(Self {
+            normalized_objective: original_user_request.clone(),
+            intent: TaskIntent::detect(&original_user_request),
+            original_user_request,
+            interaction_mode,
+            workspace,
+        })
+    }
+
+    pub fn with_objective(mut self, objective: String) -> Result<Self, WorkflowError> {
+        validate_text("objective", &objective, false)?;
+        self.normalized_objective = objective;
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPlan {
@@ -904,8 +1110,9 @@ pub enum WorkflowPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStatus {
-    pub id: String,
+    pub id: WorkflowId,
     pub objective: String,
+    pub task: WorkflowTaskState,
     pub phase: WorkflowPhase,
     pub plan: Option<WorkflowPlan>,
     pub iterations: u32,
@@ -923,8 +1130,9 @@ pub struct WorkflowStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowReport {
-    pub id: String,
+    pub id: WorkflowId,
     pub objective: String,
+    pub task: WorkflowTaskState,
     pub phase: WorkflowPhase,
     pub changed_files: Vec<PathBuf>,
     pub iterations: u32,
@@ -977,8 +1185,17 @@ pub struct WorkflowMemory {
     pub relevant_symbols: Vec<RelevantSymbolEvidence>,
     pub executed_commands: Vec<CommandEvidence>,
     pub known_errors: Vec<KnownErrorEvidence>,
+    pub tool_contract_errors: Vec<ToolContractErrorEvidence>,
     pub repair_strategies: Vec<RepairStrategyEvidence>,
     pub open_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolContractErrorEvidence {
+    pub revision: u32,
+    pub tool_name: String,
+    pub diagnostic_fingerprint: String,
+    pub repetitions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1247,12 +1464,31 @@ impl From<ValidationStatus> for ValidationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowStopReason {
-    IterationLimit { limit: u32 },
-    RepairLimit { limit: u32 },
-    RepeatedDiff { repetitions: usize },
-    RepeatedFailure { repetitions: usize },
-    RepeatedToolCall { repetitions: usize },
-    NoDiagnosticProgress { attempts: usize },
+    ActionLimit {
+        limit: u32,
+    },
+    IterationLimit {
+        limit: u32,
+    },
+    RepairLimit {
+        limit: u32,
+    },
+    RepeatedDiff {
+        repetitions: usize,
+    },
+    RepeatedFailure {
+        repetitions: usize,
+    },
+    RepeatedToolCall {
+        repetitions: usize,
+    },
+    RepeatedToolContract {
+        tool_name: String,
+        repetitions: usize,
+    },
+    NoDiagnosticProgress {
+        attempts: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1445,6 +1681,10 @@ pub enum WorkflowError {
     InvalidIterationLimit(u32),
     #[error("workflow repair limit must be at most 100, got {0}")]
     InvalidRepairLimit(u32),
+    #[error("workflow task objective must match the workflow objective")]
+    TaskObjectiveMismatch,
+    #[error("a {0:?} task does not permit workspace mutations")]
+    MutationForbiddenForIntent(TaskIntent),
     #[error("invalid workflow transition from {from:?}; expected one of {expected:?}")]
     InvalidTransition {
         from: WorkflowPhase,
@@ -1960,5 +2200,82 @@ mod tests {
         assert!(!serialized.contains("secret-filter"));
         assert!(!serialized.contains("must-not-be-retained"));
         assert!(!serialized.contains("fn target"));
+    }
+
+    #[test]
+    fn task_state_preserves_original_request_and_blocks_inspection_mutations() {
+        let task = WorkflowTaskState::new(
+            "Nur analysiere den vorhandenen Fehler.".to_string(),
+            TaskInteractionMode::ReadOnly,
+            PathBuf::from("/tmp/workspace"),
+        )
+        .unwrap()
+        .with_objective("analyze the existing failure".to_string())
+        .unwrap();
+        let mut workflow = CodingWorkflow::new_with_task(
+            "analyze the existing failure".to_string(),
+            task,
+            limits(),
+        )
+        .unwrap();
+
+        workflow.set_plan(plan()).unwrap();
+        workflow.begin_editing().unwrap();
+
+        assert!(matches!(
+            workflow.authorize_change(),
+            Err(WorkflowError::MutationForbiddenForIntent(
+                TaskIntent::Inspect
+            ))
+        ));
+        let status = workflow.status();
+        assert_eq!(
+            status.task.original_user_request,
+            "Nur analysiere den vorhandenen Fehler."
+        );
+        assert_eq!(status.task.interaction_mode, TaskInteractionMode::ReadOnly);
+        assert_eq!(status.task.intent, TaskIntent::Inspect);
+    }
+
+    #[test]
+    fn blocks_repeated_tool_contract_failures_with_retained_evidence() {
+        let mut workflow = CodingWorkflow::new("repair the fixture".to_string(), limits()).unwrap();
+
+        assert_eq!(
+            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            1
+        );
+        assert_eq!(
+            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            2
+        );
+        assert_eq!(
+            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            3
+        );
+
+        let status = workflow.status();
+        assert_eq!(status.phase, WorkflowPhase::Blocked);
+        assert_eq!(status.memory.tool_contract_errors.len(), 3);
+        assert!(matches!(
+            status.stop_reason,
+            Some(WorkflowStopReason::RepeatedToolContract {
+                tool_name,
+                repetitions: 3
+            }) if tool_name == "coding__apply_changes"
+        ));
+    }
+
+    #[test]
+    fn workflow_identifiers_reject_rollback_identifier_shape() {
+        let workflow = CodingWorkflow::new("change a file".to_string(), limits()).unwrap();
+        assert!(workflow.id().as_str().starts_with("workflow_"));
+        assert!(
+            serde_json::from_str::<WorkflowId>("\"00000000-0000-7000-8000-000000000000\"").is_err()
+        );
+        assert!(serde_json::from_str::<WorkflowId>(
+            "\"rollback_00000000-0000-7000-8000-000000000000\""
+        )
+        .is_err());
     }
 }

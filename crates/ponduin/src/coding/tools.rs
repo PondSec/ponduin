@@ -19,8 +19,10 @@ use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
-    CodingWorkflow, RepairApproach, WorkflowLimits, WorkflowPhase, WorkflowPlan, WorkflowReport,
-    WorkflowStatus,
+    CodingWorkflow, RepairApproach, RequirementPriority, RequirementSource,
+    RequirementVerification, WorkflowCheck, WorkflowCommand, WorkflowId, WorkflowLimits,
+    WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowRequirement, WorkflowStatus,
+    WorkflowTaskState,
 };
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use rmcp::model::{
@@ -87,6 +89,7 @@ pub(crate) struct CodingToolState {
     committed: Mutex<VecDeque<OwnedCommit>>,
     intelligence_cache: Mutex<VecDeque<IntelligenceCacheEntry>>,
     workflows: Mutex<VecDeque<WorkspaceWorkflow>>,
+    task_contexts: Mutex<VecDeque<WorkspaceTaskContext>>,
     mutation_lock: Mutex<()>,
 }
 
@@ -117,6 +120,12 @@ struct WorkspaceWorkflow {
     workflow: CodingWorkflow,
 }
 
+#[derive(Debug)]
+struct WorkspaceTaskContext {
+    workspace_root: PathBuf,
+    task: WorkflowTaskState,
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowToolContext {
     status: WorkflowStatus,
@@ -132,10 +141,12 @@ impl CodingToolState {
 
     pub(crate) fn compact_native_definitions_for_workspace(
         &self,
-        workspace_root: &Path,
+        _workspace_root: &Path,
     ) -> Vec<Tool> {
-        let context = self.workflow_tool_context(workspace_root);
-        compact_native_definitions(definitions_for_workflow(context.as_ref()), context.as_ref())
+        // Ollama-native Qwen runs do not reliably accept a changed tool list on the turn after a
+        // tool call. Keep the small contract stable; execute still derives authority from the
+        // workflow state through definitions_for_workspace before every call.
+        compact_native_definitions(definitions())
     }
 
     pub(crate) fn workflow_guidance_for_workspace(&self, workspace_root: &Path) -> Option<String> {
@@ -494,8 +505,21 @@ impl CodingToolState {
             ));
         }
         workflows.retain(|entry| entry.workspace_root != workspace_root);
-        let workflow = CodingWorkflow::new(
+        let task = self
+            .take_task_context(workspace_root)
+            .unwrap_or_else(|| {
+                WorkflowTaskState::new(
+                    objective.clone(),
+                    crate::coding::TaskInteractionMode::Autonomous,
+                    workspace_root.to_path_buf(),
+                )
+                .expect("a validated workflow objective must form a task state")
+            })
+            .with_objective(objective.clone())
+            .map_err(|error| invalid_arguments(error.to_string()))?;
+        let workflow = CodingWorkflow::new_with_task(
             objective,
+            task,
             WorkflowLimits {
                 max_iterations: config.max_iterations,
                 max_repair_attempts: config.max_repair_attempts,
@@ -511,6 +535,131 @@ impl CodingToolState {
             workflows.pop_front();
         }
         Ok(status)
+    }
+
+    pub(crate) fn register_task_context(
+        &self,
+        workspace_root: &Path,
+        original_user_request: String,
+        interaction_mode: crate::coding::TaskInteractionMode,
+    ) -> Result<(), ErrorData> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = WorkflowTaskState::new(
+            original_user_request,
+            interaction_mode,
+            workspace_root.to_path_buf(),
+        )
+        .map_err(|error| invalid_arguments(error.to_string()))?;
+        let workflows = self
+            .workflows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if workflows
+            .iter()
+            .any(|entry| entry.workspace_root == workspace_root && !entry.workflow.is_terminal())
+        {
+            return Ok(());
+        }
+        drop(workflows);
+
+        let mut contexts = self
+            .task_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        contexts.retain(|entry| entry.workspace_root != workspace_root);
+        contexts.push_back(WorkspaceTaskContext {
+            workspace_root: workspace_root.to_path_buf(),
+            task,
+        });
+        while contexts.len() > MAX_WORKSPACE_WORKFLOWS {
+            contexts.pop_front();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recovery_instruction(&self, workspace_root: &Path) -> Option<String> {
+        let status = self.workflow_status(workspace_root, None).ok()?;
+        if matches!(
+            status.phase,
+            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+        ) {
+            return None;
+        }
+        let guidance = self.workflow_guidance_for_workspace(workspace_root)?;
+        Some(format!(
+            "Resume the active coding task after an internal model failure. Original user request: \
+             {}. Objective: {}. Intent: {:?}. Interaction mode: {:?}. {} Do not ask the user to \
+             repeat the task; take the next allowed tool action.",
+            status.task.original_user_request,
+            status.task.normalized_objective,
+            status.task.intent,
+            status.task.interaction_mode,
+            guidance,
+        ))
+    }
+
+    pub(crate) fn active_workflow_id(&self, workspace_root: &Path) -> Option<WorkflowId> {
+        self.workflow_status(workspace_root, None)
+            .ok()
+            .map(|status| status.id)
+    }
+
+    pub(crate) fn active_workflow_continuation(&self, workspace_root: &Path) -> Option<String> {
+        let status = self.workflow_status(workspace_root, None).ok()?;
+        if matches!(
+            status.phase,
+            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+        ) {
+            return None;
+        }
+        let guidance = self.workflow_guidance_for_workspace(workspace_root)?;
+        Some(format!(
+            "The active coding workflow is incomplete. {} Do not provide a final prose response \
+             until the workflow has reached an evidence-backed terminal state.",
+            guidance
+        ))
+    }
+
+    pub(crate) fn terminal_workflow_message(&self, workspace_root: &Path) -> Option<String> {
+        let status = self.workflow_status(workspace_root, None).ok()?;
+        if !matches!(status.phase, WorkflowPhase::Blocked | WorkflowPhase::Failed) {
+            return None;
+        }
+        Some(format!(
+            "The coding workflow stopped at {:?} with recorded reason {:?}. The original request \
+             and workflow evidence were retained; no user resubmission is required.",
+            status.phase, status.stop_reason
+        ))
+    }
+
+    pub(crate) fn recovery_exhausted_message(&self, workspace_root: &Path) -> Option<String> {
+        let status = self.workflow_status(workspace_root, None).ok()?;
+        if matches!(
+            status.phase,
+            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+        ) {
+            return None;
+        }
+        Some(format!(
+            "The active coding task remains preserved at {:?} after repeated empty model responses. \
+             The original request and workflow evidence were retained; no user resubmission is required.",
+            status.phase
+        ))
+    }
+
+    fn take_task_context(&self, workspace_root: &Path) -> Option<WorkflowTaskState> {
+        let mut contexts = self
+            .task_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        contexts
+            .iter()
+            .position(|entry| entry.workspace_root == workspace_root)
+            .and_then(|position| contexts.remove(position))
+            .map(|entry| entry.task)
     }
 
     fn note_repository_activity(&self, workspace_root: &Path) {
@@ -550,7 +699,7 @@ impl CodingToolState {
     fn set_workflow_plan(
         &self,
         workspace_root: &Path,
-        workflow_id: &str,
+        workflow_id: &WorkflowId,
         plan: WorkflowPlan,
     ) -> Result<WorkflowStatus, ErrorData> {
         let _mutation = self
@@ -568,7 +717,7 @@ impl CodingToolState {
     fn update_workflow_memory(
         &self,
         workspace_root: &Path,
-        workflow_id: &str,
+        workflow_id: &WorkflowId,
         assumptions: Option<Vec<String>>,
         open_points: Option<Vec<String>>,
     ) -> Result<WorkflowStatus, ErrorData> {
@@ -587,7 +736,7 @@ impl CodingToolState {
     fn set_repair_strategy(
         &self,
         workspace_root: &Path,
-        workflow_id: &str,
+        workflow_id: &WorkflowId,
         approach: RepairApproach,
         hypothesis: String,
         target_files: Vec<PathBuf>,
@@ -607,7 +756,7 @@ impl CodingToolState {
     fn transition_workflow(
         &self,
         workspace_root: &Path,
-        workflow_id: &str,
+        workflow_id: &WorkflowId,
         transition: WorkflowTransition,
     ) -> Result<WorkflowStatus, ErrorData> {
         let _mutation = self
@@ -629,7 +778,7 @@ impl CodingToolState {
     fn workflow_status(
         &self,
         workspace_root: &Path,
-        workflow_id: Option<&str>,
+        workflow_id: Option<&WorkflowId>,
     ) -> Result<WorkflowStatus, ErrorData> {
         self.workflows
             .lock()
@@ -647,7 +796,7 @@ impl CodingToolState {
     fn complete_workflow(
         &self,
         workspace_root: &Path,
-        workflow_id: &str,
+        workflow_id: &WorkflowId,
         summary: String,
         remaining_risks: Vec<String>,
     ) -> Result<WorkflowReport, ErrorData> {
@@ -715,6 +864,31 @@ impl CodingToolState {
             result?;
         }
         Ok(())
+    }
+
+    pub(crate) fn record_tool_contract_failure(
+        &self,
+        workspace_root: &Path,
+        tool_name: &str,
+        error_class: &str,
+    ) -> Option<usize> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.record_tool_contract_failure(tool_name, error_class)
+        })
+    }
+
+    pub(crate) fn block_for_action_limit(&self, workspace_root: &Path, limit: u32) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.block_for_action_limit(limit);
+        });
     }
 
     fn mutation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -785,7 +959,7 @@ impl CodingToolState {
     fn with_workflow_mut<R>(
         &self,
         workspace_root: &Path,
-        workflow_id: &str,
+        workflow_id: &WorkflowId,
         operation: impl FnOnce(&mut CodingWorkflow) -> Result<R, ErrorData>,
     ) -> Result<R, ErrorData> {
         let mut workflows = self
@@ -872,99 +1046,34 @@ pub fn definitions() -> Vec<Tool> {
     ]
 }
 
-fn compact_native_definitions(
-    tools: Vec<Tool>,
-    context: Option<&WorkflowToolContext>,
-) -> Vec<Tool> {
-    let phase = context.map(|context| context.status.phase);
+fn compact_native_definitions(tools: Vec<Tool>) -> Vec<Tool> {
     tools
         .into_iter()
-        .filter(|tool| compact_native_tool_allowed(tool.name.as_ref(), phase))
+        .filter(|tool| compact_native_tool_allowed(tool.name.as_ref()))
         .map(compact_native_tool_schema)
         .collect()
 }
 
-fn compact_native_tool_allowed(name: &str, phase: Option<WorkflowPhase>) -> bool {
-    match phase {
-        None => matches!(
-            name,
-            REPOSITORY_PROFILE_TOOL_NAME
-                | REPOSITORY_INSTRUCTIONS_TOOL_NAME
-                | FIND_FILES_TOOL_NAME
-                | READ_FILE_TOOL_NAME
-                | PROJECT_CAPABILITIES_TOOL_NAME
-                | WORKFLOW_START_TOOL_NAME
-        ),
-        Some(WorkflowPhase::Analyzing | WorkflowPhase::Searching) => matches!(
-            name,
-            REPOSITORY_PROFILE_TOOL_NAME
-                | REPOSITORY_INSTRUCTIONS_TOOL_NAME
-                | FIND_FILES_TOOL_NAME
-                | READ_FILE_TOOL_NAME
-                | PROJECT_CAPABILITIES_TOOL_NAME
-                | WORKFLOW_SET_PLAN_TOOL_NAME
-                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
-                | WORKFLOW_STATUS_TOOL_NAME
-        ),
-        Some(WorkflowPhase::Planning) => matches!(
-            name,
-            FIND_FILES_TOOL_NAME
-                | SEARCH_TEXT_TOOL_NAME
-                | READ_FILE_TOOL_NAME
-                | GIT_DIFF_TOOL_NAME
-                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
-                | WORKFLOW_STATUS_TOOL_NAME
-                | WORKFLOW_TRANSITION_TOOL_NAME
-        ),
-        Some(WorkflowPhase::Editing) => matches!(
-            name,
-            FIND_FILES_TOOL_NAME
-                | SEARCH_TEXT_TOOL_NAME
-                | READ_FILE_TOOL_NAME
-                | APPLY_CHANGES_TOOL_NAME
-                | ROLLBACK_CHANGES_TOOL_NAME
-                | GIT_STATUS_TOOL_NAME
-                | GIT_DIFF_TOOL_NAME
-                | WORKFLOW_STATUS_TOOL_NAME
-                | WORKFLOW_TRANSITION_TOOL_NAME
-        ),
-        Some(WorkflowPhase::Testing) => matches!(
-            name,
-            READ_FILE_TOOL_NAME
-                | GIT_DIFF_TOOL_NAME
-                | PROJECT_CAPABILITIES_TOOL_NAME
-                | RUN_PROCESS_TOOL_NAME
-                | RUN_VALIDATION_TOOL_NAME
-                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
-                | WORKFLOW_STATUS_TOOL_NAME
-                | WORKFLOW_TRANSITION_TOOL_NAME
-        ),
-        Some(WorkflowPhase::Debugging) => matches!(
-            name,
-            FIND_FILES_TOOL_NAME
-                | SEARCH_TEXT_TOOL_NAME
-                | READ_FILE_TOOL_NAME
-                | GIT_DIFF_TOOL_NAME
-                | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
-                | WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
-                | WORKFLOW_STATUS_TOOL_NAME
-                | WORKFLOW_TRANSITION_TOOL_NAME
-        ),
-        Some(WorkflowPhase::Reviewing) => matches!(
-            name,
-            READ_FILE_TOOL_NAME
-                | GIT_STATUS_TOOL_NAME
-                | GIT_DIFF_TOOL_NAME
-                | GIT_STAGE_OWNED_TOOL_NAME
-                | GIT_COMMIT_OWNED_TOOL_NAME
-                | GIT_CREATE_BRANCH_TOOL_NAME
-                | GIT_PUSH_OWNED_TOOL_NAME
-                | REVIEW_CHANGES_TOOL_NAME
-                | WORKFLOW_STATUS_TOOL_NAME
-                | WORKFLOW_COMPLETE_TOOL_NAME
-        ),
-        Some(WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed) => false,
-    }
+fn compact_native_tool_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        REPOSITORY_PROFILE_TOOL_NAME
+            | REPOSITORY_INSTRUCTIONS_TOOL_NAME
+            | FIND_FILES_TOOL_NAME
+            | SEARCH_TEXT_TOOL_NAME
+            | READ_FILE_TOOL_NAME
+            | PROJECT_CAPABILITIES_TOOL_NAME
+            | WORKFLOW_START_TOOL_NAME
+            | WORKFLOW_SET_PLAN_TOOL_NAME
+            | WORKFLOW_TRANSITION_TOOL_NAME
+            | WORKFLOW_STATUS_TOOL_NAME
+            | WORKFLOW_COMPLETE_TOOL_NAME
+            | APPLY_CHANGES_TOOL_NAME
+            | ROLLBACK_CHANGES_TOOL_NAME
+            | RUN_PROCESS_TOOL_NAME
+            | RUN_VALIDATION_TOOL_NAME
+            | REVIEW_CHANGES_TOOL_NAME
+    )
 }
 
 fn compact_native_tool_schema(mut tool: Tool) -> Tool {
@@ -1004,38 +1113,25 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
         }
         WORKFLOW_SET_PLAN_TOOL_NAME => {
             tool.description = Some(
-                "Set the active workflow plan. Include every planned new file in relevant_files, \
-                 the required checks in validation, and a concrete rollback_strategy."
+                "Set the active workflow plan with a compact, non-nested contract. Use only \
+                 workspace-relative relevant_files, one intended_change, and one required \
+                 validation command. Do not send a nested plan object or serialized JSON."
                     .into(),
             );
             tool.input_schema = object!({
                 "type": "object",
-                "required": ["workflow_id", "plan"],
+                "required": [
+                    "workflow_id",
+                    "relevant_files",
+                    "intended_change",
+                    "validation_program"
+                ],
                 "properties": {
-                    "workflow_id": {"type": "string"},
-                    "plan": {
-                        "type": "object",
-                        "required": [
-                            "affected_components",
-                            "relevant_files",
-                            "risks",
-                            "intended_changes",
-                            "requirements",
-                            "tests",
-                            "validation",
-                            "rollback_strategy"
-                        ],
-                        "properties": {
-                            "affected_components": {"type": "array", "items": {"type": "string"}},
-                            "relevant_files": {"type": "array", "items": {"type": "string"}},
-                            "risks": {"type": "array", "items": {"type": "string"}},
-                            "intended_changes": {"type": "array", "items": {"type": "string"}},
-                            "requirements": workflow_requirement_array_schema(),
-                            "tests": workflow_check_array_schema(),
-                            "validation": workflow_check_array_schema(),
-                            "rollback_strategy": {"type": "string"}
-                        }
-                    }
+                    "workflow_id": {"type": "string", "pattern": "^workflow_[0-9a-fA-F-]{36}$"},
+                    "relevant_files": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                    "intended_change": {"type": "string", "minLength": 1},
+                    "validation_program": {"type": "string", "minLength": 1, "description": "For Rust tests use cargo."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "For Rust tests use [\"test\"]."}
                 }
             })
             .into();
@@ -1305,6 +1401,28 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with(CODING_TOOL_PREFIX)
 }
 
+pub(crate) fn canonical_native_tool_name(name: &str) -> Option<&'static str> {
+    match name {
+        "repository_profile" => Some(REPOSITORY_PROFILE_TOOL_NAME),
+        "repository_instructions" => Some(REPOSITORY_INSTRUCTIONS_TOOL_NAME),
+        "find_files" => Some(FIND_FILES_TOOL_NAME),
+        "search_text" => Some(SEARCH_TEXT_TOOL_NAME),
+        "read_file" => Some(READ_FILE_TOOL_NAME),
+        "project_capabilities" => Some(PROJECT_CAPABILITIES_TOOL_NAME),
+        "workflow_start" => Some(WORKFLOW_START_TOOL_NAME),
+        "workflow_set_plan" => Some(WORKFLOW_SET_PLAN_TOOL_NAME),
+        "workflow_transition" => Some(WORKFLOW_TRANSITION_TOOL_NAME),
+        "workflow_status" => Some(WORKFLOW_STATUS_TOOL_NAME),
+        "workflow_complete" => Some(WORKFLOW_COMPLETE_TOOL_NAME),
+        "apply_changes" => Some(APPLY_CHANGES_TOOL_NAME),
+        "rollback_changes" => Some(ROLLBACK_CHANGES_TOOL_NAME),
+        "run_process" => Some(RUN_PROCESS_TOOL_NAME),
+        "run_validation" => Some(RUN_VALIDATION_TOOL_NAME),
+        "review_changes" => Some(REVIEW_CHANGES_TOOL_NAME),
+        _ => None,
+    }
+}
+
 fn is_repository_activity(name: &str) -> bool {
     matches!(
         name,
@@ -1369,10 +1487,7 @@ pub(crate) async fn execute_async(
     }
 
     let workspace = CodingWorkspace::new(working_dir).map_err(invalid_workspace)?;
-    if is_repository_activity(&tool_call.name) {
-        state.note_repository_activity(workspace.root());
-    }
-    match tool_call.name.as_ref() {
+    let result = match tool_call.name.as_ref() {
         RUN_PROCESS_TOOL_NAME => {
             let params: RunProcessParams = parse_arguments(&tool_call)?;
             validate_process_invocation(&params.program, &params.args)?;
@@ -1598,7 +1713,11 @@ pub(crate) async fn execute_async(
             json_result(&result, config.output_limit)
         }
         _ => unreachable!("async coding tool name was checked"),
+    };
+    if result.is_ok() && is_repository_activity(&tool_call.name) {
+        state.note_repository_activity(workspace.root());
     }
+    result
 }
 
 #[cfg(test)]
@@ -1617,10 +1736,7 @@ pub(crate) fn execute_with_state(
     working_dir: &Path,
 ) -> Result<CallToolResult, ErrorData> {
     let workspace = CodingWorkspace::new(working_dir).map_err(invalid_workspace)?;
-    if is_repository_activity(&tool_call.name) {
-        state.note_repository_activity(workspace.root());
-    }
-    match tool_call.name.as_ref() {
+    let result = match tool_call.name.as_ref() {
         REPOSITORY_PROFILE_TOOL_NAME => {
             let params: RepositoryProfileParams = parse_arguments(&tool_call)?;
             if params.max_files == 0 || params.max_files > MAX_REPOSITORY_FILE_LIMIT {
@@ -1837,7 +1953,19 @@ pub(crate) fn execute_with_state(
             json_result(&status, config.output_limit)
         }
         WORKFLOW_SET_PLAN_TOOL_NAME => {
-            let mut params: WorkflowSetPlanParams = parse_arguments(&tool_call)?;
+            let mut params = if tool_call
+                .arguments
+                .as_ref()
+                .is_some_and(|arguments| arguments.contains_key("plan"))
+            {
+                parse_arguments::<WorkflowSetPlanParams>(&tool_call)?
+            } else {
+                let compact: WorkflowCompactPlanParams = parse_arguments(&tool_call)?;
+                WorkflowSetPlanParams {
+                    workflow_id: compact.workflow_id.clone(),
+                    plan: compact.into_plan(),
+                }
+            };
             if params.plan.relevant_files.is_empty() {
                 return Err(invalid_arguments(
                     "`plan.relevant_files` must list workspace-relative paths affected by the \
@@ -1888,7 +2016,7 @@ pub(crate) fn execute_with_state(
         }
         WORKFLOW_STATUS_TOOL_NAME => {
             let params: WorkflowStatusParams = parse_arguments(&tool_call)?;
-            let status = state.workflow_status(workspace.root(), params.workflow_id.as_deref())?;
+            let status = state.workflow_status(workspace.root(), params.workflow_id.as_ref())?;
             json_result(&status, config.output_limit)
         }
         WORKFLOW_COMPLETE_TOOL_NAME => {
@@ -1920,7 +2048,11 @@ pub(crate) fn execute_with_state(
             "unknown internal coding tool `{}`",
             tool_call.name
         ))),
+    };
+    if result.is_ok() && is_repository_activity(&tool_call.name) {
+        state.note_repository_activity(workspace.root());
     }
+    result
 }
 
 fn repository_profile_tool() -> Tool {
@@ -2638,7 +2770,7 @@ fn workflow_set_plan_tool() -> Tool {
             "type": "object",
             "required": ["workflow_id", "plan"],
             "properties": {
-                "workflow_id": {"type": "string", "minLength": 1},
+                "workflow_id": {"type": "string", "pattern": "^workflow_[0-9a-fA-F-]{36}$"},
                 "plan": {
                     "type": "object",
                     "required": [
@@ -2694,7 +2826,7 @@ fn workflow_update_memory_tool() -> Tool {
             "type": "object",
             "required": ["workflow_id"],
             "properties": {
-                "workflow_id": {"type": "string", "minLength": 1},
+                "workflow_id": {"type": "string", "pattern": "^workflow_[0-9a-fA-F-]{36}$"},
                 "assumptions": {
                     "type": ["array", "null"],
                     "maxItems": 200,
@@ -2734,7 +2866,7 @@ fn workflow_set_repair_strategy_tool() -> Tool {
             "type": "object",
             "required": ["workflow_id", "approach", "hypothesis", "target_files"],
             "properties": {
-                "workflow_id": {"type": "string", "minLength": 1},
+                "workflow_id": {"type": "string", "pattern": "^workflow_[0-9a-fA-F-]{36}$"},
                 "approach": {
                     "type": "string",
                     "enum": ["local_logic", "dependency_boundary", "configuration", "test_fixture"]
@@ -2779,7 +2911,7 @@ fn workflow_transition_tool_with_values(transitions: &[&str], description: &str)
             "type": "object",
             "required": ["workflow_id", "transition"],
             "properties": {
-                "workflow_id": {"type": "string", "minLength": 1},
+                "workflow_id": {"type": "string", "pattern": "^workflow_[0-9a-fA-F-]{36}$"},
                 "transition": {
                     "type": "string",
                     "enum": transitions
@@ -2802,7 +2934,7 @@ fn workflow_status_tool() -> Tool {
             "properties": {
                 "workflow_id": {
                     "type": ["string", "null"],
-                    "minLength": 1,
+                    "pattern": "^workflow_[0-9a-fA-F-]{36}$",
                     "default": null
                 }
             },
@@ -2823,7 +2955,7 @@ fn workflow_complete_tool() -> Tool {
             "type": "object",
             "required": ["workflow_id", "summary", "remaining_risks"],
             "properties": {
-                "workflow_id": {"type": "string", "minLength": 1},
+                "workflow_id": {"type": "string", "pattern": "^workflow_[0-9a-fA-F-]{36}$"},
                 "summary": {
                     "type": "string",
                     "minLength": 1,
@@ -3493,6 +3625,7 @@ struct SearchTextParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadFileParams {
+    #[serde(alias = "relative_path")]
     path: PathBuf,
     #[serde(default)]
     start_line: Option<usize>,
@@ -3693,14 +3826,71 @@ struct WorkflowStartParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowSetPlanParams {
-    workflow_id: String,
+    workflow_id: WorkflowId,
     plan: WorkflowPlan,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkflowCompactPlanParams {
+    #[serde(alias = "flow_id")]
+    workflow_id: WorkflowId,
+    relevant_files: Vec<PathBuf>,
+    intended_change: String,
+    validation_program: String,
+    #[serde(default, alias = "validation_args")]
+    args: Vec<String>,
+}
+
+impl WorkflowCompactPlanParams {
+    fn into_plan(self) -> WorkflowPlan {
+        let validation_id = "required-validation".to_string();
+        let expected_files = self.relevant_files.clone();
+        WorkflowPlan {
+            affected_components: self
+                .relevant_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            relevant_files: self.relevant_files,
+            risks: vec![
+                "The declared change must remain limited to the planned files and pass validation."
+                    .to_string(),
+            ],
+            intended_changes: vec![self.intended_change.clone()],
+            requirements: vec![WorkflowRequirement {
+                id: "declared-change".to_string(),
+                description: self.intended_change,
+                source: RequirementSource::User,
+                priority: RequirementPriority::Critical,
+                mandatory: true,
+                verification: RequirementVerification {
+                    expected_files,
+                    check_ids: vec![validation_id.clone()],
+                },
+            }],
+            tests: Vec::new(),
+            validation: vec![WorkflowCheck {
+                id: validation_id,
+                description: "Run the declared validation command.".to_string(),
+                command: WorkflowCommand {
+                    program: self.validation_program,
+                    args: self.args,
+                    cwd: PathBuf::from("."),
+                },
+                required: true,
+            }],
+            rollback_strategy:
+                "Roll back the change batch using the returned rollback identifier if validation fails."
+                    .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkflowUpdateMemoryParams {
-    workflow_id: String,
+    workflow_id: WorkflowId,
     #[serde(default)]
     assumptions: Option<Vec<String>>,
     #[serde(default)]
@@ -3710,7 +3900,7 @@ struct WorkflowUpdateMemoryParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowSetRepairStrategyParams {
-    workflow_id: String,
+    workflow_id: WorkflowId,
     approach: RepairApproach,
     hypothesis: String,
     target_files: Vec<PathBuf>,
@@ -3731,20 +3921,20 @@ enum WorkflowTransition {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowTransitionParams {
-    workflow_id: String,
+    workflow_id: WorkflowId,
     transition: WorkflowTransition,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct WorkflowStatusParams {
-    workflow_id: Option<String>,
+    workflow_id: Option<WorkflowId>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowCompleteParams {
-    workflow_id: String,
+    workflow_id: WorkflowId,
     summary: String,
     remaining_risks: Vec<String>,
 }
@@ -4195,7 +4385,7 @@ mod tests {
             &config,
             &state,
             CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
-                "workflow_id": started["id"].as_str().unwrap(),
+                "flow_id": started["id"].as_str().unwrap(),
                 "plan": {
                     "affected_components": ["package"],
                     "relevant_files": [],
@@ -4214,6 +4404,54 @@ mod tests {
         assert!(error.message.contains("greenfield project"));
         assert!(error.message.contains("intended new paths"));
         assert!(error.message.contains("pyproject.toml"));
+    }
+
+    #[test]
+    fn workflow_start_uses_host_task_context_and_rejects_rollback_ids() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        state
+            .register_task_context(
+                workspace.root(),
+                "Erstelle ein neues Webprojekt mit HTML, CSS und JavaScript.".to_string(),
+                crate::coding::TaskInteractionMode::Autonomous,
+            )
+            .unwrap();
+
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "create the requested web project"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let started: Value = serde_json::from_str(&result_text(started)).unwrap();
+
+        assert_eq!(
+            started["task"]["original_user_request"],
+            "Erstelle ein neues Webprojekt mit HTML, CSS und JavaScript."
+        );
+        assert_eq!(started["task"]["intent"], "create");
+        assert!(started["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("workflow_")));
+
+        let error = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_STATUS_TOOL_NAME).with_arguments(object!({
+                "workflow_id": "00000000-0000-7000-8000-000000000000"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+        assert!(error
+            .message
+            .contains("workflow_id must start with `workflow_`"));
     }
 
     #[test]
@@ -4263,6 +4501,49 @@ mod tests {
         assert_eq!(
             planned["plan"]["relevant_files"],
             serde_json::json!(["src/package/__init__.py"])
+        );
+    }
+
+    #[test]
+    fn compact_plan_contract_builds_a_complete_validated_workflow_plan() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "repair the package"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let started: Value = serde_json::from_str(&result_text(started)).unwrap();
+
+        let planned = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
+                "workflow_id": started["id"].as_str().unwrap(),
+                "relevant_files": ["lib.rs"],
+                "intended_change": "normalize labels as lowercase",
+                "validation_program": "cargo",
+                "args": ["test"]
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let planned: Value = serde_json::from_str(&result_text(planned)).unwrap();
+
+        assert_eq!(planned["phase"], "planning");
+        assert_eq!(planned["plan"]["requirements"][0]["mandatory"], true);
+        assert_eq!(
+            planned["plan"]["validation"][0]["command"]["program"],
+            "cargo"
+        );
+        assert_eq!(
+            planned["plan"]["validation"][0]["command"]["args"],
+            serde_json::json!(["test"])
         );
     }
 
@@ -4930,7 +5211,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         fs::write(temp_dir.path().join("app.py"), "one\ntwo\nthree\n").unwrap();
         let call = CallToolRequestParams::new(READ_FILE_TOOL_NAME).with_arguments(object!({
-            "path": "app.py",
+            "relative_path": "app.py",
             "start_line": 2,
             "end_line": 2
         }));
@@ -5224,6 +5505,56 @@ mod tests {
         assert!(timeout_error
             .message
             .contains("configured coding shell timeout of 120"));
+    }
+
+    #[tokio::test]
+    async fn malformed_async_tool_calls_do_not_execute_or_mutate_workflow_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let mut config = enabled_config();
+        config.lsp = true;
+        let state = CodingToolState::default();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "inspect the fixture workspace"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let marker = temp_dir.path().join("must-not-exist");
+        let process_error = execute_async(
+            &config,
+            &state,
+            CallToolRequestParams::new(RUN_PROCESS_TOOL_NAME).with_arguments(object!({
+                "args": ["-c", "touch must-not-exist"]
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap_err();
+        let lsp_error = execute_async(
+            &config,
+            &state,
+            CallToolRequestParams::new(LSP_QUERY_TOOL_NAME).with_arguments(object!({
+                "operation": "document_symbols"
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(process_error.code, ErrorCode::INVALID_PARAMS);
+        assert!(process_error.message.contains("missing field `program`"));
+        assert_eq!(lsp_error.code, ErrorCode::INVALID_PARAMS);
+        assert!(lsp_error.message.contains("missing field `path`"));
+        assert!(!marker.exists());
+        assert_eq!(
+            state.workflow_status(workspace.root(), None).unwrap().phase,
+            WorkflowPhase::Analyzing
+        );
     }
 
     #[test]
