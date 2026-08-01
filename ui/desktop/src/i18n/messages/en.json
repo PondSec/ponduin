@@ -2052,7 +2052,7 @@
     "defaultMessage": "Test"
   },
   "modeSelectionItem.autonomousDescription": {
-    "defaultMessage": "Run all tools, including internal coding actions, without confirmation. Hard security blocks still apply."
+    "defaultMessage": "Run tools and coding actions without confirmation. Workspace and process boundaries still apply."
   },
   "modeSelectionItem.autonomousLabel": {
     "defaultMessage": "Autonomous"

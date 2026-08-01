@@ -512,7 +512,11 @@ export default function BaseChat({
           </div>
         )}
 
-        <WorkflowProgressPill messages={messages} progressMessage={progressMessage} />
+        <WorkflowProgressPill
+          active={chatState !== ChatState.Idle}
+          messages={messages}
+          progressMessage={progressMessage}
+        />
 
         <ChatInputCard
           className={cn(

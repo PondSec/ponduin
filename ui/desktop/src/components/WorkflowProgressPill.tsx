@@ -5,17 +5,19 @@ import { getWorkflowProgress } from '../utils/workflowProgress';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/Tooltip';
 
 type WorkflowProgressPillProps = {
+  active: boolean;
   messages: Message[];
   progressMessage?: string;
 };
 
 export default function WorkflowProgressPill({
+  active,
   messages,
   progressMessage,
 }: WorkflowProgressPillProps) {
   const progress = useMemo(() => getWorkflowProgress(messages), [messages]);
 
-  if (!progress) {
+  if (!active || !progress) {
     return null;
   }
 
@@ -47,8 +49,12 @@ export default function WorkflowProgressPill({
             )}
           </button>
         </TooltipTrigger>
-        <TooltipContent side="top" className="w-[min(28rem,calc(100vw-2rem))] p-3 text-left">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-inverse/60">
+        <TooltipContent
+          side="top"
+          className="w-[min(28rem,calc(100vw-2rem))] border border-border-primary bg-background-secondary p-3 text-left text-text-primary shadow-xl"
+          arrowClassName="bg-background-secondary fill-background-secondary"
+        >
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-secondary">
             Konkreter Plan
           </p>
           <ol className="space-y-2">
@@ -59,13 +65,15 @@ export default function WorkflowProgressPill({
                   <p className="font-medium">
                     {index + 1}. {step.label}
                   </p>
-                  {step.detail && <p className="mt-0.5 text-text-inverse/70">{step.detail}</p>}
+                  {step.detail && <p className="mt-0.5 text-text-secondary">{step.detail}</p>}
                 </div>
               </li>
             ))}
           </ol>
           {progressMessage && (
-            <p className="mt-3 border-t border-white/15 pt-2">{progressMessage}</p>
+            <p className="mt-3 border-t border-border-primary pt-2 text-text-secondary">
+              {progressMessage}
+            </p>
           )}
         </TooltipContent>
       </Tooltip>
@@ -85,5 +93,5 @@ function StepIcon({ status }: { status: 'active' | 'complete' | 'pending' }) {
       />
     );
   }
-  return <Circle className="mt-0.5 size-4 shrink-0 text-text-inverse/50" aria-hidden="true" />;
+  return <Circle className="mt-0.5 size-4 shrink-0 text-text-secondary" aria-hidden="true" />;
 }

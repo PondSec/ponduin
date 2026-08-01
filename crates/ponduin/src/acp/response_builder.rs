@@ -488,7 +488,7 @@ mod tests {
             SessionModeId::new("auto"),
             vec![
                 SessionMode::new(SessionModeId::new("auto"), "auto")
-                    .description("Run all tool calls without confirmation; hard security blocks still apply"),
+                    .description("Run all tool calls without confirmation; workspace and process boundaries still apply"),
                 SessionMode::new(SessionModeId::new("approve"), "approve")
                     .description("Ask before every tool call"),
                 SessionMode::new(SessionModeId::new("smart_approve"), "smart_approve")
@@ -505,7 +505,7 @@ mod tests {
             SessionModeId::new("approve"),
             vec![
                 SessionMode::new(SessionModeId::new("auto"), "auto")
-                    .description("Run all tool calls without confirmation; hard security blocks still apply"),
+                    .description("Run all tool calls without confirmation; workspace and process boundaries still apply"),
                 SessionMode::new(SessionModeId::new("approve"), "approve")
                     .description("Ask before every tool call"),
                 SessionMode::new(SessionModeId::new("smart_approve"), "smart_approve")
@@ -584,7 +584,7 @@ mod tests {
             SessionConfigOption::select(
                 "mode", "Mode", "auto",
                 vec![
-                    SessionConfigSelectOption::new("auto", "auto").description("Run all tool calls without confirmation; hard security blocks still apply"),
+                    SessionConfigSelectOption::new("auto", "auto").description("Run all tool calls without confirmation; workspace and process boundaries still apply"),
                     SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
                     SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Allow read-only tools; ask before mutating or sensitive tool calls"),
                     SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),
@@ -619,7 +619,7 @@ mod tests {
             SessionConfigOption::select(
                 "mode", "Mode", "approve",
                 vec![
-                    SessionConfigSelectOption::new("auto", "auto").description("Run all tool calls without confirmation; hard security blocks still apply"),
+                    SessionConfigSelectOption::new("auto", "auto").description("Run all tool calls without confirmation; workspace and process boundaries still apply"),
                     SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
                     SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Allow read-only tools; ask before mutating or sensitive tool calls"),
                     SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),

@@ -60,7 +60,11 @@ describe('WorkflowProgressPill', () => {
   it('shows live workflow progress and concrete steps on hover', async () => {
     const user = userEvent.setup();
     render(
-      <WorkflowProgressPill messages={workflowMessages()} progressMessage="Running final checks" />
+      <WorkflowProgressPill
+        active
+        messages={workflowMessages()}
+        progressMessage="Running final checks"
+      />
     );
 
     const trigger = screen.getByRole('button', { name: 'Workflow, Schritt 5 von 5' });
@@ -76,5 +80,11 @@ describe('WorkflowProgressPill', () => {
     expect(tooltip.getByText(/Normalize labels to lowercase\./)).toBeInTheDocument();
     expect(tooltip.getByText(/Run the library test suite\./)).toBeInTheDocument();
     expect(tooltip.getByText('Running final checks')).toBeInTheDocument();
+  });
+
+  it('hides progress after the agent stops', () => {
+    render(<WorkflowProgressPill active={false} messages={workflowMessages()} />);
+
+    expect(screen.queryByRole('button', { name: /Workflow/ })).not.toBeInTheDocument();
   });
 });
