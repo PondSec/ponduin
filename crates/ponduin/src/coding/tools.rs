@@ -1952,11 +1952,20 @@ pub(crate) fn execute_with_state(
         }
         WRITE_FILE_TOOL_NAME => {
             let params: WriteFileParams = parse_arguments(&tool_call)?;
+            let write_path = workspace
+                .resolve_for_write(&params.path)
+                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let path_exists = match write_path.symlink_metadata() {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(invalid_arguments(error.to_string())),
+            };
+            let updating_existing_file = path_exists && params.expected_digest.is_some();
             let mut change = serde_json::Map::new();
             change.insert(
                 "operation".to_string(),
                 Value::String(
-                    if params.expected_digest.is_some() {
+                    if updating_existing_file {
                         "write"
                     } else {
                         "create"
@@ -1969,7 +1978,8 @@ pub(crate) fn execute_with_state(
                 Value::String(params.path.to_string_lossy().into_owned()),
             );
             change.insert("content".to_string(), Value::String(params.content));
-            if let Some(expected_digest) = params.expected_digest {
+            if let Some(expected_digest) = params.expected_digest.filter(|_| updating_existing_file)
+            {
                 change.insert(
                     "expected_digest".to_string(),
                     Value::String(expected_digest),
@@ -4595,6 +4605,31 @@ mod tests {
                 .unwrap()
                 .changed_files,
             vec![PathBuf::from("index.html")]
+        );
+    }
+
+    #[test]
+    fn write_file_creates_a_new_file_when_a_model_supplies_an_unneeded_digest() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["index.html"]);
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "index.html",
+                "content": "<h1>America</h1>\n",
+                "expected_digest": "sha256:not-a-real-blake3-digest"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
+            "<h1>America</h1>\n"
         );
     }
 

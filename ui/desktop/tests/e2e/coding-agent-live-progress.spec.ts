@@ -1,0 +1,41 @@
+import { expect, test } from './fixtures';
+
+const workingDir = process.env.PONDUIN_E2E_WORKING_DIR;
+const enabled = process.env.PONDUIN_LIVE_AGENT_E2E === '1' && Boolean(workingDir);
+
+test.setTimeout(30 * 60_000);
+
+test.describe('live native coding agent progress GUI', () => {
+  test.skip(
+    !enabled,
+    'set PONDUIN_LIVE_AGENT_E2E=1 and PONDUIN_E2E_WORKING_DIR to run local-model E2E'
+  );
+
+  test('shows model updates and tool calls while autonomous work is still running', async ({
+    ponduinPage,
+  }) => {
+    const input = ponduinPage.locator('[data-testid="chat-input"]');
+    const agentMessages = ponduinPage.locator('.agent-message-bubble');
+    const toolCalls = ponduinPage.getByTestId('tool-call-progress');
+    const agentMessageCount = await agentMessages.count();
+    const toolCallCount = await toolCalls.count();
+
+    await input.waitFor({ state: 'visible', timeout: 60_000 });
+    await input.fill(
+      'Arbeite autonom im aktuellen Projekt. Erkläre vor dem ersten Tool-Aufruf kurz den nächsten Arbeitsschritt. Prüfe dann den Projektinhalt, erstelle progress_check.py mit einer Funktion add(a, b), führe einen passenden Python-Befehl aus und fasse erst nach der Validierung zusammen.'
+    );
+    await input.press('Enter');
+    await expect(input).toHaveValue('', { timeout: 30_000 });
+
+    await expect(toolCalls).toHaveCount(toolCallCount + 1, {
+      timeout: 240_000,
+    });
+    await expect(toolCalls.nth(toolCallCount)).toBeVisible({ timeout: 240_000 });
+    await expect(agentMessages).toHaveCount(agentMessageCount + 1, {
+      timeout: 240_000,
+    });
+    await expect(agentMessages.nth(agentMessageCount)).toBeVisible({
+      timeout: 240_000,
+    });
+  });
+});

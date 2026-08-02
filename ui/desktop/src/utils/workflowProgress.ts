@@ -34,12 +34,18 @@ export function getWorkflowProgress(messages: Message[]): WorkflowProgress | und
   }
 
   const plan = [...workflowCalls].reverse().find((call) => call.name === 'workflow_set_plan');
+  if (!plan) {
+    return undefined;
+  }
+  const planSteps = concretePlanSteps(plan.arguments);
+  if (planSteps.length === 0) {
+    return undefined;
+  }
+
   const changedFiles = changedFileCount(workflowCalls);
   const currentStep = currentStepFor(workflowCalls);
   const lineCounts = diffLineCounts(messages, workflowCalls);
-  const planSteps = plan ? concretePlanSteps(plan.arguments) : [];
-  const fallbackStep = workflowObjective(workflowCalls);
-  const steps = (planSteps.length > 0 ? planSteps : [fallbackStep]).map((label, index, all) => ({
+  const steps = planSteps.map((label, index, all) => ({
     label,
     detail: stepDetail(index, all.length, currentStep, changedFiles),
     status: stepStatus(index, all.length, currentStep),
@@ -195,14 +201,6 @@ function concretePlanSteps(argumentsValue: Record<string, unknown>): string[] {
     plan?.intended_changes,
     argumentsValue.intended_change
   );
-}
-
-function workflowObjective(calls: CodingToolCall[]): string {
-  const start = [...calls].reverse().find((call) => call.name === 'workflow_start');
-  const objective = start?.arguments.objective;
-  return typeof objective === 'string' && objective.trim()
-    ? objective.trim()
-    : 'Der Agent konkretisiert den Auftrag.';
 }
 
 function firstNonEmptyStringArray(...values: unknown[]): string[] {

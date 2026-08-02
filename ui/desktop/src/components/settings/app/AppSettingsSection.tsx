@@ -19,7 +19,7 @@ import ThemeSelector from '../../PonduinSidebar/ThemeSelector';
 import PonduinLogo from '../../../images/ponduin-icon.png';
 import TelemetrySettings from './TelemetrySettings';
 import { trackSettingToggled } from '../../../utils/analytics';
-import type { LanguageSetting } from '../../../utils/settings';
+import type { FileAccessScope, LanguageSetting } from '../../../utils/settings';
 
 const i18n = defineMessages({
   appearanceTitle: { id: 'settings.appearance.title', defaultMessage: 'Appearance' },
@@ -151,6 +151,37 @@ const i18n = defineMessages({
     defaultMessage: 'Toggle notifications on and adjust settings as desired',
   },
   close: { id: 'settings.close', defaultMessage: 'Close' },
+  fileAccessTitle: { id: 'settings.fileAccess.title', defaultMessage: 'File access' },
+  fileAccessDesc: {
+    id: 'settings.fileAccess.description',
+    defaultMessage: 'Choose where new agent tasks may read and write files.',
+  },
+  workspaceAccess: {
+    id: 'settings.fileAccess.workspace',
+    defaultMessage: 'Workspace only',
+  },
+  workspaceAccessDesc: {
+    id: 'settings.fileAccess.workspaceDescription',
+    defaultMessage: 'The agent can access only the directory selected for the task.',
+  },
+  userAccess: { id: 'settings.fileAccess.user', defaultMessage: 'Entire user folder' },
+  userAccessDesc: {
+    id: 'settings.fileAccess.userDescription',
+    defaultMessage: 'The agent can access files throughout your home folder.',
+  },
+  computerAccess: { id: 'settings.fileAccess.computer', defaultMessage: 'Entire computer' },
+  computerAccessDesc: {
+    id: 'settings.fileAccess.computerDescription',
+    defaultMessage: 'The agent can access files anywhere your user account is allowed to access.',
+  },
+  appliesToNewTasks: {
+    id: 'settings.fileAccess.appliesToNewTasks',
+    defaultMessage: 'This applies to newly opened tasks.',
+  },
+  fullDiskAccess: {
+    id: 'settings.fileAccess.fullDiskAccess',
+    defaultMessage: 'Open macOS Full Disk Access settings',
+  },
 });
 
 const LANGUAGE_OPTIONS: Array<{ value: LanguageSetting; message: keyof typeof i18n }> = [
@@ -187,6 +218,7 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
   const [showNotificationModal, setShowNotificationModal] = useState(false);
   const [showPricing, setShowPricing] = useState(true);
   const [language, setLanguage] = useState<LanguageSetting>('system');
+  const [fileAccessScope, setFileAccessScope] = useState<FileAccessScope>('workspace');
   const updateSectionRef = useRef<HTMLDivElement>(null);
   const shouldShowUpdates = !window.appConfig.get('PONDUIN_VERSION');
 
@@ -197,6 +229,7 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
   useEffect(() => {
     window.electron.getSetting('showPricing').then(setShowPricing);
     window.electron.getSetting('language').then((value) => setLanguage(value ?? 'system'));
+    window.electron.getSetting('fileAccessScope').then((value) => setFileAccessScope(value));
   }, []);
 
   useEffect(() => {
@@ -306,6 +339,20 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
       console.error('Failed to update language setting:', error);
       setLanguage(language);
     }
+  };
+
+  const handleFileAccessScopeChange = async (scope: FileAccessScope) => {
+    if (scope === fileAccessScope) {
+      return;
+    }
+
+    const approved = await window.electron.requestFileAccessScope(scope);
+    if (!approved) {
+      return;
+    }
+
+    await window.electron.setSetting('fileAccessScope', scope);
+    setFileAccessScope(scope);
   };
 
   const intl = useIntl();
@@ -444,6 +491,56 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
                 />
               </div>
             </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-lg">
+        <CardHeader className="pb-0">
+          <CardTitle className="mb-1">{intl.formatMessage(i18n.fileAccessTitle)}</CardTitle>
+          <CardDescription>{intl.formatMessage(i18n.fileAccessDesc)}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 px-4 pt-4">
+          {(
+            [
+              ['workspace', 'workspaceAccess', 'workspaceAccessDesc'],
+              ['user', 'userAccess', 'userAccessDesc'],
+              ['computer', 'computerAccess', 'computerAccessDesc'],
+            ] as const
+          ).map(([scope, label, description]) => (
+            <label
+              key={scope}
+              className="flex cursor-pointer items-start gap-3 rounded-md border border-border-primary px-3 py-3 transition-colors has-[:checked]:border-blue-400 has-[:checked]:bg-background-tertiary"
+            >
+              <input
+                type="radio"
+                name="file-access-scope"
+                value={scope}
+                checked={fileAccessScope === scope}
+                onChange={() => void handleFileAccessScopeChange(scope)}
+                className="mt-1"
+              />
+              <span>
+                <span className="block text-sm text-text-primary">
+                  {intl.formatMessage(i18n[label])}
+                </span>
+                <span className="block pt-0.5 text-xs text-text-secondary">
+                  {intl.formatMessage(i18n[description])}
+                </span>
+              </span>
+            </label>
+          ))}
+          <p className="text-xs text-text-secondary">
+            {intl.formatMessage(i18n.appliesToNewTasks)}
+          </p>
+          {isMacOS && fileAccessScope === 'computer' && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void window.electron.openFullDiskAccessSettings()}
+            >
+              {intl.formatMessage(i18n.fullDiskAccess)}
+            </Button>
           )}
         </CardContent>
       </Card>

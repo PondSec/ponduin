@@ -1,4 +1,4 @@
-import type { OpenDialogOptions, OpenDialogReturnValue } from 'electron';
+import type { MessageBoxOptions, OpenDialogOptions, OpenDialogReturnValue } from 'electron';
 import {
   app,
   App,
@@ -36,7 +36,7 @@ import { ensureWinShims } from './utils/winShims';
 import { addRecentDir, loadRecentDirs } from './utils/recentDirs';
 import { formatAppName, errorMessage, formatErrorForLogging } from './utils/conversionUtils';
 import { isRetiredPonduinChatApp } from './utils/retiredApps';
-import type { Settings, SettingKey } from './utils/settings';
+import type { FileAccessScope, Settings, SettingKey } from './utils/settings';
 import { defaultSettings, getKeyboardShortcuts } from './utils/settings';
 import * as crypto from 'crypto';
 import * as yaml from 'yaml';
@@ -924,6 +924,20 @@ const getServerSecret = (settings: Settings): string => {
   return GENERATED_SECRET;
 };
 
+function workingDirectoryForAccessScope(
+  requestedDirectory: string,
+  scope: FileAccessScope
+): string {
+  switch (scope) {
+    case 'workspace':
+      return requestedDirectory;
+    case 'user':
+      return os.homedir();
+    case 'computer':
+      return path.parse(os.homedir()).root;
+  }
+}
+
 const getActiveExternalBackend = (settings: Settings): ExternalBackend | null => {
   const envBackend = getExternalBackendFromEnv();
   if (envBackend) {
@@ -1059,7 +1073,10 @@ const createChat = async (
   }
 
   const serverSecret = externalBackend ? externalBackend.secret : GENERATED_SECRET;
-  let workingDir = dir || os.homedir();
+  let workingDir = workingDirectoryForAccessScope(
+    dir || os.homedir(),
+    settings.fileAccessScope
+  );
   let ponduinServeLease: PonduinServeLease | null = null;
 
   if (externalBackend) {
@@ -1937,6 +1954,7 @@ const validSettingKeys: Set<string> = new Set([
   'enableWakelock',
   'enableNotifications',
   'spellcheckEnabled',
+  'fileAccessScope',
   'externalPonduind',
   'globalShortcut',
   'keyboardShortcuts',
@@ -1949,6 +1967,12 @@ const validSettingKeys: Set<string> = new Set([
   'disableAutoDownload',
 ]);
 
+const validFileAccessScopes: ReadonlySet<FileAccessScope> = new Set([
+  'workspace',
+  'user',
+  'computer',
+]);
+
 ipcMain.handle('set-setting', (_event, key: SettingKey, value: unknown) => {
   // Validate key at runtime to prevent prototype pollution
   if (!validSettingKeys.has(key)) {
@@ -1958,6 +1982,11 @@ ipcMain.handle('set-setting', (_event, key: SettingKey, value: unknown) => {
 
   if (key === 'language' && !isValidLanguageSetting(value)) {
     console.error(`Invalid language setting rejected: ${String(value)}`);
+    return;
+  }
+
+  if (key === 'fileAccessScope' && !validFileAccessScopes.has(value as FileAccessScope)) {
+    console.error(`Invalid file access scope rejected: ${String(value)}`);
     return;
   }
 
@@ -1978,6 +2007,43 @@ ipcMain.handle('set-setting', (_event, key: SettingKey, value: unknown) => {
   if (key === 'disableAutoDownload') {
     setAutoDownloadDisabled(value as boolean);
   }
+});
+
+ipcMain.handle('request-file-access-scope', async (event, scope: FileAccessScope) => {
+  if (!validFileAccessScopes.has(scope)) {
+    return false;
+  }
+  if (scope === 'workspace') {
+    return true;
+  }
+
+  const isComputerScope = scope === 'computer';
+  const options: MessageBoxOptions = {
+    type: isComputerScope ? 'warning' : 'question',
+    title: isComputerScope ? 'Allow access to all files?' : 'Allow access to your user files?',
+    message: isComputerScope
+      ? 'Allow Ponduin to access files anywhere this macOS user can access?'
+      : 'Allow Ponduin to access files throughout your user folder?',
+    detail: isComputerScope
+      ? 'This applies to new tasks. Protected macOS folders still require Full Disk Access in System Settings.'
+      : 'This applies to new tasks. You can return to workspace-only access at any time.',
+    buttons: ['Cancel', 'Allow'],
+    defaultId: 0,
+    cancelId: 0,
+  };
+  const window = BrowserWindow.fromWebContents(event.sender);
+  const response = window
+    ? await dialog.showMessageBox(window, options)
+    : await dialog.showMessageBox(options);
+  return response.response === 1;
+});
+
+ipcMain.handle('open-full-disk-access-settings', async () => {
+  if (process.platform !== 'darwin') {
+    return false;
+  }
+  await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles');
+  return true;
 });
 
 ipcMain.handle('get-secret-key', (event) => {

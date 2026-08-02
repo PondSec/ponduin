@@ -405,6 +405,10 @@ fn project_message_for_user_event(message: &Message) -> Message {
     message.user_visible_content()
 }
 
+fn message_for_live_update(message: &Message) -> Option<Message> {
+    (!message.content.is_empty()).then(|| message.clone())
+}
+
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
 }
@@ -2536,10 +2540,8 @@ impl Agent {
                                         .workflow_continuation(&session.working_dir)
                                         .is_some();
 
-                                if !suppress_user_visible_response
-                                    && !filtered_response.content.is_empty()
-                                {
-                                    yield AgentEvent::Message(filtered_response.clone());
+                                if let Some(live_response) = message_for_live_update(&filtered_response) {
+                                    yield AgentEvent::Message(live_response);
                                     tokio::task::yield_now().await;
                                 }
 
@@ -4599,8 +4601,31 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         assert_eq!(visible_ids, vec!["read", "other"]);
     }
 
+    #[test]
+    fn live_updates_preserve_model_text_and_tool_progress() {
+        let response = Message::assistant()
+            .with_text("I will now inspect the project.")
+            .with_tool_request(
+                "read",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::READ_FILE_TOOL_NAME,
+                )),
+            );
+
+        let progress = message_for_live_update(&response).expect("live update");
+
+        assert!(progress
+            .as_concat_text()
+            .contains("I will now inspect the project."));
+        assert!(matches!(
+            progress.content.as_slice(),
+            [MessageContent::Text(_), MessageContent::ToolRequest(_)]
+        ));
+    }
+
     #[tokio::test]
     async fn coding_tools_are_disclosed_after_activation_and_reset_next_reply() -> Result<()> {
+        let _guard = env_lock::lock_env([("PONDUIN_THINKING_EFFORT", Some("high"))]);
         let temp_dir = tempfile::tempdir()?;
         let provider = Arc::new(CodingDisclosureProvider::new());
         let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
@@ -4700,7 +4725,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .tools
             .iter()
             .all(|name| !crate::coding::tools::is_reserved_name(name)));
-        assert_eq!(inactive.thinking_effort, None);
+        assert_eq!(inactive.thinking_effort.as_deref(), Some("high"));
         Ok(())
     }
 

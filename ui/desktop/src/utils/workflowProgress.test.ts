@@ -83,14 +83,12 @@ describe('getWorkflowProgress', () => {
     ]);
   });
 
-  it('shows the active analysis step before a plan has been accepted', () => {
+  it('hides progress before a concrete plan has been accepted', () => {
     const progress = getWorkflowProgress(
       messages([request('start', 'workflow_start'), response('start')])
     );
 
-    expect(progress?.currentStep).toBe(1);
-    expect(progress?.steps[0].status).toBe('active');
-    expect(progress?.steps[0].label).toBe('Der Agent konkretisiert den Auftrag.');
+    expect(progress).toBeUndefined();
   });
 
   it('only shows the latest workflow in a session', () => {
@@ -105,6 +103,6 @@ describe('getWorkflowProgress', () => {
       ])
     );
 
-    expect(progress?.currentStep).toBe(1);
+    expect(progress).toBeUndefined();
   });
 });

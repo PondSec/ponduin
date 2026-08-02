@@ -39,6 +39,9 @@ static ACP_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static ACP_CONFIG_ROOT: LazyLock<tempfile::TempDir> =
     LazyLock::new(|| tempfile::tempdir().unwrap());
 
+const ROUTING_CONTINUE_RESPONSE: &str =
+    include_str!("../acp_test_data/openai_routing_continue.txt");
+
 struct FixtureScheduler {
     jobs: tokio::sync::Mutex<Vec<ScheduledJob>>,
 }
@@ -270,6 +273,12 @@ impl OpenAiFixture {
                         return ResponseTemplate::new(417)
                             .insert_header("content-type", "application/json")
                             .set_body_json(serde_json::json!({"error": {"message": e}}));
+                    }
+
+                    if body.contains("Classify the newest user turn in the quoted JSON below") {
+                        return ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string(ROUTING_CONTINUE_RESPONSE);
                     }
 
                     // See if the actual request matches the expected pattern
