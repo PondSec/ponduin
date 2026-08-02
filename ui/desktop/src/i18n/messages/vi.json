@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Biểu tượng dock"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Áp dụng cho các tác vụ mới mở."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Toàn bộ máy tính"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "Tác nhân có thể truy cập tệp ở bất kỳ đâu mà tài khoản người dùng của bạn được phép truy cập."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Chọn nơi các tác vụ tác nhân mới có thể đọc và ghi tệp."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Mở cài đặt Quyền truy cập toàn bộ ổ đĩa của macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Quyền truy cập tệp"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Toàn bộ thư mục người dùng"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "Tác nhân có thể truy cập tệp trong thư mục người dùng của bạn."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Chỉ không gian làm việc"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "Tác nhân chỉ có thể truy cập tệp trong không gian làm việc của tác vụ."
+  },
   "settings.help.description": {
     "defaultMessage": "Giúp chúng tôi cải thiện ponduin bằng cách báo cáo sự cố hoặc yêu cầu tính năng mới"
   },

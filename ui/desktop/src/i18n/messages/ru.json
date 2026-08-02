@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Значок Dock"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Применяется к вновь открываемым задачам."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Весь компьютер"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "Агент может получать доступ к файлам везде, где это разрешено вашей учётной записи."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Выберите, где новые задачи агента могут читать и записывать файлы."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Открыть настройки полного доступа к диску macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Доступ к файлам"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Вся папка пользователя"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "Агент может получать доступ к файлам в вашей папке пользователя."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Только рабочая область"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "Агент может получать доступ только к файлам в рабочей области задачи."
+  },
   "settings.help.description": {
     "defaultMessage": "Помогите улучшить ponduin: сообщайте о проблемах или запрашивайте новые функции"
   },

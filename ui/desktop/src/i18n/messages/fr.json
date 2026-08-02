@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Icône du Dock"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "S’applique aux nouvelles tâches ouvertes."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Ordinateur entier"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "L’agent peut accéder aux fichiers auxquels votre compte utilisateur est autorisé à accéder."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Choisissez où les nouvelles tâches de l’agent peuvent lire et écrire des fichiers."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Ouvrir les réglages Accès complet au disque de macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Accès aux fichiers"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Dossier utilisateur entier"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "L’agent peut accéder aux fichiers de votre dossier utilisateur."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Espace de travail uniquement"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "L’agent ne peut accéder qu’aux fichiers de l’espace de travail de la tâche."
+  },
   "settings.help.description": {
     "defaultMessage": "Aidez-nous à améliorer ponduin en signalant des problèmes ou en demandant de nouvelles fonctionnalités"
   },

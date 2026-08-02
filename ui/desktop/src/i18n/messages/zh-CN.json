@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Dock 图标"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "适用于新打开的任务。"
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "整台电脑"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "代理可以访问您的用户帐户获准访问的任何位置中的文件。"
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "选择新代理任务可以在哪些位置读取和写入文件。"
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "打开 macOS“完全磁盘访问权限”设置"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "文件访问"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "整个用户文件夹"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "代理可以访问您的用户文件夹中的文件。"
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "仅工作区"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "代理只能访问任务工作区中的文件。"
+  },
   "settings.help.description": {
     "defaultMessage": "通过报告问题或请求新功能帮助我们改进 ponduin"
   },
