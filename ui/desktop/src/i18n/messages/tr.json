@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Bağlantı noktası simgesi"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Yeni açılan görevler için geçerlidir."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Tüm bilgisayar"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "Aracı, kullanıcı hesabınızın erişmesine izin verilen her yerdeki dosyalara erişebilir."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Yeni aracı görevlerinin dosyaları nerede okuyup yazabileceğini seçin."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "macOS Tam Disk Erişimi ayarlarını aç"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Dosya erişimi"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Tüm kullanıcı klasörü"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "Aracı, kullanıcı klasörünüzdeki dosyalara erişebilir."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Yalnızca çalışma alanı"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "Aracı yalnızca görevin çalışma alanındaki dosyalara erişebilir."
+  },
   "settings.help.description": {
     "defaultMessage": "Sorunları bildirerek veya yeni özellikler talep ederek ponduin'yi geliştirmemize yardımcı olun"
   },

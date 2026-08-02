@@ -182,7 +182,11 @@ export default function PonduinMessage({
                   const confirmationContent = findConfirmationForToolAcrossMessages(toolRequest.id);
                   const isApprovalClicked = confirmationContent && !isPending && hasResponse;
                   return (
-                    <div className="ponduin-message-tool" key={toolRequest.id}>
+                    <div
+                      className="ponduin-message-tool"
+                      data-testid="tool-call-progress"
+                      key={toolRequest.id}
+                    >
                       <ToolCallWithResponse
                         sessionId={sessionId}
                         isCancelledMessage={false}

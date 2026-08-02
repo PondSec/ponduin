@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Icona del dock"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Si applica alle attività aperte da ora in poi."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Intero computer"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "L'agente può accedere ai file a cui il tuo account utente è autorizzato ad accedere."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Scegli dove le nuove attività dell'agente possono leggere e scrivere file."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Apri le impostazioni di accesso completo al disco di macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Accesso ai file"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Intera cartella utente"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "L'agente può accedere ai file nella tua cartella utente."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Solo spazio di lavoro"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "L'agente può accedere solo ai file nello spazio di lavoro dell'attività."
+  },
   "settings.help.description": {
     "defaultMessage": "Aiutaci a migliorare ponduin segnalando problemi o richiedendo nuove funzionalità"
   },

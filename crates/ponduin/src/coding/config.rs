@@ -9,7 +9,6 @@ pub const CODING_MAX_ITERATIONS_KEY: &str = "PONDUIN_CODING_MAX_ITERATIONS";
 pub const CODING_MAX_REPAIR_ATTEMPTS_KEY: &str = "PONDUIN_CODING_MAX_REPAIR_ATTEMPTS";
 pub const CODING_MAX_CONTEXT_TOKENS_KEY: &str = "PONDUIN_CODING_MAX_CONTEXT_TOKENS";
 pub const CODING_MAX_FILES_PER_BATCH_KEY: &str = "PONDUIN_CODING_MAX_FILES_PER_BATCH";
-pub const CODING_PLAN_FILE_THRESHOLD_KEY: &str = "PONDUIN_CODING_PLAN_FILE_THRESHOLD";
 pub const CODING_AUTO_TEST_KEY: &str = "PONDUIN_CODING_AUTO_TEST";
 pub const CODING_AUTO_FORMAT_KEY: &str = "PONDUIN_CODING_AUTO_FORMAT";
 pub const CODING_INDEXING_KEY: &str = "PONDUIN_CODING_INDEXING";
@@ -31,7 +30,6 @@ const MAX_CONTEXT_TOKENS: usize = 1_000_000;
 const MAX_ITERATIONS_LIMIT: u32 = 1_000;
 const MAX_REPAIR_ATTEMPTS_LIMIT: u32 = 100;
 const MAX_FILES_PER_BATCH_LIMIT: usize = 1_000;
-const MAX_PLAN_FILE_THRESHOLD: usize = 1_000;
 const MIN_SHELL_TIMEOUT_SECONDS: u64 = 1;
 const MAX_SHELL_TIMEOUT_SECONDS: u64 = 3_600;
 const MIN_OUTPUT_LIMIT: usize = 1_024;
@@ -48,7 +46,6 @@ pub struct CodingConfig {
     pub max_repair_attempts: u32,
     pub max_context_tokens: usize,
     pub max_files_per_batch: usize,
-    pub plan_file_threshold: usize,
     pub auto_test: bool,
     pub auto_format: bool,
     pub indexing: bool,
@@ -73,7 +70,6 @@ impl Default for CodingConfig {
             max_repair_attempts: 3,
             max_context_tokens: 32_768,
             max_files_per_batch: 20,
-            plan_file_threshold: 4,
             auto_test: true,
             auto_format: false,
             indexing: true,
@@ -118,11 +114,6 @@ impl CodingConfig {
                 config,
                 CODING_MAX_FILES_PER_BATCH_KEY,
                 defaults.max_files_per_batch,
-            )?,
-            plan_file_threshold: optional(
-                config,
-                CODING_PLAN_FILE_THRESHOLD_KEY,
-                defaults.plan_file_threshold,
             )?,
             auto_test: optional(config, CODING_AUTO_TEST_KEY, defaults.auto_test)?,
             auto_format: optional(config, CODING_AUTO_FORMAT_KEY, defaults.auto_format)?,
@@ -193,12 +184,6 @@ impl CodingConfig {
             self.max_files_per_batch as u64,
             1,
             MAX_FILES_PER_BATCH_LIMIT as u64,
-        )?;
-        validate_range(
-            CODING_PLAN_FILE_THRESHOLD_KEY,
-            self.plan_file_threshold as u64,
-            1,
-            MAX_PLAN_FILE_THRESHOLD as u64,
         )?;
         validate_range(
             CODING_SHELL_TIMEOUT_KEY,

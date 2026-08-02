@@ -2,8 +2,9 @@ use crate::coding::file::content_digest;
 use crate::coding::intelligence::CodeSymbol;
 use crate::coding::patch::MutationPreview;
 use crate::coding::process::ProcessOutput;
+use crate::coding::review::{ReviewReport, ReviewSeverity};
 use crate::coding::validation::{ValidationExecution, ValidationStatus};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
@@ -16,8 +17,9 @@ const LOOP_THRESHOLD: usize = 3;
 /// Auditable state machine for multi-step coding tasks.
 #[derive(Debug, Clone)]
 pub struct CodingWorkflow {
-    id: String,
+    id: WorkflowId,
     objective: String,
+    task: WorkflowTaskState,
     phase: WorkflowPhase,
     plan: Option<WorkflowPlan>,
     limits: WorkflowLimits,
@@ -33,16 +35,33 @@ pub struct CodingWorkflow {
     last_error_count: Option<usize>,
     stop_reason: Option<WorkflowStopReason>,
     completion: Option<CompletionDetails>,
+    review: Option<ReviewEvidence>,
     memory: WorkflowMemory,
 }
 
 impl CodingWorkflow {
     pub fn new(objective: String, limits: WorkflowLimits) -> Result<Self, WorkflowError> {
+        Self::new_with_task(
+            objective.clone(),
+            WorkflowTaskState::new(objective, TaskInteractionMode::Autonomous, PathBuf::new())?,
+            limits,
+        )
+    }
+
+    pub fn new_with_task(
+        objective: String,
+        task: WorkflowTaskState,
+        limits: WorkflowLimits,
+    ) -> Result<Self, WorkflowError> {
         limits.validate()?;
         validate_text("objective", &objective, false)?;
+        if task.normalized_objective != objective {
+            return Err(WorkflowError::TaskObjectiveMismatch);
+        }
         Ok(Self {
-            id: Uuid::now_v7().to_string(),
+            id: WorkflowId::new(),
             objective,
+            task,
             phase: WorkflowPhase::Analyzing,
             plan: None,
             limits,
@@ -58,11 +77,12 @@ impl CodingWorkflow {
             last_error_count: None,
             stop_reason: None,
             completion: None,
+            review: None,
             memory: WorkflowMemory::default(),
         })
     }
 
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &WorkflowId {
         &self.id
     }
 
@@ -151,6 +171,77 @@ impl CodingWorkflow {
         Ok(())
     }
 
+    pub fn record_tool_contract_failure(&mut self, tool_name: &str, error_class: &str) -> usize {
+        if self.is_terminal() {
+            return 0;
+        }
+        let diagnostic_fingerprint =
+            content_digest(format!("{tool_name}\0{error_class}").as_bytes());
+        let repetitions = self
+            .memory
+            .tool_contract_errors
+            .iter()
+            .filter(|error| error.diagnostic_fingerprint == diagnostic_fingerprint)
+            .count()
+            + 1;
+        self.memory
+            .tool_contract_errors
+            .push(ToolContractErrorEvidence {
+                revision: self.revision,
+                tool_name: tool_name.to_string(),
+                diagnostic_fingerprint,
+                repetitions,
+            });
+        if self.memory.tool_contract_errors.len() > MAX_EVIDENCE_RECORDS {
+            self.memory.tool_contract_errors.remove(0);
+        }
+        if repetitions >= LOOP_THRESHOLD {
+            self.block(WorkflowStopReason::RepeatedToolContract {
+                tool_name: tool_name.to_string(),
+                repetitions,
+            });
+        }
+        repetitions
+    }
+
+    pub fn block_for_action_limit(&mut self, limit: u32) {
+        if !self.is_terminal() {
+            self.block(WorkflowStopReason::ActionLimit { limit });
+        }
+    }
+
+    pub fn set_repair_strategy(
+        &mut self,
+        approach: RepairApproach,
+        hypothesis: String,
+        target_files: Vec<PathBuf>,
+    ) -> Result<(), WorkflowError> {
+        self.require_phase(&[WorkflowPhase::Debugging])?;
+        validate_text("repair hypothesis", &hypothesis, false)?;
+        validate_paths(&target_files)?;
+        let diagnostic_fingerprint = self
+            .current_failed_validation()
+            .map(|validation| validation.diagnostic_fingerprint.clone())
+            .ok_or(WorkflowError::RepairStrategyWithoutFailure)?;
+        if self.memory.repair_strategies.iter().any(|strategy| {
+            strategy.diagnostic_fingerprint == diagnostic_fingerprint
+                && strategy.approach == approach
+        }) {
+            return Err(WorkflowError::RepeatedRepairStrategy(approach));
+        }
+        self.memory.repair_strategies.push(RepairStrategyEvidence {
+            revision: self.revision,
+            diagnostic_fingerprint,
+            approach,
+            hypothesis_fingerprint: content_digest(hypothesis.as_bytes()),
+            target_files,
+        });
+        if self.memory.repair_strategies.len() > MAX_EVIDENCE_RECORDS {
+            self.memory.repair_strategies.remove(0);
+        }
+        Ok(())
+    }
+
     pub fn set_plan(&mut self, plan: WorkflowPlan) -> Result<(), WorkflowError> {
         self.require_phase(&[WorkflowPhase::Analyzing, WorkflowPhase::Searching])?;
         plan.validate()?;
@@ -170,6 +261,9 @@ impl CodingWorkflow {
 
     pub fn authorize_change(&mut self) -> Result<(), WorkflowError> {
         self.require_phase(&[WorkflowPhase::Editing])?;
+        if matches!(self.task.intent, TaskIntent::Inspect | TaskIntent::Verify) {
+            return Err(WorkflowError::MutationForbiddenForIntent(self.task.intent));
+        }
         if self.iterations >= self.limits.max_iterations {
             self.fail(WorkflowStopReason::IterationLimit {
                 limit: self.limits.max_iterations,
@@ -276,7 +370,14 @@ impl CodingWorkflow {
             return Ok(());
         }
 
-        let validation = ValidationEvidence::from_process(self.revision, program, args, output);
+        let planned_check_ids = self.matching_check_ids(program, args, &output.cwd);
+        let validation = ValidationEvidence::from_process(
+            self.revision,
+            program,
+            args,
+            output,
+            planned_check_ids,
+        );
         self.accept_validation(validation)
     }
 
@@ -290,7 +391,43 @@ impl CodingWorkflow {
         if let Some(command) = CommandEvidence::from_execution(self.revision, execution) {
             self.record_command_evidence(command);
         }
-        self.accept_validation(ValidationEvidence::from_execution(self.revision, execution))
+        let planned_check_ids = execution.command.as_ref().map_or_else(Vec::new, |command| {
+            self.matching_check_ids(&command.program, &command.args, &command.cwd)
+        });
+        self.accept_validation(ValidationEvidence::from_execution(
+            self.revision,
+            execution,
+            planned_check_ids,
+        ))
+    }
+
+    pub fn record_review(&mut self, review: &ReviewReport) -> Result<(), WorkflowError> {
+        self.require_phase(&[WorkflowPhase::Reviewing])?;
+        let changed_files = self.changed_files().into_iter().collect::<BTreeSet<_>>();
+        let reviewed_files = review.files.iter().cloned().collect::<BTreeSet<_>>();
+        let blocking_findings = review
+            .findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.severity,
+                    ReviewSeverity::Critical | ReviewSeverity::High
+                )
+            })
+            .count();
+        self.review = Some(ReviewEvidence {
+            revision: self.revision,
+            analyzed_patch_fingerprint: review.analyzed_patch_fingerprint.clone(),
+            reviewed_files: review.files.clone(),
+            finding_count: review.findings.len(),
+            blocking_findings,
+            complete: changed_files.is_subset(&reviewed_files)
+                && !(review.diff_truncated || review.lossy_output || review.truncated),
+        });
+        if blocking_findings > 0 {
+            self.phase = WorkflowPhase::Debugging;
+        }
+        Ok(())
     }
 
     fn accept_validation(&mut self, validation: ValidationEvidence) -> Result<(), WorkflowError> {
@@ -305,6 +442,7 @@ impl CodingWorkflow {
         if outcome.is_success() {
             self.non_improving_failures = 0;
             self.last_error_count = Some(0);
+            self.failure_counts.clear();
             return Ok(());
         }
         if let Some(validation) = self.validations.last() {
@@ -358,6 +496,23 @@ impl CodingWorkflow {
 
     pub fn begin_repair(&mut self) -> Result<(), WorkflowError> {
         self.require_phase(&[WorkflowPhase::Debugging])?;
+        let diagnostic_fingerprint = self
+            .current_failed_validation()
+            .map(|validation| validation.diagnostic_fingerprint.clone())
+            .ok_or(WorkflowError::RepairStrategyWithoutFailure)?;
+        let repetitions = self
+            .failure_counts
+            .get(&diagnostic_fingerprint)
+            .copied()
+            .unwrap_or_default();
+        if repetitions >= 2
+            && !self.memory.repair_strategies.iter().any(|strategy| {
+                strategy.revision == self.revision
+                    && strategy.diagnostic_fingerprint == diagnostic_fingerprint
+            })
+        {
+            return Err(WorkflowError::RepairStrategyRequired);
+        }
         if self.repair_attempts >= self.limits.max_repair_attempts {
             self.block(WorkflowStopReason::RepairLimit {
                 limit: self.limits.max_repair_attempts,
@@ -371,10 +526,17 @@ impl CodingWorkflow {
     }
 
     pub fn begin_review(&mut self) -> Result<(), WorkflowError> {
-        let validation_required = self
+        let required_checks = self
             .plan
             .as_ref()
-            .is_some_and(|plan| !plan.validation.is_empty() || !plan.tests.is_empty());
+            .map(|plan| {
+                plan.checks()
+                    .into_iter()
+                    .filter(|check| check.required)
+                    .map(|check| check.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         match self.phase {
             WorkflowPhase::Testing => {
                 let current = self
@@ -382,21 +544,25 @@ impl CodingWorkflow {
                     .iter()
                     .filter(|validation| validation.revision == self.revision)
                     .collect::<Vec<_>>();
-                if validation_required
-                    && !current
+                if current.iter().any(|validation| {
+                    validation
+                        .planned_check_ids
                         .iter()
-                        .any(|validation| validation.outcome.is_success())
-                {
-                    return Err(WorkflowError::ValidationRequired);
-                }
-                if current
-                    .iter()
-                    .any(|validation| validation.outcome.requires_repair())
-                {
+                        .any(|id| required_checks.contains(id))
+                        && !validation.outcome.is_success()
+                }) {
                     return Err(WorkflowError::ValidationFailed);
                 }
+                if required_checks.iter().any(|check_id| {
+                    !current.iter().any(|validation| {
+                        validation.outcome.is_success()
+                            && validation.planned_check_ids.iter().any(|id| id == check_id)
+                    })
+                }) {
+                    return Err(WorkflowError::ValidationRequired);
+                }
             }
-            WorkflowPhase::Editing if !validation_required => {}
+            WorkflowPhase::Editing if required_checks.is_empty() => {}
             _ => {
                 return Err(WorkflowError::InvalidTransition {
                     from: self.phase,
@@ -413,17 +579,44 @@ impl CodingWorkflow {
         candidate.begin_review().is_ok()
     }
 
+    pub fn can_complete(&self) -> bool {
+        self.phase == WorkflowPhase::Reviewing
+            && self
+                .review
+                .as_ref()
+                .is_some_and(|review| review.revision == self.revision && review.complete)
+    }
+
     pub fn complete(
         &mut self,
         summary: String,
         remaining_risks: Vec<String>,
     ) -> Result<WorkflowReport, WorkflowError> {
         self.require_phase(&[WorkflowPhase::Reviewing])?;
+        let review = self.review.as_ref().ok_or(WorkflowError::ReviewRequired)?;
+        if review.revision != self.revision || !review.complete {
+            return Err(WorkflowError::ReviewRequired);
+        }
+        if review.blocking_findings > 0 {
+            return Err(WorkflowError::ReviewFailed);
+        }
+        let requirements = self.requirement_evidence();
+        let open_requirements = requirements
+            .iter()
+            .filter(|requirement| {
+                requirement.mandatory && requirement.status != RequirementStatus::Verified
+            })
+            .map(|requirement| requirement.id.clone())
+            .collect::<Vec<_>>();
+        if !open_requirements.is_empty() {
+            return Err(WorkflowError::MandatoryRequirementsOpen(open_requirements));
+        }
         validate_text("completion summary", &summary, false)?;
         validate_items("remaining risks", &remaining_risks, true)?;
         self.completion = Some(CompletionDetails {
             summary,
             remaining_risks,
+            requirements,
         });
         self.phase = WorkflowPhase::Completed;
         Ok(self.report())
@@ -433,6 +626,7 @@ impl CodingWorkflow {
         WorkflowStatus {
             id: self.id.clone(),
             objective: self.objective.clone(),
+            task: self.task.clone(),
             phase: self.phase,
             plan: self.plan.clone(),
             iterations: self.iterations,
@@ -455,13 +649,20 @@ impl CodingWorkflow {
             .filter(|validation| validation.revision == self.revision)
             .cloned()
             .collect::<Vec<_>>();
-        let verified = !current_validations.is_empty()
-            && current_validations
+        let requirements = self
+            .completion
+            .as_ref()
+            .map(|completion| completion.requirements.clone())
+            .unwrap_or_else(|| self.requirement_evidence());
+        let verified = self.phase == WorkflowPhase::Completed
+            && requirements
                 .iter()
-                .all(|validation| validation.outcome.is_success());
+                .filter(|requirement| requirement.mandatory)
+                .all(|requirement| requirement.status == RequirementStatus::Verified);
         WorkflowReport {
             id: self.id.clone(),
             objective: self.objective.clone(),
+            task: self.task.clone(),
             phase: self.phase,
             changed_files: self.changed_files(),
             iterations: self.iterations,
@@ -477,6 +678,8 @@ impl CodingWorkflow {
                 .as_ref()
                 .map(|completion| completion.remaining_risks.clone())
                 .unwrap_or_default(),
+            requirements,
+            review: self.review.clone(),
             stop_reason: self.stop_reason.clone(),
             memory: self.memory.clone(),
         }
@@ -497,6 +700,93 @@ impl CodingWorkflow {
         if self.memory.executed_commands.len() > MAX_EVIDENCE_RECORDS {
             self.memory.executed_commands.remove(0);
         }
+    }
+
+    fn requirement_evidence(&self) -> Vec<RequirementEvidence> {
+        let Some(plan) = &self.plan else {
+            return Vec::new();
+        };
+        let changed_files = self.changed_files().into_iter().collect::<BTreeSet<_>>();
+        let current_validations = self
+            .validations
+            .iter()
+            .filter(|validation| validation.revision == self.revision)
+            .collect::<Vec<_>>();
+        plan.requirements
+            .iter()
+            .map(|requirement| {
+                let files_verified = requirement
+                    .verification
+                    .expected_files
+                    .iter()
+                    .all(|path| changed_files.contains(path));
+                let matching_checks = current_validations
+                    .iter()
+                    .filter(|validation| {
+                        validation
+                            .planned_check_ids
+                            .iter()
+                            .any(|id| requirement.verification.check_ids.contains(id))
+                    })
+                    .collect::<Vec<_>>();
+                let checks_verified = requirement.verification.check_ids.iter().all(|check_id| {
+                    matching_checks.iter().any(|validation| {
+                        validation.outcome.is_success()
+                            && validation.planned_check_ids.iter().any(|id| id == check_id)
+                    })
+                });
+                let status = if files_verified && checks_verified {
+                    RequirementStatus::Verified
+                } else if matching_checks
+                    .iter()
+                    .any(|validation| validation.outcome == ValidationOutcome::Failed)
+                {
+                    RequirementStatus::Failed
+                } else if matching_checks.iter().any(|validation| {
+                    matches!(
+                        validation.outcome,
+                        ValidationOutcome::Blocked
+                            | ValidationOutcome::NotExecutable
+                            | ValidationOutcome::NotPresent
+                            | ValidationOutcome::TimedOut
+                            | ValidationOutcome::IncompleteOutput
+                    )
+                }) {
+                    RequirementStatus::Blocked
+                } else if files_verified || checks_verified {
+                    RequirementStatus::PartiallyVerified
+                } else {
+                    RequirementStatus::Pending
+                };
+                RequirementEvidence {
+                    id: requirement.id.clone(),
+                    description: requirement.description.clone(),
+                    mandatory: requirement.mandatory,
+                    status,
+                    expected_files: requirement.verification.expected_files.clone(),
+                    check_ids: requirement.verification.check_ids.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn matching_check_ids(&self, program: &str, args: &[String], cwd: &Path) -> Vec<String> {
+        self.plan
+            .as_ref()
+            .map(|plan| {
+                plan.checks()
+                    .into_iter()
+                    .filter(|check| check.command.matches(program, args, cwd))
+                    .map(|check| check.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn current_failed_validation(&self) -> Option<&ValidationEvidence> {
+        self.validations.iter().rev().find(|validation| {
+            validation.revision == self.revision && validation.outcome.requires_repair()
+        })
     }
 
     fn require_phase(&self, expected: &[WorkflowPhase]) -> Result<(), WorkflowError> {
@@ -539,6 +829,151 @@ impl WorkflowLimits {
     }
 }
 
+/// A distinct, externally serialized identity for one coding workflow.
+///
+/// The `workflow_` prefix prevents a rollback UUID or another identifier class
+/// from being accepted at the tool boundary as a workflow identifier.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WorkflowId(String);
+
+impl WorkflowId {
+    fn new() -> Self {
+        Self(format!("workflow_{}", Uuid::now_v7()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for WorkflowId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for WorkflowId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let Some(uuid) = value.strip_prefix("workflow_") else {
+            return Err(D::Error::custom(
+                "workflow_id must start with `workflow_`; rollback and other IDs are not valid workflow IDs",
+            ));
+        };
+        Uuid::parse_str(uuid).map_err(|_| {
+            D::Error::custom("workflow_id must contain a valid UUID after `workflow_`")
+        })?;
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskInteractionMode {
+    ReadOnly,
+    Ask,
+    Autonomous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIntent {
+    Create,
+    Modify,
+    Repair,
+    Inspect,
+    Verify,
+}
+
+impl TaskIntent {
+    pub fn detect(request: &str) -> Self {
+        let request = request.to_ascii_lowercase();
+        if ["repair", "fix", "beheb", "reparier", "bug"]
+            .iter()
+            .any(|term| request.contains(term))
+        {
+            Self::Repair
+        } else if ["create", "erstelle", "neu", "new project", "anlegen"]
+            .iter()
+            .any(|term| request.contains(term))
+        {
+            Self::Create
+        } else if [
+            "analyse",
+            "analys",
+            "analyze",
+            "untersuche",
+            "inspect",
+            "read-only",
+            "read only",
+        ]
+        .iter()
+        .any(|term| request.contains(term))
+        {
+            Self::Inspect
+        } else if [
+            "verify",
+            "verif",
+            "prüfe",
+            "pruefe",
+            "testen ohne",
+            "test only",
+        ]
+        .iter()
+        .any(|term| request.contains(term))
+        {
+            Self::Verify
+        } else {
+            Self::Modify
+        }
+    }
+}
+
+/// Durable, compact task information supplied by the host before a model can
+/// simplify the request into a plan. The surrounding workflow owns plans,
+/// evidence, errors, and state transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTaskState {
+    pub original_user_request: String,
+    pub normalized_objective: String,
+    pub intent: TaskIntent,
+    pub interaction_mode: TaskInteractionMode,
+    pub workspace: PathBuf,
+}
+
+impl WorkflowTaskState {
+    pub fn new(
+        original_user_request: String,
+        interaction_mode: TaskInteractionMode,
+        workspace: PathBuf,
+    ) -> Result<Self, WorkflowError> {
+        validate_text("original user request", &original_user_request, false)?;
+        Ok(Self {
+            normalized_objective: original_user_request.clone(),
+            intent: TaskIntent::detect(&original_user_request),
+            original_user_request,
+            interaction_mode,
+            workspace,
+        })
+    }
+
+    pub fn with_objective(mut self, objective: String) -> Result<Self, WorkflowError> {
+        validate_text("objective", &objective, false)?;
+        self.normalized_objective = objective;
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPlan {
@@ -546,8 +981,9 @@ pub struct WorkflowPlan {
     pub relevant_files: Vec<PathBuf>,
     pub risks: Vec<String>,
     pub intended_changes: Vec<String>,
-    pub tests: Vec<String>,
-    pub validation: Vec<String>,
+    pub requirements: Vec<WorkflowRequirement>,
+    pub tests: Vec<WorkflowCheck>,
+    pub validation: Vec<WorkflowCheck>,
     pub rollback_strategy: String,
 }
 
@@ -557,10 +993,104 @@ impl WorkflowPlan {
         validate_paths(&self.relevant_files)?;
         validate_items("risks", &self.risks, true)?;
         validate_items("intended changes", &self.intended_changes, false)?;
-        validate_items("tests", &self.tests, true)?;
-        validate_items("validation", &self.validation, true)?;
+        let relevant_files = self.relevant_files.iter().cloned().collect::<BTreeSet<_>>();
+        validate_requirements(&self.requirements, &relevant_files)?;
+        let checks = self.checks();
+        validate_checks(&checks)?;
+        let check_ids = checks
+            .iter()
+            .map(|check| check.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for requirement in &self.requirements {
+            if requirement
+                .verification
+                .check_ids
+                .iter()
+                .any(|id| !check_ids.contains(id.as_str()))
+            {
+                return Err(WorkflowError::UnknownRequirementCheck(
+                    requirement.id.clone(),
+                ));
+            }
+        }
         validate_text("rollback strategy", &self.rollback_strategy, false)
     }
+
+    fn checks(&self) -> Vec<&WorkflowCheck> {
+        self.tests.iter().chain(&self.validation).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRequirement {
+    pub id: String,
+    pub description: String,
+    pub source: RequirementSource,
+    pub priority: RequirementPriority,
+    pub mandatory: bool,
+    pub verification: RequirementVerification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementSource {
+    User,
+    Inferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementPriority {
+    Critical,
+    High,
+    Normal,
+    Low,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementVerification {
+    #[serde(default)]
+    pub expected_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub check_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCheck {
+    pub id: String,
+    pub description: String,
+    pub command: WorkflowCommand,
+    #[serde(default = "default_required")]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCommand {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_cwd")]
+    pub cwd: PathBuf,
+}
+
+impl WorkflowCommand {
+    fn matches(&self, program: &str, args: &[String], cwd: &Path) -> bool {
+        self.program == program
+            && self.args == args
+            && (self.cwd == cwd || (self.cwd == Path::new(".") && cwd.as_os_str().is_empty()))
+    }
+}
+
+fn default_required() -> bool {
+    true
+}
+
+fn default_cwd() -> PathBuf {
+    PathBuf::from(".")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,8 +1110,9 @@ pub enum WorkflowPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStatus {
-    pub id: String,
+    pub id: WorkflowId,
     pub objective: String,
+    pub task: WorkflowTaskState,
     pub phase: WorkflowPhase,
     pub plan: Option<WorkflowPlan>,
     pub iterations: u32,
@@ -599,8 +1130,9 @@ pub struct WorkflowStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowReport {
-    pub id: String,
+    pub id: WorkflowId,
     pub objective: String,
+    pub task: WorkflowTaskState,
     pub phase: WorkflowPhase,
     pub changed_files: Vec<PathBuf>,
     pub iterations: u32,
@@ -609,9 +1141,41 @@ pub struct WorkflowReport {
     pub verified: bool,
     pub summary: Option<String>,
     pub remaining_risks: Vec<String>,
+    pub requirements: Vec<RequirementEvidence>,
+    pub review: Option<ReviewEvidence>,
     pub stop_reason: Option<WorkflowStopReason>,
     #[serde(default)]
     pub memory: WorkflowMemory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequirementEvidence {
+    pub id: String,
+    pub description: String,
+    pub mandatory: bool,
+    pub status: RequirementStatus,
+    pub expected_files: Vec<PathBuf>,
+    pub check_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementStatus {
+    Pending,
+    PartiallyVerified,
+    Verified,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewEvidence {
+    pub revision: u32,
+    pub analyzed_patch_fingerprint: String,
+    pub reviewed_files: Vec<PathBuf>,
+    pub finding_count: usize,
+    pub blocking_findings: usize,
+    pub complete: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,7 +1185,35 @@ pub struct WorkflowMemory {
     pub relevant_symbols: Vec<RelevantSymbolEvidence>,
     pub executed_commands: Vec<CommandEvidence>,
     pub known_errors: Vec<KnownErrorEvidence>,
+    pub tool_contract_errors: Vec<ToolContractErrorEvidence>,
+    pub repair_strategies: Vec<RepairStrategyEvidence>,
     pub open_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolContractErrorEvidence {
+    pub revision: u32,
+    pub tool_name: String,
+    pub diagnostic_fingerprint: String,
+    pub repetitions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairStrategyEvidence {
+    pub revision: u32,
+    pub diagnostic_fingerprint: String,
+    pub approach: RepairApproach,
+    pub hypothesis_fingerprint: String,
+    pub target_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairApproach {
+    LocalLogic,
+    DependencyBoundary,
+    Configuration,
+    TestFixture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -727,10 +1319,18 @@ pub struct ValidationEvidence {
     pub output_truncated: bool,
     pub error_count: usize,
     pub diagnostic_fingerprint: String,
+    #[serde(default)]
+    pub planned_check_ids: Vec<String>,
 }
 
 impl ValidationEvidence {
-    fn from_process(revision: u32, program: &str, args: &[String], output: &ProcessOutput) -> Self {
+    fn from_process(
+        revision: u32,
+        program: &str,
+        args: &[String],
+        output: &ProcessOutput,
+        planned_check_ids: Vec<String>,
+    ) -> Self {
         let outcome = if output.timed_out {
             ValidationOutcome::TimedOut
         } else if output.background_process_detected || output.output_collection_error.is_some() {
@@ -767,13 +1367,23 @@ impl ValidationEvidence {
             output_truncated: output.output_truncated,
             error_count,
             diagnostic_fingerprint,
+            planned_check_ids,
         }
     }
 
-    fn from_execution(revision: u32, execution: &ValidationExecution) -> Self {
+    fn from_execution(
+        revision: u32,
+        execution: &ValidationExecution,
+        planned_check_ids: Vec<String>,
+    ) -> Self {
         if let (Some(command), Some(output)) = (&execution.command, &execution.output) {
-            let mut evidence =
-                Self::from_process(revision, &command.program, &command.args, output);
+            let mut evidence = Self::from_process(
+                revision,
+                &command.program,
+                &command.args,
+                output,
+                planned_check_ids,
+            );
             evidence.outcome = ValidationOutcome::from(execution.status);
             return evidence;
         }
@@ -808,6 +1418,7 @@ impl ValidationEvidence {
             output_truncated: false,
             error_count: 0,
             diagnostic_fingerprint: content_digest(diagnostics.as_bytes()),
+            planned_check_ids,
         }
     }
 }
@@ -853,12 +1464,31 @@ impl From<ValidationStatus> for ValidationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowStopReason {
-    IterationLimit { limit: u32 },
-    RepairLimit { limit: u32 },
-    RepeatedDiff { repetitions: usize },
-    RepeatedFailure { repetitions: usize },
-    RepeatedToolCall { repetitions: usize },
-    NoDiagnosticProgress { attempts: usize },
+    ActionLimit {
+        limit: u32,
+    },
+    IterationLimit {
+        limit: u32,
+    },
+    RepairLimit {
+        limit: u32,
+    },
+    RepeatedDiff {
+        repetitions: usize,
+    },
+    RepeatedFailure {
+        repetitions: usize,
+    },
+    RepeatedToolCall {
+        repetitions: usize,
+    },
+    RepeatedToolContract {
+        tool_name: String,
+        repetitions: usize,
+    },
+    NoDiagnosticProgress {
+        attempts: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -871,6 +1501,7 @@ struct InvocationEvidence {
 struct CompletionDetails {
     summary: String,
     remaining_risks: Vec<String>,
+    requirements: Vec<RequirementEvidence>,
 }
 
 fn invocation_fingerprint(program: &str, args: &[String], cwd: &Path, revision: u32) -> String {
@@ -969,6 +1600,77 @@ fn validate_paths(paths: &[PathBuf]) -> Result<(), WorkflowError> {
     Ok(())
 }
 
+fn validate_requirements(
+    requirements: &[WorkflowRequirement],
+    relevant_files: &BTreeSet<PathBuf>,
+) -> Result<(), WorkflowError> {
+    if requirements.is_empty() || requirements.len() > MAX_PLAN_ITEMS {
+        return Err(WorkflowError::InvalidPlanField("requirements"));
+    }
+    let mut ids = BTreeSet::new();
+    for requirement in requirements {
+        validate_text("requirement id", &requirement.id, false)?;
+        validate_text("requirement description", &requirement.description, false)?;
+        if !ids.insert(requirement.id.as_str()) {
+            return Err(WorkflowError::DuplicateRequirementId(
+                requirement.id.clone(),
+            ));
+        }
+        if requirement.verification.expected_files.is_empty()
+            && requirement.verification.check_ids.is_empty()
+        {
+            return Err(WorkflowError::MissingRequirementVerification(
+                requirement.id.clone(),
+            ));
+        }
+        validate_paths_allow_empty(&requirement.verification.expected_files)?;
+        if requirement
+            .verification
+            .expected_files
+            .iter()
+            .any(|path| !relevant_files.contains(path))
+        {
+            return Err(WorkflowError::RequirementFileOutsidePlan(
+                requirement.id.clone(),
+            ));
+        }
+        validate_items(
+            "requirement check ids",
+            &requirement.verification.check_ids,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_checks(checks: &[&WorkflowCheck]) -> Result<(), WorkflowError> {
+    if checks.len() > MAX_PLAN_ITEMS {
+        return Err(WorkflowError::InvalidPlanField("workflow checks"));
+    }
+    let mut ids = BTreeSet::new();
+    for check in checks {
+        validate_text("workflow check id", &check.id, false)?;
+        validate_text("workflow check description", &check.description, false)?;
+        validate_text("workflow check program", &check.command.program, false)?;
+        validate_paths_allow_empty(std::slice::from_ref(&check.command.cwd))?;
+        validate_items("workflow check arguments", &check.command.args, true)?;
+        if !ids.insert(check.id.as_str()) {
+            return Err(WorkflowError::DuplicateCheckId(check.id.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_paths_allow_empty(paths: &[PathBuf]) -> Result<(), WorkflowError> {
+    if paths.len() > MAX_PLAN_ITEMS {
+        return Err(WorkflowError::InvalidPlanField("relevant files"));
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    validate_paths(paths)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
     #[error("workflow objective or plan field `{0}` is empty or exceeds its bound")]
@@ -979,6 +1681,10 @@ pub enum WorkflowError {
     InvalidIterationLimit(u32),
     #[error("workflow repair limit must be at most 100, got {0}")]
     InvalidRepairLimit(u32),
+    #[error("workflow task objective must match the workflow objective")]
+    TaskObjectiveMismatch,
+    #[error("a {0:?} task does not permit workspace mutations")]
+    MutationForbiddenForIntent(TaskIntent),
     #[error("invalid workflow transition from {from:?}; expected one of {expected:?}")]
     InvalidTransition {
         from: WorkflowPhase,
@@ -992,10 +1698,32 @@ pub enum WorkflowError {
     ValidationRequired,
     #[error("the current revision still has failed validation")]
     ValidationFailed,
+    #[error("an actual complete review is required before workflow completion")]
+    ReviewRequired,
+    #[error("the current review contains blocking findings")]
+    ReviewFailed,
+    #[error("mandatory workflow requirements remain open: {0:?}")]
+    MandatoryRequirementsOpen(Vec<String>),
+    #[error("workflow requirement IDs must be unique: {0}")]
+    DuplicateRequirementId(String),
+    #[error("workflow check IDs must be unique: {0}")]
+    DuplicateCheckId(String),
+    #[error("workflow requirement `{0}` needs a verification method")]
+    MissingRequirementVerification(String),
+    #[error("workflow requirement `{0}` references a file outside the plan")]
+    RequirementFileOutsidePlan(String),
+    #[error("workflow requirement `{0}` references an unknown check")]
+    UnknownRequirementCheck(String),
     #[error("workflow iteration limit reached: {0}")]
     IterationLimit(u32),
     #[error("workflow repair attempt limit reached: {0}")]
     RepairLimit(u32),
+    #[error("a recorded validation failure is required before selecting a repair strategy")]
+    RepairStrategyWithoutFailure,
+    #[error("a distinct repair strategy is required after a repeated validation failure")]
+    RepairStrategyRequired,
+    #[error("repair strategy `{0:?}` was already used for the current diagnostic")]
+    RepeatedRepairStrategy(RepairApproach),
     #[error("unknown or already rolled back workflow change: {0}")]
     UnknownChange(String),
     #[error("could not encode workflow evidence: {0}")]
@@ -1009,6 +1737,7 @@ mod tests {
     use super::*;
     use crate::coding::intelligence::SymbolKind;
     use crate::coding::patch::{FileMutationPreview, MutationOperation};
+    use crate::coding::review::{ReviewCategory, ReviewFinding};
 
     fn limits() -> WorkflowLimits {
         WorkflowLimits {
@@ -1023,8 +1752,28 @@ mod tests {
             relevant_files: vec![PathBuf::from("src/lib.rs")],
             risks: vec!["behavior regression".to_string()],
             intended_changes: vec!["update implementation".to_string()],
-            tests: vec!["unit tests".to_string()],
-            validation: vec!["cargo test".to_string()],
+            requirements: vec![WorkflowRequirement {
+                id: "implementation".to_string(),
+                description: "update the implementation and validate it".to_string(),
+                source: RequirementSource::User,
+                priority: RequirementPriority::High,
+                mandatory: true,
+                verification: RequirementVerification {
+                    expected_files: vec![PathBuf::from("src/lib.rs")],
+                    check_ids: vec!["cargo-test".to_string()],
+                },
+            }],
+            tests: vec![WorkflowCheck {
+                id: "cargo-test".to_string(),
+                description: "run the unit tests".to_string(),
+                command: WorkflowCommand {
+                    program: "cargo".to_string(),
+                    args: vec!["test".to_string()],
+                    cwd: PathBuf::from("."),
+                },
+                required: true,
+            }],
+            validation: Vec::new(),
             rollback_strategy: "roll back the retained patch".to_string(),
         }
     }
@@ -1060,6 +1809,20 @@ mod tests {
         }
     }
 
+    fn review() -> ReviewReport {
+        ReviewReport {
+            staged: false,
+            files: vec![PathBuf::from("src/lib.rs")],
+            skipped_sensitive: Vec::new(),
+            findings: Vec::new(),
+            counts: BTreeMap::new(),
+            analyzed_patch_fingerprint: "blake3:review".to_string(),
+            diff_truncated: false,
+            lossy_output: false,
+            truncated: false,
+        }
+    }
+
     fn planned_workflow() -> CodingWorkflow {
         let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
         workflow.note_repository_activity();
@@ -1080,6 +1843,7 @@ mod tests {
             .record_process("cargo", &["test".to_string()], &output(true, "ok"))
             .unwrap();
         workflow.begin_review().unwrap();
+        workflow.record_review(&review()).unwrap();
         let report = workflow
             .complete("implemented safely".to_string(), Vec::new())
             .unwrap();
@@ -1088,7 +1852,129 @@ mod tests {
         assert!(report.verified);
         assert_eq!(report.changed_files, vec![PathBuf::from("src/lib.rs")]);
         assert_eq!(report.validations[0].outcome, ValidationOutcome::Passed);
+        assert_eq!(report.requirements[0].status, RequirementStatus::Verified);
+        assert!(report.review.is_some());
         assert!(!report.validations[0].diagnostic_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn requires_every_mandatory_planned_check_before_review() {
+        let mut plan = plan();
+        plan.validation.push(WorkflowCheck {
+            id: "rustc-version".to_string(),
+            description: "confirm the compiler runtime".to_string(),
+            command: WorkflowCommand {
+                program: "rustc".to_string(),
+                args: vec!["--version".to_string()],
+                cwd: PathBuf::from("."),
+            },
+            required: true,
+        });
+        plan.requirements[0]
+            .verification
+            .check_ids
+            .push("rustc-version".to_string());
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+        workflow.set_plan(plan).unwrap();
+        workflow.begin_editing().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-1".to_string(), &preview("+new"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+
+        assert!(matches!(
+            workflow.begin_review(),
+            Err(WorkflowError::ValidationRequired)
+        ));
+    }
+
+    #[test]
+    fn completion_requires_review_and_verified_mandatory_requirements() {
+        let mut plan = plan();
+        plan.relevant_files.push(PathBuf::from("src/missing.rs"));
+        plan.requirements[0]
+            .verification
+            .expected_files
+            .push(PathBuf::from("src/missing.rs"));
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+        workflow.set_plan(plan).unwrap();
+        workflow.begin_editing().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-1".to_string(), &preview("+new"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+        workflow.begin_review().unwrap();
+
+        assert!(matches!(
+            workflow.complete("incomplete".to_string(), Vec::new()),
+            Err(WorkflowError::ReviewRequired)
+        ));
+
+        workflow.record_review(&review()).unwrap();
+        assert!(matches!(
+            workflow.complete("incomplete".to_string(), Vec::new()),
+            Err(WorkflowError::MandatoryRequirementsOpen(requirements))
+                if requirements == ["implementation"]
+        ));
+    }
+
+    #[test]
+    fn blocking_review_finding_returns_to_diagnosis() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-1".to_string(), &preview("+new"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+        workflow.begin_review().unwrap();
+        let mut review = review();
+        review.findings.push(ReviewFinding {
+            severity: ReviewSeverity::Critical,
+            category: ReviewCategory::Security,
+            message: "credential detected".to_string(),
+            path: PathBuf::from("src/lib.rs"),
+            line: 1,
+        });
+
+        workflow.record_review(&review).unwrap();
+
+        assert_eq!(workflow.phase(), WorkflowPhase::Debugging);
+        assert!(!workflow.can_complete());
+    }
+
+    #[test]
+    fn review_must_cover_each_retained_changed_file() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-1".to_string(), &preview("+new"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+        workflow.begin_review().unwrap();
+        let mut review = review();
+        review.files.clear();
+
+        workflow.record_review(&review).unwrap();
+
+        assert!(!workflow.can_complete());
+        assert!(matches!(
+            workflow.complete("incomplete review".to_string(), Vec::new()),
+            Err(WorkflowError::ReviewRequired)
+        ));
     }
 
     #[test]
@@ -1119,6 +2005,29 @@ mod tests {
                     &output(false, "error 123: same failure"),
                 )
                 .unwrap();
+            if revision == 1 {
+                assert!(matches!(
+                    workflow.begin_repair(),
+                    Err(WorkflowError::RepairStrategyRequired)
+                ));
+                workflow
+                    .set_repair_strategy(
+                        RepairApproach::DependencyBoundary,
+                        "inspect the failing dependency boundary".to_string(),
+                        vec![PathBuf::from("src/lib.rs")],
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    workflow.set_repair_strategy(
+                        RepairApproach::DependencyBoundary,
+                        "repeat the same approach".to_string(),
+                        vec![PathBuf::from("src/lib.rs")],
+                    ),
+                    Err(WorkflowError::RepeatedRepairStrategy(
+                        RepairApproach::DependencyBoundary
+                    ))
+                ));
+            }
             if revision < 2 {
                 workflow.begin_repair().unwrap();
             }
@@ -1129,6 +2038,10 @@ mod tests {
             workflow.status().stop_reason,
             Some(WorkflowStopReason::RepeatedFailure { repetitions: 3 })
         ));
+        assert_eq!(
+            workflow.status().memory.repair_strategies[0].approach,
+            RepairApproach::DependencyBoundary
+        );
     }
 
     #[test]
@@ -1152,6 +2065,32 @@ mod tests {
             .unwrap();
 
         assert!(!workflow.status().repair_pending);
+    }
+
+    #[test]
+    fn successful_validation_resets_repeated_failure_detection() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(false, "error"))
+            .unwrap();
+        assert_eq!(workflow.failure_counts.len(), 1);
+
+        workflow.begin_repair().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("repair".to_string(), &preview("repair"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+
+        assert!(workflow.failure_counts.is_empty());
     }
 
     #[test]
@@ -1261,5 +2200,92 @@ mod tests {
         assert!(!serialized.contains("secret-filter"));
         assert!(!serialized.contains("must-not-be-retained"));
         assert!(!serialized.contains("fn target"));
+    }
+
+    #[test]
+    fn task_state_preserves_original_request_and_blocks_inspection_mutations() {
+        let task = WorkflowTaskState::new(
+            "Nur analysiere den vorhandenen Fehler.".to_string(),
+            TaskInteractionMode::ReadOnly,
+            PathBuf::from("/tmp/workspace"),
+        )
+        .unwrap()
+        .with_objective("analyze the existing failure".to_string())
+        .unwrap();
+        let mut workflow = CodingWorkflow::new_with_task(
+            "analyze the existing failure".to_string(),
+            task,
+            limits(),
+        )
+        .unwrap();
+
+        workflow.set_plan(plan()).unwrap();
+        workflow.begin_editing().unwrap();
+
+        assert!(matches!(
+            workflow.authorize_change(),
+            Err(WorkflowError::MutationForbiddenForIntent(
+                TaskIntent::Inspect
+            ))
+        ));
+        let status = workflow.status();
+        assert_eq!(
+            status.task.original_user_request,
+            "Nur analysiere den vorhandenen Fehler."
+        );
+        assert_eq!(status.task.interaction_mode, TaskInteractionMode::ReadOnly);
+        assert_eq!(status.task.intent, TaskIntent::Inspect);
+    }
+
+    #[test]
+    fn creation_intent_wins_over_inspection_and_validation_steps() {
+        assert_eq!(
+            TaskIntent::detect(
+                "Create index.html, styles.css, and script.js. Work through inspection and validation."
+            ),
+            TaskIntent::Create
+        );
+    }
+
+    #[test]
+    fn blocks_repeated_tool_contract_failures_with_retained_evidence() {
+        let mut workflow = CodingWorkflow::new("repair the fixture".to_string(), limits()).unwrap();
+
+        assert_eq!(
+            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            1
+        );
+        assert_eq!(
+            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            2
+        );
+        assert_eq!(
+            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            3
+        );
+
+        let status = workflow.status();
+        assert_eq!(status.phase, WorkflowPhase::Blocked);
+        assert_eq!(status.memory.tool_contract_errors.len(), 3);
+        assert!(matches!(
+            status.stop_reason,
+            Some(WorkflowStopReason::RepeatedToolContract {
+                tool_name,
+                repetitions: 3
+            }) if tool_name == "coding__apply_changes"
+        ));
+    }
+
+    #[test]
+    fn workflow_identifiers_reject_rollback_identifier_shape() {
+        let workflow = CodingWorkflow::new("change a file".to_string(), limits()).unwrap();
+        assert!(workflow.id().as_str().starts_with("workflow_"));
+        assert!(
+            serde_json::from_str::<WorkflowId>("\"00000000-0000-7000-8000-000000000000\"").is_err()
+        );
+        assert!(serde_json::from_str::<WorkflowId>(
+            "\"rollback_00000000-0000-7000-8000-000000000000\""
+        )
+        .is_err());
     }
 }

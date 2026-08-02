@@ -499,6 +499,13 @@ impl Agent {
                     let mut coerced_req = req.clone();
 
                     if let Ok(ref mut tool_call) = coerced_req.tool_call {
+                        if let Some(canonical_name) =
+                            crate::coding::tools::canonical_native_tool_name(&tool_call.name)
+                        {
+                            if tools.iter().any(|tool| tool.name == canonical_name) {
+                                tool_call.name = canonical_name.to_string().into();
+                            }
+                        }
                         if let Some(tool) = tools.iter().find(|t| t.name == tool_call.name) {
                             let schema_value = Value::Object(tool.input_schema.as_ref().clone());
                             tool_call.arguments =
@@ -1036,8 +1043,9 @@ mod tests {
         let active_names: Vec<_> = active_tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert!(!active_names.contains(&crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
         assert!(!active_names.contains(&crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME));
-        assert!(active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
-        assert!(active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(!active_names.contains(&crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(!active_names.contains(&crate::coding::tools::RUN_PROCESS_TOOL_NAME));
+        assert!(active_names.contains(&crate::coding::tools::WORKFLOW_START_TOOL_NAME));
         assert!(!active_names.contains(&"frontend__a_tool"));
         assert!(!active_names.contains(&"frontend__z_tool"));
         assert!(active_names
@@ -1328,6 +1336,36 @@ mod tests {
             })
             .collect();
         assert_eq!(filtered_ids, vec!["dup", "unique"]);
+    }
+
+    #[tokio::test]
+    async fn categorize_tool_requests_canonicalizes_an_exposed_native_coding_suffix() {
+        let agent = crate::agents::Agent::new();
+        let tool = Tool::new(
+            crate::coding::tools::WORKFLOW_SET_PLAN_TOOL_NAME,
+            "set plan",
+            object!({ "type": "object" }),
+        );
+        let response = Message::assistant().with_tool_request(
+            "tool-1",
+            Ok(rmcp::model::CallToolRequestParams::new("workflow_set_plan")),
+        );
+
+        let (_frontend_requests, other_requests, filtered_message) = agent
+            .categorize_tool_requests(&response, &[tool], false)
+            .await;
+
+        assert_eq!(
+            other_requests[0].tool_call.as_ref().unwrap().name,
+            crate::coding::tools::WORKFLOW_SET_PLAN_TOOL_NAME
+        );
+        let MessageContent::ToolRequest(request) = &filtered_message.content[0] else {
+            panic!("expected canonicalized tool request");
+        };
+        assert_eq!(
+            request.tool_call.as_ref().unwrap().name,
+            crate::coding::tools::WORKFLOW_SET_PLAN_TOOL_NAME
+        );
     }
 
     fn make_tool_with_meta(meta_json: Option<serde_json::Value>) -> Tool {

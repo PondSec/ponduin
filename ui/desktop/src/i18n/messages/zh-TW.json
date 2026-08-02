@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Dock 圖示"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "適用於新開啟的任務。"
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "整部電腦"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "代理程式可存取您的使用者帳號獲准存取的任何位置中的檔案。"
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "選擇新的代理程式任務可在哪些位置讀取及寫入檔案。"
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "開啟 macOS「完整磁碟存取權」設定"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "檔案存取"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "整個使用者資料夾"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "代理程式可存取您使用者資料夾中的檔案。"
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "僅工作區"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "代理程式只能存取任務工作區中的檔案。"
+  },
   "settings.help.description": {
     "defaultMessage": "回報問題或申請新功能，協助我們改善 ponduin"
   },

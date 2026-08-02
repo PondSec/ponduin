@@ -5,6 +5,8 @@ export interface ExternalBackendConfig {
   certFingerprint?: string;
 }
 
+export type FileAccessScope = 'workspace' | 'user' | 'computer';
+
 export interface KeyboardShortcuts {
   focusWindow: string | null;
   quickLauncher: string | null;
@@ -36,6 +38,7 @@ export interface Settings {
   enableWakelock: boolean;
   enableNotifications: boolean;
   spellcheckEnabled: boolean;
+  fileAccessScope: FileAccessScope;
   // Key is kept as `externalPonduind` for backward compat with persisted user settings.
   externalPonduind: ExternalBackendConfig;
   globalShortcut?: string | null;
@@ -74,6 +77,7 @@ export const defaultSettings: Settings = {
   enableWakelock: false,
   enableNotifications: true,
   spellcheckEnabled: true,
+  fileAccessScope: 'workspace',
   keyboardShortcuts: defaultKeyboardShortcuts,
   externalPonduind: {
     enabled: false,

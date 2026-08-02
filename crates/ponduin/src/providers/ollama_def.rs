@@ -197,9 +197,14 @@ mod tests {
             ("PONDUIN_STREAM_TIMEOUT", None::<&str>),
             ("OLLAMA_TIMEOUT", None::<&str>),
         ]);
-        let config = crate::config::Config::global();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::new_with_file_secrets(
+            temp_dir.path().join("config.yaml"),
+            temp_dir.path().join("secrets.yaml"),
+        )
+        .unwrap();
         assert_eq!(
-            resolve_ollama_chunk_timeout(config),
+            resolve_ollama_chunk_timeout(&config),
             OLLAMA_DEFAULT_CHUNK_TIMEOUT_SECS
         );
     }

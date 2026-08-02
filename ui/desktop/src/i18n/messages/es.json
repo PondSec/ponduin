@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Icono del dock"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Se aplica a las tareas que se abran a partir de ahora."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Todo el equipo"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "El agente puede acceder a los archivos a los que tenga acceso tu cuenta de usuario."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Elige dónde las nuevas tareas del agente pueden leer y escribir archivos."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Abrir ajustes de acceso total al disco de macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Acceso a archivos"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Carpeta de usuario completa"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "El agente puede acceder a los archivos de tu carpeta de usuario."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Solo espacio de trabajo"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "El agente solo puede acceder a los archivos del espacio de trabajo de la tarea."
+  },
   "settings.help.description": {
     "defaultMessage": "Ayúdanos a mejorar ponduin reportando problemas o solicitando nuevas funciones"
   },

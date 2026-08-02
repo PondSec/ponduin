@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-01",
+  "scope": "Reliability and autonomy vertical slice",
+  "baseline": {
+    "source": "evals/coding-agent/baseline.json",
+    "command": "source bin/activate-hermit && cargo test -p ponduin --lib coding::",
+    "result": {
+      "passed": 151,
+      "failed": 0,
+      "ignored": 5
+    },
+    "known_gaps": [
+      "A malformed coding-tool invocation could be recorded as repository activity before parsing succeeded.",
+      "The original request was not retained as durable workflow task state for model recovery.",
+      "Workflow IDs did not have a distinct runtime type at the tool boundary.",
+      "An active coding workflow could reach a generic turn-limit prompt without a retained workflow stop reason."
+    ]
+  },
+  "after": {
+    "command": "source bin/activate-hermit && cargo test -p ponduin --lib coding::",
+    "result": {
+      "passed": 171,
+      "failed": 0,
+      "ignored": 5
+    },
+    "deterministic_regressions": [
+      {
+        "scenario": "host task state survives recovery",
+        "test": "coding::agent::tests::recovery_uses_the_host_retained_task_instead_of_requesting_resubmission",
+        "result": "passed",
+        "assertions": [
+          "The exact user request remains available to the recovery instruction.",
+          "Recovery does not ask the user to resend the task.",
+          "An active workflow suppresses premature final prose."
+        ]
+      },
+      {
+        "scenario": "malformed asynchronous process request",
+        "test": "coding::tools::tests::malformed_async_tool_calls_do_not_execute_or_mutate_workflow_state",
+        "result": "passed",
+        "assertions": [
+          "No process dispatch occurs for invalid parameters.",
+          "The malformed request does not create repository-activity evidence."
+        ]
+      },
+      {
+        "scenario": "wrong or unavailable coding tool",
+        "test": "coding::agent::tests::rejects_a_tool_that_is_not_exposed_for_the_current_workflow_step",
+        "result": "passed",
+        "assertions": [
+          "A tool outside the current workflow contract is rejected before execution.",
+          "No workspace file is created."
+        ]
+      },
+      {
+        "scenario": "rollback ID used where a workflow ID is required",
+        "test": "coding::tools::tests::workflow_start_uses_host_task_context_and_rejects_rollback_ids",
+        "result": "passed",
+        "assertions": [
+          "Only the workflow_<uuid> identifier form deserializes as WorkflowId.",
+          "Rollback-shaped identifiers cannot mutate workflow state."
+        ]
+      },
+      {
+        "scenario": "repeated equivalent tool-contract failure",
+        "test": "coding::workflow::tests::blocks_repeated_tool_contract_failures_with_retained_evidence",
+        "result": "passed",
+        "assertions": [
+          "Three equivalent contract failures produce retained diagnostic evidence.",
+          "The workflow enters Blocked with RepeatedToolContract rather than claiming success."
+        ]
+      },
+      {
+        "scenario": "terminal-report accuracy",
+        "test": "coding::agent::tests::reports_the_recorded_contract_stop_reason_instead_of_an_action_limit",
+        "result": "passed",
+        "assertions": [
+          "A recorded RepeatedToolContract stop reason takes precedence over an unrelated action-limit message."
+        ]
+      },
+      {
+        "scenario": "empty or premature model completion during an active workflow",
+        "test": "tests::coding_recovery_contract_tests::active_coding_workflow_preserves_task_and_blocks_premature_completion",
+        "result": "passed",
+        "assertions": [
+          "The premature provider prose stays hidden from the user.",
+          "The original user request remains persisted.",
+          "The final message does not request user resubmission."
+        ]
+      },
+      {
+        "scenario": "compact native Qwen workflow plan",
+        "test": "coding::tools::tests::compact_plan_contract_builds_a_complete_validated_workflow_plan",
+        "result": "passed",
+        "assertions": [
+          "The flat Qwen contract creates the same validated requirements, validation command, and rollback strategy as the full contract.",
+          "No JSON string is accepted as a structured standard plan."
+        ]
+      },
+      {
+        "scenario": "native Qwen phase gates and read compatibility",
+        "test": "coding::agent::tests::qwen3_uses_a_compact_native_tool_contract; coding::tools::tests::reads_versioned_line_ranges_through_internal_tool",
+        "result": "passed",
+        "assertions": [
+          "After workflow start, native Qwen receives only plan and status tools until the plan gate passes.",
+          "The documented relative_path read alias resolves through the same bounded file reader."
+        ]
+      }
+    ]
+  },
+  "selected_real_qwen_runs": {
+    "provider": "ollama",
+    "models": ["qwen3.5:9b", "qwen3:8b"],
+    "workspace_policy": "isolated temporary Rust fixture; later runs use a committed red Git baseline and no repository source file",
+    "runs": [
+      {
+        "id": "repair-baseline",
+        "fixture": "normalize_label regression",
+        "max_turns": 20,
+        "result": "unverified",
+        "observed": [
+          "The model made malformed coding-tool calls.",
+          "No fixture change or successful validation was obtained.",
+          "The run ended with the former generic continuation prompt."
+        ]
+      },
+      {
+        "id": "repair-contract-recovery",
+        "fixture": "normalize_label regression",
+        "max_turns": 8,
+        "result": "controlled_internal_block_without_verified_fix",
+        "observed": [
+          "The model started a real workflow.",
+          "Three equivalent invalid workflow-ID calls were rejected.",
+          "The workflow retained RepeatedToolContract evidence and blocked without mutating the fixture.",
+          "This run exposed a reporting-priority defect that the terminal-report regression test now covers."
+        ]
+      },
+      {
+        "id": "repair-post-report-priority",
+        "fixture": "normalize_label regression",
+        "max_turns": 8,
+        "result": "bounded_no_progress_timeout",
+        "observed": [
+          "After approximately four minutes there was no tool progress, workspace change, or test execution.",
+          "The client was stopped with SIGTERM after process sampling confirmed an idle wait.",
+          "The original failing test remained failing; no success was claimed."
+        ]
+      },
+      {
+        "id": "compact-gated-qwen-runs",
+        "fixture": "Git-initialized normalize_label regression",
+        "max_turns": 14,
+        "result": "controlled_no_verified_fix",
+        "observed": [
+          "qwen3.5:9b exercised workflow creation, malformed nested plans, unsupported fields, guessed paths, and unregistered tools; every invalid request was rejected before mutation.",
+          "The compact adapter and phase visibility were refined from those concrete transcripts and covered by deterministic tests.",
+          "qwen3:8b also created the real workflow but produced no subsequent tool call within the bounded live window.",
+          "The original red fixture remained unchanged and no live run was reported as a repair success."
+        ]
+      }
+    ],
+    "aggregate": {
+      "attempted": 12,
+      "verified_successes": 0,
+      "false_success_claims": 0,
+      "workspace_mutations_without_valid_contract": 0,
+      "conclusion": "The selected real runs prove fail-closed behavior and expose live-model latency, tool-transport, and progress limits. They do not yet prove autonomous repair success for either tested local Qwen model."
+    }
+  },
+  "release_ready": false,
+  "release_blockers": [
+    "No selected real Qwen repair run has reached verified success.",
+    "The requested desktop workflow-progress surface is intentionally not implemented yet.",
+    "The final desktop build, smoke test, and controlled /Applications replacement have not been performed."
+  ]
+}

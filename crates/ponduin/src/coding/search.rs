@@ -33,7 +33,10 @@ impl<'workspace> RepositorySearch<'workspace> {
             return Err(SearchError::EmptyQuery);
         }
 
-        let query = query.to_ascii_lowercase();
+        let query_terms = file_query_terms(query);
+        if query_terms.is_empty() {
+            return Err(SearchError::EmptyQuery);
+        }
         let mut state = WalkState::default();
         let mut matches = Vec::new();
         self.walk_files(scope.as_ref(), limits.max_files, &mut state, |path| {
@@ -41,11 +44,8 @@ impl<'workspace> RepositorySearch<'workspace> {
                 return WalkControl::Stop;
             }
             let relative = self.relative(path);
-            if relative
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains(&query)
-            {
+            let path = relative.to_string_lossy().to_ascii_lowercase();
+            if query_terms.iter().any(|query| path.contains(query)) {
                 matches.push(relative);
             }
             WalkControl::Continue
@@ -269,6 +269,14 @@ impl SearchLimits {
     }
 }
 
+fn file_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| character.is_ascii_whitespace() || character == ',')
+        .map(|term| term.replace('*', "").to_ascii_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextSearchRequest {
     pub pattern: String,
@@ -463,6 +471,12 @@ mod tests {
         let files = search
             .find_files("service", ".", SearchLimits::default())
             .unwrap();
+        let glob = search
+            .find_files("*.rs", ".", SearchLimits::default())
+            .unwrap();
+        let combined = search
+            .find_files("lib.rs service.py", ".", SearchLimits::default())
+            .unwrap();
         let text = search
             .search_text(
                 &TextSearchRequest {
@@ -477,6 +491,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(files.matches, vec![PathBuf::from("src/nested/service.py")]);
+        assert_eq!(glob.matches, vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(
+            combined.matches,
+            vec![
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/nested/service.py")
+            ]
+        );
         assert_eq!(text.matches.len(), 2);
         assert_eq!(text.matches[0].path, PathBuf::from("src/lib.rs"));
         assert_eq!(text.matches[0].line, 2);

@@ -363,7 +363,10 @@ The coding strategy uses the current agent loop:
 Repair attempts are limited by configuration. A progress fingerprint includes
 the normalized error, changed-file digests, diff digest, validation command,
 and tool-call signature. Repeated fingerprints, unchanged diffs, or a growing
-error count stop automatic repair and report the block.
+error count stop automatic repair and report the block. Before repairing a
+second occurrence of the same diagnostic, the agent must record a distinct
+repair approach and a fingerprint of its hypothesis; it cannot silently retry
+the same tactic. Hypothesis text is not retained in workflow memory.
 
 ## Configuration
 
@@ -375,7 +378,6 @@ PONDUIN_CODING_MAX_ITERATIONS
 PONDUIN_CODING_MAX_REPAIR_ATTEMPTS
 PONDUIN_CODING_MAX_CONTEXT_TOKENS
 PONDUIN_CODING_MAX_FILES_PER_BATCH
-PONDUIN_CODING_PLAN_FILE_THRESHOLD
 PONDUIN_CODING_AUTO_TEST
 PONDUIN_CODING_AUTO_FORMAT
 PONDUIN_CODING_INDEXING

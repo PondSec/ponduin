@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Dockアイコン"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "新しく開くタスクに適用されます。"
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "コンピュータ全体"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "エージェントは、ユーザーアカウントがアクセスを許可されている場所のファイルにアクセスできます。"
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "新しいエージェントタスクがファイルを読み書きできる場所を選択します。"
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "macOSのフルディスクアクセス設定を開く"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "ファイルアクセス"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "ユーザフォルダ全体"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "エージェントはユーザフォルダ内のファイルにアクセスできます。"
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "ワークスペースのみ"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "エージェントはタスクのワークスペース内のファイルにのみアクセスできます。"
+  },
   "settings.help.description": {
     "defaultMessage": "問題の報告や新機能のリクエストでponduinの改善にご協力ください"
   },
