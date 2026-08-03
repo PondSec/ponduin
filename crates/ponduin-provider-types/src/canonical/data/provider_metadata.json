@@ -85,7 +85,7 @@
     "env": [
       "DASHSCOPE_API_KEY"
     ],
-    "model_count": 84
+    "model_count": 85
   },
   {
     "id": "alibaba-coding-plan",
@@ -228,7 +228,7 @@
     "env": [
       "CHUTES_API_KEY"
     ],
-    "model_count": 12
+    "model_count": 13
   },
   {
     "id": "clarifai",
@@ -362,7 +362,7 @@
     "env": [
       "DIGITALOCEAN_ACCESS_TOKEN"
     ],
-    "model_count": 82
+    "model_count": 83
   },
   {
     "id": "dinference",
@@ -406,7 +406,7 @@
     "env": [
       "EMPIRIOLABS_API_KEY"
     ],
-    "model_count": 37
+    "model_count": 39
   },
   {
     "id": "evroc",
@@ -560,7 +560,7 @@
     "env": [
       "HF_TOKEN"
     ],
-    "model_count": 55
+    "model_count": 56
   },
   {
     "id": "hyper",
@@ -571,7 +571,7 @@
     "env": [
       "HYPER_API_KEY"
     ],
-    "model_count": 23
+    "model_count": 24
   },
   {
     "id": "iflowcn",
@@ -583,6 +583,17 @@
       "IFLOW_API_KEY"
     ],
     "model_count": 14
+  },
+  {
+    "id": "impossibl",
+    "display_name": "Impossibl",
+    "npm": "@ai-sdk/openai-compatible",
+    "api": "https://api.impossibl.com/v1",
+    "doc": "https://impossibl.com/docs/models",
+    "env": [
+      "IMPOSSIBL_API_KEY"
+    ],
+    "model_count": 76
   },
   {
     "id": "inception",
@@ -670,7 +681,7 @@
     "env": [
       "KILO_API_KEY"
     ],
-    "model_count": 346
+    "model_count": 342
   },
   {
     "id": "kimi-for-coding",
@@ -1078,7 +1089,7 @@
     "env": [
       "OPENCODE_API_KEY"
     ],
-    "model_count": 23
+    "model_count": 24
   },
   {
     "id": "orcarouter",

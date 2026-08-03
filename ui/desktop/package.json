@@ -1,7 +1,7 @@
 {
   "name": "ponduin-app",
   "productName": "Ponduin",
-  "version": "1.44.2",
+  "version": "1.44.3",
   "description": "Ponduin App",
   "engines": {
     "node": "^24.10.0",
