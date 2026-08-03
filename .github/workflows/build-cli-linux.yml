@@ -106,10 +106,14 @@ jobs:
             git \
             tar
 
+      # rust-cache probes `rustc -vV`. The manylinux images intentionally do not
+      # contain Rust until the following build step bootstraps rustup, so caching
+      # is limited to native host jobs instead of failing before the build starts.
       - name: Cache Cargo artifacts
+        if: matrix.container == ''
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
-          key: ${{ matrix.architecture }}-${{ matrix.target-suffix }}-${{ matrix.build-on }}-${{ matrix.container || 'native' }}
+          key: ${{ matrix.architecture }}-${{ matrix.target-suffix }}-${{ matrix.build-on }}-native
 
       - name: Build CLI (host runner)
         if: matrix.container == ''
