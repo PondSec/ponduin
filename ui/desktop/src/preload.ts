@@ -2,6 +2,7 @@ import Electron, { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { Recipe } from './recipe';
 import type { PonduinApp } from './types/apps';
 import type { Settings, SettingKey } from './utils/settings';
+import type { FileAccessScope } from './utils/settings';
 import { defaultSettings } from './utils/settings';
 
 // Mapping from settings keys to their old localStorage keys for lazy migration
@@ -130,6 +131,8 @@ type ElectronAPI = {
   getDockIconState: () => Promise<boolean>;
   getSetting: <K extends SettingKey>(key: K) => Promise<Settings[K]>;
   setSetting: <K extends SettingKey>(key: K, value: Settings[K]) => Promise<void>;
+  requestFileAccessScope: (scope: FileAccessScope) => Promise<boolean>;
+  openFullDiskAccessSettings: () => Promise<boolean>;
   getSecretKey: () => Promise<string | null>;
   getAcpUrl: () => Promise<string | null>;
   setWakelock: (enable: boolean) => Promise<boolean>;
@@ -252,6 +255,9 @@ const electronAPI: ElectronAPI = {
     }
     return ipcRenderer.invoke('set-setting', key, value);
   },
+  requestFileAccessScope: (scope: FileAccessScope) =>
+    ipcRenderer.invoke('request-file-access-scope', scope),
+  openFullDiskAccessSettings: () => ipcRenderer.invoke('open-full-disk-access-settings'),
   getSecretKey: () => ipcRenderer.invoke('get-secret-key'),
   getAcpUrl: () => ipcRenderer.invoke('get-acp-url'),
   setWakelock: (enable: boolean) => ipcRenderer.invoke('set-wakelock', enable),

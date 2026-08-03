@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "डॉक आइकन"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "यह नई खोली गई टास्क पर लागू होता है।"
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "पूरा कंप्यूटर"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "एजेंट उन सभी फ़ाइलों तक पहुँच सकता है, जिन तक आपके उपयोगकर्ता खाते की पहुँच है।"
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "चुनें कि नई एजेंट टास्क कहाँ फ़ाइलों को पढ़ और लिख सकती हैं।"
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "macOS पूर्ण डिस्क पहुँच सेटिंग खोलें"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "फ़ाइल पहुँच"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "पूरा उपयोगकर्ता फ़ोल्डर"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "एजेंट आपके उपयोगकर्ता फ़ोल्डर की फ़ाइलों तक पहुँच सकता है।"
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "केवल कार्यस्थान"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "एजेंट केवल टास्क के कार्यस्थान की फ़ाइलों तक पहुँच सकता है।"
+  },
   "settings.help.description": {
     "defaultMessage": "समस्याओं की रिपोर्ट करके या नई सुविधाओं का अनुरोध करके ponduin को बेहतर बनाने में हमारी सहायता करें"
   },

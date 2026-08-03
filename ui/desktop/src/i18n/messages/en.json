@@ -2052,7 +2052,7 @@
     "defaultMessage": "Test"
   },
   "modeSelectionItem.autonomousDescription": {
-    "defaultMessage": "Run all tools, including internal coding actions, without confirmation. Hard security blocks still apply."
+    "defaultMessage": "Run tools and coding actions without confirmation. Workspace and process boundaries still apply."
   },
   "modeSelectionItem.autonomousLabel": {
     "defaultMessage": "Autonomous"
@@ -3913,6 +3913,36 @@
   },
   "settings.dockIcon.title": {
     "defaultMessage": "Dock icon"
+  },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "This applies to newly opened tasks."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Entire computer"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "The agent can access files anywhere your user account is allowed to access."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Choose where new agent tasks may read and write files."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Open macOS Full Disk Access settings"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "File access"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Entire user folder"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "The agent can access files throughout your home folder."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Workspace only"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "The agent can access only the directory selected for the task."
   },
   "settings.help.description": {
     "defaultMessage": "Help us improve ponduin by reporting issues or requesting new features"

@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Ícone da dock"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Aplica-se a tarefas abertas a partir de agora."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Computador inteiro"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "O agente pode acessar arquivos em qualquer lugar que sua conta de usuário tenha permissão para acessar."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Escolha onde as novas tarefas do agente podem ler e gravar arquivos."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Abrir ajustes de Acesso Total ao Disco do macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Acesso a arquivos"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Pasta de usuário inteira"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "O agente pode acessar arquivos na sua pasta de usuário."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Somente espaço de trabalho"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "O agente só pode acessar arquivos no espaço de trabalho da tarefa."
+  },
   "settings.help.description": {
     "defaultMessage": "Ajude-nos a melhorar o ponduin comunicando problemas ou solicitando novas funcionalidades"
   },

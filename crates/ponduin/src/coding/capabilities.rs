@@ -21,7 +21,6 @@ pub struct ModelCapabilityProfile {
     pub recommended_context_tokens: usize,
     pub recommended_files_per_context: usize,
     pub recommended_files_per_change: usize,
-    pub recommended_plan_file_threshold: usize,
 }
 
 impl ModelCapabilityProfile {
@@ -104,15 +103,6 @@ impl ModelCapabilityProfile {
             .max_files_per_batch
             .min(strategy_change_limit)
             .min(suitability_change_limit);
-        let recommended_plan_file_threshold = if tool_transport == ToolTransport::EmulatedJson
-            || context_class == ContextClass::Compact
-            || coding_suitability == CodingSuitability::Limited
-        {
-            1
-        } else {
-            coding.plan_file_threshold
-        };
-
         Self {
             context_window_tokens,
             max_output_tokens,
@@ -130,7 +120,6 @@ impl ModelCapabilityProfile {
             recommended_context_tokens,
             recommended_files_per_context,
             recommended_files_per_change,
-            recommended_plan_file_threshold,
         }
     }
 
@@ -142,7 +131,7 @@ impl ModelCapabilityProfile {
              embedding_support={}, speed={}, resource_demand={}, execution_strategy={}. Unknown \
              capabilities are not assumed. Keep each prepared repository context at or below {} \
              tokens and normally within {} files. Change at most {} files per verified step. \
-             Create an explicit plan before work expected to touch {} or more files. After each \
+             Every workspace mutation begins from an explicit plan. After each \
              change, validate the narrowest relevant surface before expanding scope.",
             self.context_window_tokens,
             self.max_output_tokens,
@@ -160,7 +149,6 @@ impl ModelCapabilityProfile {
             self.recommended_context_tokens,
             self.recommended_files_per_context,
             self.recommended_files_per_change,
-            self.recommended_plan_file_threshold
         )
     }
 }
@@ -306,7 +294,6 @@ mod tests {
         CodingConfig {
             max_context_tokens: 100_000,
             max_files_per_batch: 20,
-            plan_file_threshold: 4,
             ..CodingConfig::default()
         }
     }
@@ -327,7 +314,6 @@ mod tests {
         assert_eq!(profile.structured_output, CapabilitySupport::Unknown);
         assert_eq!(profile.execution_strategy, ExecutionStrategy::Sequential);
         assert_eq!(profile.recommended_files_per_change, 1);
-        assert_eq!(profile.recommended_plan_file_threshold, 1);
         assert!(profile.recommended_context_tokens < 10_000);
     }
 
@@ -346,7 +332,6 @@ mod tests {
         assert_eq!(profile.execution_strategy, ExecutionStrategy::Deliberate);
         assert_eq!(profile.recommended_context_tokens, 90_000);
         assert_eq!(profile.recommended_files_per_change, 5);
-        assert_eq!(profile.recommended_plan_file_threshold, 4);
         assert!(profile.prompt_guidance().contains("context_window=300000"));
         assert!(profile.prompt_guidance().contains("tool_calling=unknown"));
     }
@@ -361,7 +346,6 @@ mod tests {
         let profile = ModelCapabilityProfile::detect(&model, &coding_config());
 
         assert_eq!(profile.tool_transport, ToolTransport::Native);
-        assert_eq!(profile.recommended_plan_file_threshold, 4);
     }
 
     #[test]
@@ -387,7 +371,6 @@ mod tests {
         assert_eq!(profile.recommended_context_tokens, 8_192);
         assert_eq!(profile.recommended_files_per_context, 4);
         assert_eq!(profile.recommended_files_per_change, 1);
-        assert_eq!(profile.recommended_plan_file_threshold, 1);
         assert!(profile
             .prompt_guidance()
             .contains("coding_suitability=limited"));

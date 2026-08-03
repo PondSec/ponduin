@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Ikon dock"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Berlaku untuk tugas yang baru dibuka."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Seluruh komputer"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "Agen dapat mengakses file di mana pun akun pengguna Anda diizinkan mengaksesnya."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Pilih lokasi tempat tugas agen baru dapat membaca dan menulis file."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Buka pengaturan Akses Disk Penuh macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Akses file"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Seluruh folder pengguna"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "Agen dapat mengakses file di folder pengguna Anda."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Hanya ruang kerja"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "Agen hanya dapat mengakses file di ruang kerja tugas."
+  },
   "settings.help.description": {
     "defaultMessage": "Bantu kami meningkatkan ponduin dengan melaporkan masalah atau meminta fitur baru"
   },

@@ -48,6 +48,7 @@ const mockSettings: Record<string, unknown> = {
   showDockIcon: true,
   enableWakelock: false,
   spellcheckEnabled: true,
+  fileAccessScope: 'workspace',
   keyboardShortcuts: {
     focusWindow: 'CommandOrControl+Alt+G',
     quickLauncher: 'CommandOrControl+Alt+Shift+G',
@@ -83,6 +84,8 @@ Object.defineProperty(window, 'electron', {
       mockSettings[key] = value;
       return Promise.resolve();
     }),
+    requestFileAccessScope: vi.fn(() => Promise.resolve(true)),
+    openFullDiskAccessSettings: vi.fn(() => Promise.resolve(true)),
     reloadApp: vi.fn(),
     showMessageBox: vi.fn(() => Promise.resolve({ response: 0 })),
     getIsFullScreen: vi.fn(() => Promise.resolve(false)),

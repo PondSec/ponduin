@@ -12,7 +12,7 @@ const i18n = defineMessages({
   autonomousDescription: {
     id: 'modeSelectionItem.autonomousDescription',
     defaultMessage:
-      'Run all tools, including internal coding actions, without confirmation. Hard security blocks still apply.',
+      'Run tools and coding actions without confirmation. Workspace and process boundaries still apply.',
   },
   manualLabel: {
     id: 'modeSelectionItem.manualLabel',

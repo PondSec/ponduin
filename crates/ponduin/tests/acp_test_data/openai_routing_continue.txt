@@ -1,0 +1,7 @@
+data: {"id":"chatcmpl-routing","object":"chat.completion.chunk","created":1766709751,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_routing","type":"function","function":{"name":"coding__continue_without_agent","arguments":"{}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-routing","object":"chat.completion.chunk","created":1766709751,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-routing","object":"chat.completion.chunk","created":1766709751,"model":"gpt-4.1","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}
+
+data: [DONE]

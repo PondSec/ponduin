@@ -223,6 +223,20 @@ prompt: |
   7. Use `coding__rollback_changes` and verify all three files return to their
      prior contents.
 
+  ### Reliability and recovery boundaries
+
+  1. Begin an active workflow and retain its reported workflow ID.
+  2. Submit one malformed process request without a `program` field. Verify no
+     process starts and the active workflow remains inspectable.
+  3. Submit a rollback-shaped identifier where a workflow ID is required.
+     Verify it is rejected, the returned recovery diagnostic includes the
+     current workflow ID, and no workflow transition occurs.
+  4. Repeat an equivalent invalid workflow-contract request until the bounded
+     workflow stop state is reported. Verify the result does not claim success
+     or ask the user to resend the original task.
+  5. In a separate read-only analysis workflow, verify an attempted mutation is
+     rejected without changing a fixture file.
+
   ### Validation, diagnostics, review, and Git
 
   1. Use `coding__run_validation` with a current command id from

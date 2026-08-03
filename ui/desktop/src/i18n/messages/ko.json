@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Dock 아이콘"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "새로 여는 작업에 적용됩니다."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "전체 컴퓨터"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "에이전트는 사용자 계정이 접근할 수 있는 모든 위치의 파일에 접근할 수 있습니다."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "새 에이전트 작업이 파일을 읽고 쓸 수 있는 위치를 선택하세요."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "macOS 전체 디스크 접근 설정 열기"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "파일 접근"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "전체 사용자 폴더"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "에이전트는 사용자 폴더의 파일에 접근할 수 있습니다."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "작업 공간만"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "에이전트는 작업의 작업 공간 파일에만 접근할 수 있습니다."
+  },
   "settings.help.description": {
     "defaultMessage": "문제를 신고하거나 새 기능을 요청하여 ponduin 개선에 도움을 주세요."
   },

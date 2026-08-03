@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Dock-Symbol"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Gilt für neu geöffnete Aufgaben."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Gesamter Computer"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "Der Agent kann auf alle Dateien zugreifen, auf die Ihr Benutzerkonto zugreifen darf."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Wählen Sie, wo neue Agent-Aufgaben Dateien lesen und schreiben dürfen."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "macOS-Einstellungen für vollständigen Festplattenzugriff öffnen"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Dateizugriff"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Gesamter Benutzerordner"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "Der Agent kann auf Dateien in Ihrem Benutzerordner zugreifen."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Nur Workspace"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "Der Agent kann nur auf Dateien im Workspace der Aufgabe zugreifen."
+  },
   "settings.help.description": {
     "defaultMessage": "Helfen Sie uns, ponduin zu verbessern, indem Sie Probleme melden oder neue Funktionen anfordern"
   },

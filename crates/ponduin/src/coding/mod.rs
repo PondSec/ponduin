@@ -48,5 +48,5 @@ pub use review::ReviewAnalyzer;
 pub use search::RepositorySearch;
 pub use strategy::MODEL_ROUTING_GUIDANCE;
 pub use validation::ValidationService;
-pub use workflow::CodingWorkflow;
+pub use workflow::{CodingWorkflow, TaskInteractionMode, WorkflowTaskState};
 pub use workspace::CodingWorkspace;

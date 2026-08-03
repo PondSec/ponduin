@@ -123,6 +123,37 @@ fn collect_coding_route_decisions(
     invalid_tool_request
 }
 
+fn retain_first_compact_coding_request(
+    remaining_requests: &mut Vec<ToolRequest>,
+    filtered_response: &mut Message,
+) {
+    let mut saw_coding_request = false;
+    let dropped_ids = remaining_requests
+        .iter()
+        .filter_map(|request| {
+            let tool_call = request.tool_call.as_ref().ok()?;
+            if !crate::coding::tools::is_reserved_name(&tool_call.name) {
+                return None;
+            }
+            if saw_coding_request {
+                Some(request.id.clone())
+            } else {
+                saw_coding_request = true;
+                None
+            }
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    if dropped_ids.is_empty() {
+        return;
+    }
+
+    remaining_requests.retain(|request| !dropped_ids.contains(&request.id));
+    filtered_response.content.retain(|content| {
+        !matches!(content, MessageContent::ToolRequest(request) if dropped_ids.contains(&request.id))
+    });
+}
+
 fn coding_routing_messages(conversation: &Conversation) -> Result<Vec<Message>> {
     let newest_user_turn = conversation
         .messages()
@@ -374,8 +405,22 @@ fn project_message_for_user_event(message: &Message) -> Message {
     message.user_visible_content()
 }
 
+fn message_for_live_update(message: &Message) -> Option<Message> {
+    (!message.content.is_empty()).then(|| message.clone())
+}
+
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
+}
+
+fn latest_user_request(conversation: &Conversation) -> Option<String> {
+    conversation.messages().iter().rev().find_map(|message| {
+        if message.role != rmcp::model::Role::User {
+            return None;
+        }
+        let text = agent_visible_message_text(message);
+        (!text.trim().is_empty()).then_some(text)
+    })
 }
 
 fn attach_turn_usage(
@@ -2121,8 +2166,17 @@ impl Agent {
             )
             .await?;
         if coding_exposure == super::reply_parts::CodingToolExposure::Active {
-            model_config = model_config
-                .with_default_thinking_effort(provider.default_coding_thinking_effort());
+            model_config = model_config.with_thinking_effort(
+                self.coding_agent
+                    .next_action_thinking_effort(&session.working_dir),
+            );
+            if let Some(original_user_request) = latest_user_request(&conversation) {
+                self.coding_agent.register_task_context(
+                    ponduin_mode,
+                    &session.working_dir,
+                    original_user_request,
+                );
+            }
         }
         let (mut tools, mut toolshim_tools, mut system_prompt, _) = self
             .prepare_tools_and_prompt_with_coding(
@@ -2213,6 +2267,12 @@ impl Agent {
                 coding_exposure == super::reply_parts::CodingToolExposure::Active;
 
             loop {
+                if coding_tools_active {
+                    model_config = model_config.with_thinking_effort(
+                        self.coding_agent
+                            .next_action_thinking_effort(&session.working_dir),
+                    );
+                }
                 if is_token_cancelled(&cancel_token) {
                     break;
                 }
@@ -2285,7 +2345,29 @@ impl Agent {
                     turns_taken += 1;
                 }
                 if turns_taken > max_turns {
-                    last_assistant_text = MAX_TURNS_MESSAGE.to_string();
+                    last_assistant_text = if coding_tools_active && ponduin_mode == PonduinMode::Auto {
+                        if self
+                            .coding_agent
+                            .active_workflow_continuation(&session.working_dir)
+                            .is_some()
+                        {
+                            self.coding_agent
+                                .block_for_action_limit(&session.working_dir, max_turns);
+                            "The active coding workflow reached its configured action limit and stopped \
+                             safely. The original request and workflow evidence were retained; no user \
+                             resubmission is required."
+                                .to_string()
+                        } else if let Some(message) = self
+                            .coding_agent
+                            .terminal_workflow_message(&session.working_dir)
+                        {
+                            message
+                        } else {
+                            MAX_TURNS_MESSAGE.to_string()
+                        }
+                    } else {
+                        MAX_TURNS_MESSAGE.to_string()
+                    };
                     yield AgentEvent::Message(Message::assistant().with_text(last_assistant_text.clone()));
                     break;
                 }
@@ -2410,8 +2492,8 @@ impl Agent {
 
                                 let ToolCategorizeResult {
                                     frontend_requests,
-                                    remaining_requests,
-                                    filtered_response,
+                                    mut remaining_requests,
+                                    mut filtered_response,
                                 } = self
                                     .categorize_tools(
                                         &response,
@@ -2419,6 +2501,17 @@ impl Agent {
                                         surfaced_thinking_in_turn,
                                     )
                                     .await;
+
+                                if coding_tools_active
+                                    && self
+                                        .coding_agent
+                                        .uses_compact_history_for_model(&model_config)
+                                {
+                                    retain_first_compact_coding_request(
+                                        &mut remaining_requests,
+                                        &mut filtered_response,
+                                    );
+                                }
 
                                 let filtered_response = if let Some(inference) = inference.as_ref() {
                                     filtered_response.with_inference(inference.clone())
@@ -2441,15 +2534,21 @@ impl Agent {
                                     },
                                 );
 
-                                if !filtered_response.content.is_empty() {
-                                    yield AgentEvent::Message(filtered_response.clone());
+                                let suppress_user_visible_response = coding_tools_active
+                                    && self
+                                        .coding_agent
+                                        .workflow_continuation(&session.working_dir)
+                                        .is_some();
+
+                                if let Some(live_response) = message_for_live_update(&filtered_response) {
+                                    yield AgentEvent::Message(live_response);
                                     tokio::task::yield_now().await;
                                 }
 
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
                                 if num_tool_requests == 0 {
                                     let text = filtered_response.as_concat_text();
-                                    if !text.is_empty() {
+                                    if !suppress_user_visible_response && !text.is_empty() {
                                         last_assistant_text.push_str(&text);
                                     }
                                     messages_to_add.push(response);
@@ -3059,6 +3158,22 @@ impl Agent {
                             // continue from last user message after recovery compact
                         }
                         None if self.has_pending_steers(&session_config.id).await => {}
+                        None if coding_tools_active => {
+                            if let Some(continuation) = self
+                                .coding_agent
+                                .workflow_continuation(&session.working_dir)
+                            {
+                                messages_to_add.push(
+                                    Message::user()
+                                        .with_text(continuation)
+                                        .with_visibility(false, true),
+                                );
+                            } else {
+                                self.set_goal(None).await;
+                                self.set_grind(None).await;
+                                exit_chat = true;
+                            }
+                        }
                         None if self.goal.lock().await.is_some() && !goal_check_pending => {
                             goal_check_pending = true;
                             let goal = self.goal.lock().await.clone().unwrap();
@@ -3122,9 +3237,18 @@ impl Agent {
                                     {
                                         unproductive_turn_retries += 1;
                                         retrying_after_unproductive_turn = true;
+                                        let continuation = if coding_tools_active {
+                                            self.coding_agent
+                                                .recovery_instruction(&session.working_dir)
+                                                .unwrap_or_else(|| {
+                                                    UNPRODUCTIVE_TURN_CONTINUATION.to_string()
+                                                })
+                                        } else {
+                                            UNPRODUCTIVE_TURN_CONTINUATION.to_string()
+                                        };
                                         messages_to_add.push(
                                             Message::user()
-                                                .with_text(UNPRODUCTIVE_TURN_CONTINUATION)
+                                                .with_text(continuation)
                                                 .with_visibility(false, true),
                                         );
                                         warn!(
@@ -3138,10 +3262,22 @@ impl Agent {
                                             MAX_UNPRODUCTIVE_TURN_RETRIES
                                         );
                                     } else {
-                                        let fallback = if reasoning_only_response {
-                                            REASONING_ONLY_TURN_MESSAGE
+                                        let fallback = if coding_tools_active {
+                                            self.coding_agent
+                                                .recovery_exhausted_message(&session.working_dir)
+                                                .unwrap_or_else(|| {
+                                                    if reasoning_only_response {
+                                                        REASONING_ONLY_TURN_MESSAGE.to_string()
+                                                    } else {
+                                                        EMPTY_TURN_MESSAGE.to_string()
+                                                    }
+                                                })
                                         } else {
-                                            EMPTY_TURN_MESSAGE
+                                            if reasoning_only_response {
+                                                REASONING_ONLY_TURN_MESSAGE.to_string()
+                                            } else {
+                                                EMPTY_TURN_MESSAGE.to_string()
+                                            }
                                         };
                                         warn!(
                                             response_kind = if reasoning_only_response {
@@ -3151,7 +3287,7 @@ impl Agent {
                                             },
                                             "Provider returned an unproductive response after retries; ending turn"
                                         );
-                                        last_assistant_text = fallback.to_string();
+                                        last_assistant_text = fallback.clone();
                                         let message = Message::assistant().with_text(fallback);
                                         messages_to_add.push(message.clone());
                                         yield AgentEvent::Message(message);
@@ -4422,8 +4558,74 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         assert!(collect_coding_route_decisions(&unknown, &mut decisions));
     }
 
+    #[test]
+    fn compact_coding_requests_run_one_workflow_action_per_model_turn() {
+        let mut filtered_response = Message::assistant()
+            .with_tool_request(
+                "read",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::READ_FILE_TOOL_NAME,
+                )),
+            )
+            .with_tool_request(
+                "write",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::APPLY_CHANGES_TOOL_NAME,
+                )),
+            )
+            .with_tool_request("other", Ok(CallToolRequestParams::new("other__tool")));
+        let mut remaining_requests = filtered_response
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::ToolRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        retain_first_compact_coding_request(&mut remaining_requests, &mut filtered_response);
+
+        let remaining_ids = remaining_requests
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_ids, vec!["read", "other"]);
+        let visible_ids = filtered_response
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::ToolRequest(request) => Some(request.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_ids, vec!["read", "other"]);
+    }
+
+    #[test]
+    fn live_updates_preserve_model_text_and_tool_progress() {
+        let response = Message::assistant()
+            .with_text("I will now inspect the project.")
+            .with_tool_request(
+                "read",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::READ_FILE_TOOL_NAME,
+                )),
+            );
+
+        let progress = message_for_live_update(&response).expect("live update");
+
+        assert!(progress
+            .as_concat_text()
+            .contains("I will now inspect the project."));
+        assert!(matches!(
+            progress.content.as_slice(),
+            [MessageContent::Text(_), MessageContent::ToolRequest(_)]
+        ));
+    }
+
     #[tokio::test]
     async fn coding_tools_are_disclosed_after_activation_and_reset_next_reply() -> Result<()> {
+        let _guard = env_lock::lock_env([("PONDUIN_THINKING_EFFORT", Some("high"))]);
         let temp_dir = tempfile::tempdir()?;
         let provider = Arc::new(CodingDisclosureProvider::new());
         let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
@@ -4523,7 +4725,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .tools
             .iter()
             .all(|name| !crate::coding::tools::is_reserved_name(name)));
-        assert_eq!(inactive.thinking_effort, None);
+        assert_eq!(inactive.thinking_effort.as_deref(), Some("high"));
         Ok(())
     }
 

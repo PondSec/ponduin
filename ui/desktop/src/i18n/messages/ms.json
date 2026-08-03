@@ -3914,6 +3914,36 @@
   "settings.dockIcon.title": {
     "defaultMessage": "Ikon dok"
   },
+  "settings.fileAccess.appliesToNewTasks": {
+    "defaultMessage": "Ini digunakan untuk tugasan yang baru dibuka."
+  },
+  "settings.fileAccess.computer": {
+    "defaultMessage": "Keseluruhan komputer"
+  },
+  "settings.fileAccess.computerDescription": {
+    "defaultMessage": "Ejen boleh mengakses fail di mana-mana lokasi yang dibenarkan untuk akaun pengguna anda."
+  },
+  "settings.fileAccess.description": {
+    "defaultMessage": "Pilih tempat tugasan ejen baharu boleh membaca dan menulis fail."
+  },
+  "settings.fileAccess.fullDiskAccess": {
+    "defaultMessage": "Buka tetapan Akses Cakera Penuh macOS"
+  },
+  "settings.fileAccess.title": {
+    "defaultMessage": "Akses fail"
+  },
+  "settings.fileAccess.user": {
+    "defaultMessage": "Keseluruhan folder pengguna"
+  },
+  "settings.fileAccess.userDescription": {
+    "defaultMessage": "Ejen boleh mengakses fail dalam folder pengguna anda."
+  },
+  "settings.fileAccess.workspace": {
+    "defaultMessage": "Ruang kerja sahaja"
+  },
+  "settings.fileAccess.workspaceDescription": {
+    "defaultMessage": "Ejen hanya boleh mengakses fail dalam ruang kerja tugasan."
+  },
   "settings.help.description": {
     "defaultMessage": "Bantu kami menambah baik ponduin dengan melaporkan isu atau meminta ciri baharu"
   },

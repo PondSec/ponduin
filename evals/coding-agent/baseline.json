@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-31",
+  "scope": "internal coding-agent workflow",
+  "command": "source bin/activate-hermit && cargo test -p ponduin coding:: --lib",
+  "result": {
+    "passed": 151,
+    "failed": 0,
+    "ignored": 5
+  },
+  "observed_gaps": [
+    {
+      "id": "single_change_without_workflow",
+      "status": "present",
+      "evidence": "CodingToolState::authorize_mutation_locked permits a mutation without a workflow below plan_file_threshold."
+    },
+    {
+      "id": "planned_validation_coverage",
+      "status": "present",
+      "evidence": "WorkflowPlan stores tests and validation as free text; CodingWorkflow::begin_review only requires one successful current-revision validation."
+    },
+    {
+      "id": "structured_requirement_completion",
+      "status": "present",
+      "evidence": "CodingWorkflow retains an objective and plan but no requirement-level status or evidence model."
+    },
+    {
+      "id": "semantic_repair_escalation",
+      "status": "partial",
+      "evidence": "Repeated normalized diagnostics and repeated process invocations stop the workflow, but strategy choice and hypothesis evidence are not represented in workflow state."
+    }
+  ],
+  "constraints": [
+    "No installed application under /Applications was modified.",
+    "Ignored tests require external Docker or a live model and are not counted as deterministic baseline coverage."
+  ]
+}

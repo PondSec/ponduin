@@ -3780,4 +3780,182 @@ mod tests {
             Ok(())
         }
     }
+
+    mod coding_recovery_contract_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use ponduin::agents::{AgentEvent, SessionConfig};
+        use ponduin::config::PonduinMode;
+        use ponduin::conversation::message::Message;
+        use ponduin::providers::base::{
+            stream_from_single_message, MessageStream, Provider, ProviderDef, ProviderMetadata,
+        };
+        use ponduin::session::session_manager::SessionType;
+        use ponduin_providers::conversation::token_usage::{ProviderUsage, Usage};
+        use ponduin_providers::errors::ProviderError;
+        use ponduin_providers::model::ModelConfig;
+        use rmcp::model::{CallToolRequestParams, Tool};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct WorkflowThenUnproductiveProvider {
+            workflow_started: AtomicUsize,
+            post_workflow_calls: AtomicUsize,
+        }
+
+        impl WorkflowThenUnproductiveProvider {
+            fn new() -> Self {
+                Self {
+                    workflow_started: AtomicUsize::new(0),
+                    post_workflow_calls: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl ponduin::providers::base::ProviderDescriptor for WorkflowThenUnproductiveProvider {
+            fn metadata() -> ProviderMetadata {
+                ProviderMetadata {
+                    name: "workflow-then-unproductive-mock".to_string(),
+                    display_name: "Workflow Then Unproductive Mock".to_string(),
+                    description: "Mock provider for coding recovery contract tests".to_string(),
+                    default_model: "mock-model".to_string(),
+                    known_models: vec![],
+                    model_doc_link: "".to_string(),
+                    config_keys: vec![],
+                    setup_steps: vec![],
+                    model_selection_hint: None,
+                    fast_model: None,
+                }
+            }
+        }
+
+        impl ProviderDef for WorkflowThenUnproductiveProvider {
+            type Provider = Self;
+
+            fn from_env(
+                _extensions: Vec<ponduin::config::ExtensionConfig>,
+                _tls_config: Option<ponduin::providers::api_client::TlsConfig>,
+            ) -> futures::future::BoxFuture<'static, anyhow::Result<Self>> {
+                unimplemented!()
+            }
+        }
+
+        #[async_trait]
+        impl Provider for WorkflowThenUnproductiveProvider {
+            async fn stream(
+                &self,
+                _model_config: &ModelConfig,
+                _system_prompt: &str,
+                _messages: &[Message],
+                tools: &[Tool],
+            ) -> Result<MessageStream, ProviderError> {
+                let has_tool = |name| tools.iter().any(|tool| tool.name == name);
+                let message = if has_tool(ponduin::coding::tools::ACTIVATE_AGENT_TOOL_NAME) {
+                    Message::assistant().with_tool_request(
+                        "activate-coding-agent",
+                        Ok(CallToolRequestParams::new(
+                            ponduin::coding::tools::ACTIVATE_AGENT_TOOL_NAME,
+                        )
+                        .with_arguments(serde_json::Map::new())),
+                    )
+                } else if has_tool(ponduin::coding::tools::WORKFLOW_START_TOOL_NAME)
+                    && self.workflow_started.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    Message::assistant().with_tool_request(
+                        "start-workflow",
+                        Ok(CallToolRequestParams::new(
+                            ponduin::coding::tools::WORKFLOW_START_TOOL_NAME,
+                        )
+                        .with_arguments(rmcp::object!({
+                            "objective": "create the requested fixture project"
+                        }))),
+                    )
+                } else if self.post_workflow_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Message::assistant().with_text("Premature completion that must stay hidden.")
+                } else {
+                    Message::assistant()
+                };
+                let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+                Ok(stream_from_single_message(message, usage))
+            }
+
+            fn get_name(&self) -> &str {
+                "workflow-then-unproductive-mock"
+            }
+        }
+
+        #[tokio::test]
+        async fn active_coding_workflow_preserves_task_and_blocks_premature_completion(
+        ) -> Result<()> {
+            let workspace = tempfile::tempdir()?;
+            let agent = Agent::new();
+            let session = agent
+                .config
+                .session_manager
+                .create_session(
+                    workspace.path().to_path_buf(),
+                    "coding-recovery-contract".to_string(),
+                    SessionType::Hidden,
+                    PonduinMode::Auto,
+                )
+                .await?;
+            let provider = Arc::new(WorkflowThenUnproductiveProvider::new());
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+
+            let session_id = session.id.clone();
+            let stream = agent
+                .reply(
+                    Message::user().with_text("Create a small fixture project with a test."),
+                    SessionConfig {
+                        id: session.id,
+                        schedule_id: None,
+                        max_turns: Some(20),
+                        retry_config: None,
+                    },
+                    None,
+                )
+                .await?;
+            tokio::pin!(stream);
+            let mut user_visible = Vec::new();
+            while let Some(event) = stream.next().await {
+                if let AgentEvent::Message(message) = event? {
+                    user_visible.push(message);
+                }
+            }
+
+            let user_visible_text = user_visible
+                .iter()
+                .map(Message::as_concat_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!user_visible_text.contains("Premature completion"));
+            assert!(
+                user_visible_text.contains("no user resubmission is required"),
+                "expected recovery exhaustion message, got: {user_visible_text:?}"
+            );
+            assert!(!user_visible_text.contains("Please resend"));
+            assert!(provider.post_workflow_calls.load(Ordering::SeqCst) >= 4);
+
+            let persisted = agent
+                .config
+                .session_manager
+                .get_session(&session_id, true)
+                .await?
+                .conversation
+                .expect("persisted conversation");
+            let persisted_text = persisted
+                .messages()
+                .iter()
+                .map(Message::as_concat_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(persisted_text.contains("Create a small fixture project with a test."));
+            Ok(())
+        }
+    }
 }

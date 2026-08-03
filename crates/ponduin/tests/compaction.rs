@@ -13,7 +13,7 @@ use ponduin::session::Session;
 use ponduin_providers::conversation::token_usage::{ProviderUsage, Usage};
 use ponduin_providers::errors::ProviderError;
 use ponduin_providers::model::ModelConfig;
-use rmcp::model::Tool;
+use rmcp::model::{CallToolRequestParams, Tool};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -103,8 +103,26 @@ impl Provider for MockCompactionProvider {
         _model_config: &ModelConfig,
         system_prompt: &str,
         messages: &[Message],
-        _tools: &[Tool],
+        tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        let routing_request = tools
+            .iter()
+            .any(|tool| tool.name == ponduin::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+            && tools
+                .iter()
+                .any(|tool| tool.name == ponduin::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME);
+        if routing_request {
+            let message = Message::assistant().with_tool_request(
+                "mock-continue-without-coding",
+                Ok(CallToolRequestParams::new(
+                    ponduin::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME,
+                )
+                .with_arguments(serde_json::Map::new())),
+            );
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            return Ok(stream_from_single_message(message, usage));
+        }
+
         // Check if this is a compaction call (message contains "summarize")
         let is_compaction = messages.iter().any(|msg| {
             msg.content.iter().any(|content| {
