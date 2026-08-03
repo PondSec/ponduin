@@ -49,11 +49,14 @@ jobs:
     uses: ./.github/workflows/bundle-macos.yml
     permissions:
       contents: read
+    secrets: inherit
     with:
       target: aarch64-apple-darwin
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/') }}
+      # Release-branch rescue builds remain unsigned. Tagged releases are signed
+      # only after ENABLE_RELEASE_SIGNING and the required secrets are configured.
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
 
   # ------------------------------------------------------------
   # 4) Bundle CLI and Desktop (macOS x64)
@@ -62,11 +65,12 @@ jobs:
     uses: ./.github/workflows/bundle-macos.yml
     permissions:
       contents: read
+    secrets: inherit
     with:
       target: x86_64-apple-darwin
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/') }}
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
 
   # ------------------------------------------------------------
   # 5) Bundle Desktop App (Linux)
@@ -82,20 +86,22 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    secrets: inherit
     with:
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/') }}
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
 
   bundle-windows-cuda:
     uses: ./.github/workflows/bundle-windows.yml
     permissions:
       id-token: write
       contents: read
+    secrets: inherit
     with:
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/') }}
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
       windows_variant: cuda
 
   # ------------------------------------
