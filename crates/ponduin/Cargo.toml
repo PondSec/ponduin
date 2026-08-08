@@ -161,7 +161,7 @@ smithy-transport-reqwest = { version = "0.1", default-features = false, features
 aws-sdk-sagemakerruntime = { version = "1.104", default-features = false, features = ["rt-tokio"], optional = true }
 
 # For GCP Vertex AI provider auth
-jsonwebtoken = { version = "10.2", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "11.0", default-features = false, features = ["use_pem"] }
 
 blake3 = { version = "1", default-features = false, features = ["std"] }
 fs2 = { workspace = true }
@@ -253,7 +253,7 @@ wiremock = { workspace = true }
 # Unit tests exercise JWT signing and verification without selecting either
 # mutually exclusive production TLS feature. Give the test graph one explicit
 # crypto backend so jsonwebtoken never falls back to its panic-only provider.
-jsonwebtoken = { version = "10.2", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.0", default-features = false, features = ["aws_lc_rs"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 dotenvy = { workspace = true }
