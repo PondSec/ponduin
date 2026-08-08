@@ -85,6 +85,9 @@ impl TestProvider {
         let stable_messages: Vec<_> = messages
             .iter()
             .map(|msg| {
+                let mut message = msg.clone();
+                message.id = None;
+                message.created = 0;
                 let mut cleaned_content: Vec<_> = msg.content.to_vec();
 
                 for content in &mut cleaned_content {
@@ -107,7 +110,7 @@ impl TestProvider {
                         _ => {}
                     }
                 }
-                (msg.role.clone(), cleaned_content)
+                (message.role, cleaned_content)
             })
             .collect();
         let serialized = serde_json::to_string(&stable_messages).unwrap_or_default();
@@ -123,7 +126,10 @@ impl TestProvider {
 
         let content = fs::read_to_string(file_path)?;
         let records: HashMap<String, TestRecord> = serde_json::from_str(&content)?;
-        Ok(records)
+        Ok(records
+            .into_values()
+            .map(|record| (Self::hash_input(&record.input.messages), record))
+            .collect())
     }
 
     pub fn save_records(&self) -> Result<()> {
@@ -327,6 +333,48 @@ mod tests {
             .to_string()
             .contains("No recorded response found"));
 
+        let _ = fs::remove_file(temp_file);
+    }
+
+    #[tokio::test]
+    async fn test_replay_ignores_message_identity() {
+        let temp_file = format!(
+            "{}/test_identity_{}.json",
+            env::temp_dir().display(),
+            std::process::id()
+        );
+        let model_config = ModelConfig::new("test-model");
+        let mut recorded_message = Message::new(
+            Role::User,
+            1,
+            vec![MessageContent::Text(TextContent::new("Hello, world!"))],
+        );
+        recorded_message.id = Some("recorded-id".to_string());
+
+        let provider = TestProvider::new_recording(
+            Arc::new(MockProvider {
+                response: "Hello, world!".to_string(),
+            }),
+            &temp_file,
+        );
+        provider
+            .complete(&model_config, "You are helpful", &[recorded_message], &[])
+            .await
+            .unwrap();
+        provider.finish_recording().unwrap();
+
+        let mut replayed_message = Message::new(
+            Role::User,
+            2,
+            vec![MessageContent::Text(TextContent::new("Hello, world!"))],
+        );
+        replayed_message.id = Some("replayed-id".to_string());
+        let replay_provider = TestProvider::new_replaying(&temp_file).unwrap();
+        let result = replay_provider
+            .complete(&model_config, "You are helpful", &[replayed_message], &[])
+            .await;
+
+        assert!(result.is_ok());
         let _ = fs::remove_file(temp_file);
     }
 }
