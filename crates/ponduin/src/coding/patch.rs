@@ -1,4 +1,5 @@
 use crate::coding::file::content_digest;
+use crate::coding::outcome::{ActionFailureKind, ActionResult};
 use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,7 @@ impl<'workspace> PatchEngine<'workspace> {
         let result = MutationResult {
             rollback_id: rollback.id.clone(),
             preview: prepared.preview,
+            action: ActionResult::succeeded(true, true),
         };
         Ok(AppliedBatch { result, rollback })
     }
@@ -463,6 +465,8 @@ pub struct AppliedBatch {
 pub struct MutationResult {
     pub rollback_id: String,
     pub preview: MutationPreview,
+    #[serde(default)]
+    pub action: ActionResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,6 +1083,28 @@ pub enum PatchError {
     },
 }
 
+impl PatchError {
+    pub(crate) fn failure_kind(&self) -> ActionFailureKind {
+        match self {
+            Self::DigestConflict { .. }
+            | Self::PathChanged { .. }
+            | Self::RollbackConflict { .. } => ActionFailureKind::StaleState,
+            Self::Workspace(error) => error.failure_kind(),
+            Self::OutsideWorkspace(_) | Self::Sensitive(_) => ActionFailureKind::PolicyBlocked,
+            Self::NotFile(_) | Self::MissingParent(_) => ActionFailureKind::ResourceMissing,
+            Self::AlreadyExists(_) => ActionFailureKind::StaleState,
+            Self::ParentDirectoryIo { .. }
+            | Self::ParentDirectoryCleanup { .. }
+            | Self::Io { .. }
+            | Self::StageFailed { .. }
+            | Self::ApplyFailed { .. }
+            | Self::RollbackIo { .. } => ActionFailureKind::TransientFailure,
+            Self::ApplyAndRestoreFailed { .. } => ActionFailureKind::InternalFailure,
+            _ => ActionFailureKind::InvalidArguments,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1166,7 @@ mod tests {
             .contains("+    return 'after'"));
 
         let applied = engine.apply(prepared).unwrap();
+        assert_eq!(applied.result.action, ActionResult::succeeded(true, true));
         assert!(fs::read_to_string(workspace.root().join("app.py"))
             .unwrap()
             .contains("after"));

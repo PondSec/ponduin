@@ -198,9 +198,10 @@ The existing surfaces consume this core:
   preserves its public extension tools;
 - `PromptManager` adds keyed internal model-routing guidance without
   replacing the base system prompt;
-- the selected model decides semantically whether the current turn needs
-  coding tools; there is no keyword, regular-expression, or host-side branch
-  that classifies user prompts;
+- the selected model normally decides semantically whether the current turn
+  needs coding tools. After bounded invalid routing attempts, the runtime may
+  activate coding only for an explicit workspace work request; generic
+  questions remain inactive;
 - coding capabilities require no CLI or desktop opt-in and do not change the
   provider;
 - the desktop reuses the current permission and session surfaces.
@@ -224,6 +225,13 @@ selected by the user.
 Workspace escape, path traversal, symlink escape, protected secret access, and
 hard-denied destructive commands are rejected even in `auto`. This is a denial,
 not a confirmation request.
+
+For an active native coding turn, ponduin also accepts a complete textual JSON
+tool directive when the provider did not transport a native tool call. The
+runtime buffers the streamed response, resolves only tools exposed in the
+current workflow state, and sends a recovered call through the normal argument,
+permission, and workflow validation path. Unknown planned commands are never
+executed.
 
 Small tasks may edit directly when they remain below the configured file and
 risk thresholds. Larger tasks produce a plan with:
@@ -345,6 +353,63 @@ The record contains the command, working directory, exit code, duration,
 bounded stdout and stderr, and reason. Completion reports are generated from
 these records, so an unexecuted check cannot be presented as passed.
 
+### Structured action outcomes and recovery
+
+Coding subsystems classify a failed action at the boundary that has the needed
+context. File reads and mutations distinguish stale workspace state, missing
+resources, and workspace policy denials; processes distinguish timeout,
+capability, policy, and transient failures; validation distinguishes a failed
+check from an unavailable or blocked check; and workflow dispatch distinguishes
+invalid arguments from an invalid phase.
+
+The shared `ActionResult` carries the outcome, optional semantic failure kind,
+retryability, whether state changed, and whether detailed evidence was
+retained. Tool errors include that result as machine-readable data while
+retaining their original diagnostic text. Validation returns its result in the
+normal tool payload, so the model can inspect bounded diagnostics without a
+failed check ever qualifying as completion.
+
+`decide_recovery` is the single runtime mapping from a semantic failure plus
+workflow context to a recovery decision. It refreshes stale state, reinspects
+missing resources, asks for corrected arguments, requires diagnostics or a new
+repair strategy for failed checks, selects an alternative capability when one
+is exposed, and stops policy-blocked, cancelled, or internal failures. The
+workflow's existing phase, attempt history, and `next_action` provide that
+context; this does not introduce another state machine.
+
+### Action and strategy history
+
+Each active workflow also retains a bounded, task-local action history. An
+`ActionAttempt` records only the action category, runtime strategy, capability,
+target fingerprint, workflow revision, structured `ActionResult`, and compact
+progress signal. It does not retain source bodies, model reasoning, tool JSON,
+or process output. Capability feedback records task-local successes, failures,
+and capabilities proven unavailable; it is discarded with the workflow and is
+never used as a global model or provider ranking. An alternative with prior
+failures and no task-local success is not preferred merely because it is still
+technically exposed.
+
+`ActionStrategy` gives a stable identity to materially different attempts,
+including direct work, refresh-before-mutation, diagnostic inspection,
+argument correction, alternative capability use, narrower validation, and the
+existing bounded repair approaches. Before dispatching a coding tool, the
+runtime combines action history, task state, recovery outcome, current tool
+exposure, the current session/model tool surface, capability feedback, and
+evidence to select the permitted strategy. A compact local-model contract can
+therefore never be directed to an alternative that was not exposed to it.
+It treats a failed action with the same target, semantic failure, strategy, and
+unchanged state as equivalent even when model wording or irrelevant tool JSON
+differs. A later state-changing action, refreshed resource, changed diagnostic,
+or distinct repair approach remains a meaningful alternative.
+
+For example, a stale mutation requires a read before a
+`refresh_then_mutate` retry; a repeated failed validation requires diagnostic
+inspection and then a distinct repair approach; an unavailable mutation tool
+offers its currently exposed single-file alternative and stops once that
+alternative is also unsuitable. The runtime decides these boundaries and retry
+eligibility. The model supplies diagnostics interpretation and implementation
+content only within the selected safe strategy.
+
 ## Coding loop and progress detection
 
 The coding strategy uses the current agent loop:
@@ -367,6 +432,21 @@ error count stop automatic repair and report the block. Before repairing a
 second occurrence of the same diagnostic, the agent must record a distinct
 repair approach and a fingerprint of its hypothesis; it cannot silently retry
 the same tactic. Hypothesis text is not retained in workflow memory.
+
+Workflow state is scoped to the agent session as well as the canonical
+workspace. Concurrent sessions in the same repository therefore retain
+independent objectives, plans, evidence, recovery decisions, and terminal
+states. Cancellation is an explicit terminal workflow state: it discards a
+pending pre-workflow task, prevents continuation or completion, and leaves a
+machine-readable stop reason for the session that was cancelled.
+
+Workflow status also contains a runtime-derived `next_action`. It is computed
+from the retained phase, change evidence, required validation, review evidence,
+and repair history; it is not a second state machine. The tool surface and
+workflow guidance consume the same value, so a repeated validation failure
+with no distinct repair strategy exposes strategy selection before another
+repair transition, and completion is exposed only after the evidence-backed
+review gate is satisfied.
 
 ## Configuration
 

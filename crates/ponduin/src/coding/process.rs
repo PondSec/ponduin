@@ -1,4 +1,5 @@
 use crate::coding::diagnostic::{DiagnosticAnalyzer, DiagnosticReport};
+use crate::coding::outcome::{ActionFailureKind, ActionResult};
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
 use crate::subprocess::configure_subprocess;
 use serde::{Deserialize, Serialize};
@@ -134,13 +135,16 @@ impl<'workspace> ProcessRunner<'workspace> {
         if stdout_collection_error.is_some() || stderr_collection_error.is_some() {
             terminate_process_tree(&mut child, pid).await;
         }
+        let background_process_detected = matches!(
+            (&stdout_collection_error, &stderr_collection_error),
+            (Some(OutputCollectionError::TimedOut { .. }), _)
+                | (_, Some(OutputCollectionError::TimedOut { .. }))
+        );
         let output_collection_error = [stdout_collection_error, stderr_collection_error]
             .into_iter()
             .flatten()
+            .map(|error| error.to_string())
             .collect::<Vec<_>>();
-        let background_process_detected = output_collection_error
-            .iter()
-            .any(|error| error.contains("collection timed out"));
         let success = status.as_ref().is_some_and(|status| status.success())
             && !timed_out
             && output_collection_error.is_empty();
@@ -269,6 +273,20 @@ pub struct ProcessOutput {
     pub duration_ms: u128,
 }
 
+impl ProcessOutput {
+    pub(crate) fn action_result(&self) -> ActionResult {
+        if self.timed_out {
+            ActionResult::failed(ActionFailureKind::TimedOut, true)
+        } else if self.background_process_detected || self.output_collection_error.is_some() {
+            ActionResult::failed(ActionFailureKind::TransientFailure, true)
+        } else if self.success {
+            ActionResult::succeeded(false, true)
+        } else {
+            ActionResult::failed(ActionFailureKind::ProcessFailed, true)
+        }
+    }
+}
+
 struct ValidatedProcess {
     display_program: String,
     program: PathBuf,
@@ -310,7 +328,7 @@ async fn read_bounded(
 async fn collect_reader(
     mut task: tokio::task::JoinHandle<std::io::Result<BoundedBytes>>,
     stream: &'static str,
-) -> (BoundedBytes, Option<String>) {
+) -> (BoundedBytes, Option<OutputCollectionError>) {
     match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut task).await {
         Ok(Ok(Ok(output))) => (output, None),
         Ok(Ok(Err(error))) => (
@@ -318,14 +336,20 @@ async fn collect_reader(
                 truncated: true,
                 ..BoundedBytes::default()
             },
-            Some(format!("{stream}: {error}")),
+            Some(OutputCollectionError::Read {
+                stream,
+                message: error.to_string(),
+            }),
         ),
         Ok(Err(error)) => (
             BoundedBytes {
                 truncated: true,
                 ..BoundedBytes::default()
             },
-            Some(format!("{stream} task: {error}")),
+            Some(OutputCollectionError::Task {
+                stream,
+                message: error.to_string(),
+            }),
         ),
         Err(_) => {
             task.abort();
@@ -335,8 +359,33 @@ async fn collect_reader(
                     truncated: true,
                     ..BoundedBytes::default()
                 },
-                Some(format!("{stream}: collection timed out")),
+                Some(OutputCollectionError::TimedOut { stream }),
             )
+        }
+    }
+}
+
+#[derive(Debug)]
+enum OutputCollectionError {
+    Read {
+        stream: &'static str,
+        message: String,
+    },
+    Task {
+        stream: &'static str,
+        message: String,
+    },
+    TimedOut {
+        stream: &'static str,
+    },
+}
+
+impl std::fmt::Display for OutputCollectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { stream, message } => write!(formatter, "{stream}: {message}"),
+            Self::Task { stream, message } => write!(formatter, "{stream} task: {message}"),
+            Self::TimedOut { stream } => write!(formatter, "{stream}: collection timed out"),
         }
     }
 }
@@ -694,6 +743,27 @@ pub enum ProcessError {
     },
 }
 
+impl ProcessError {
+    pub(crate) fn failure_kind(&self) -> ActionFailureKind {
+        match self {
+            Self::SpawnFailed { .. } | Self::ProgramNotFile(_) => {
+                ActionFailureKind::CapabilityUnavailable
+            }
+            Self::WorkingDirectoryNotDirectory(_) => ActionFailureKind::ResourceMissing,
+            Self::Workspace(error) => error.failure_kind(),
+            Self::BlockedCommand { .. }
+            | Self::InteractiveCommand(_)
+            | Self::SensitiveEnvironmentEntry(_)
+            | Self::EnvironmentEntryNotAllowed(_)
+            | Self::WorkingDirectoryOutside(_) => ActionFailureKind::PolicyBlocked,
+            Self::TemporaryDirectoryUnavailable(_) | Self::WaitFailed { .. } => {
+                ActionFailureKind::TransientFailure
+            }
+            _ => ActionFailureKind::InvalidArguments,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,6 +904,10 @@ mod tests {
 
         assert!(output.timed_out);
         assert!(!output.success);
+        assert_eq!(
+            output.action_result().failure_kind,
+            Some(ActionFailureKind::TimedOut)
+        );
     }
 
     #[cfg(unix)]
@@ -890,6 +964,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
         let runner = runner(&workspace, Duration::from_secs(2), 1_024);
+
+        let blocked = runner.run(request("rm", &[])).await.unwrap_err();
+        assert_eq!(blocked.failure_kind(), ActionFailureKind::PolicyBlocked);
 
         for blocked in ["sh", "git", "rm", "sudo", "curl"] {
             assert!(matches!(

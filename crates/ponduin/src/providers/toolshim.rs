@@ -386,21 +386,57 @@ fn parse_inline_json_tool_calls(content: &str, tools: &[Tool]) -> Vec<CallToolRe
         };
 
         if let Some(value) = parse_json_value_tolerant(json_obj) {
-            let maybe_name = value.get("name").and_then(Value::as_str);
-            let maybe_args = value.get("arguments").and_then(Value::as_object);
-            if let (Some(raw_name), Some(arguments)) = (maybe_name, maybe_args) {
-                if let Some(tool_name) = resolve_tool_name(raw_name, tools) {
-                    calls.push(
-                        CallToolRequestParams::new(tool_name).with_arguments(arguments.clone()),
-                    );
-                }
-            }
+            collect_inline_json_tool_calls(&value, tools, &mut calls);
         }
 
         remainder = &maybe_json[consumed_len..];
     }
 
     calls
+}
+
+fn collect_inline_json_tool_calls(
+    value: &Value,
+    tools: &[Tool],
+    calls: &mut Vec<CallToolRequestParams>,
+) {
+    match value {
+        Value::Object(object) => {
+            let raw_name = object
+                .get("name")
+                .or_else(|| object.get("command"))
+                .and_then(Value::as_str);
+            let arguments = object.get("arguments").and_then(Value::as_object);
+
+            if let (Some(raw_name), Some(arguments)) = (raw_name, arguments) {
+                if let Some(tool_name) = resolve_tool_name(raw_name, tools) {
+                    let is_duplicate = calls.iter().any(|call| {
+                        call.name == tool_name
+                            && call
+                                .arguments
+                                .as_ref()
+                                .is_some_and(|existing| existing == arguments)
+                    });
+                    if !is_duplicate {
+                        calls.push(
+                            CallToolRequestParams::new(tool_name).with_arguments(arguments.clone()),
+                        );
+                    }
+                    return;
+                }
+            }
+
+            for nested in object.values() {
+                collect_inline_json_tool_calls(nested, tools, calls);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                collect_inline_json_tool_calls(nested, tools, calls);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::string_slice)] // Marker constants are ASCII; byte indexing is safe.
@@ -465,7 +501,8 @@ fn sanitize_message_after_json_tool_parse(mut message: Message) -> Message {
         if let MessageContent::Text(text) = content {
             let lower = text.text.to_ascii_lowercase();
             let looks_like_tool_directive = lower.contains("using tool:")
-                || (text.text.contains("\"name\"") && text.text.contains("\"arguments\""));
+                || (text.text.contains("\"arguments\"")
+                    && (text.text.contains("\"name\"") || text.text.contains("\"command\"")));
 
             if looks_like_tool_directive {
                 text.text.clear();
@@ -479,6 +516,40 @@ fn sanitize_message_after_json_tool_parse(mut message: Message) -> Message {
     });
 
     message
+}
+
+pub fn augment_message_with_direct_tool_calls(message: Message, tools: &[Tool]) -> Option<Message> {
+    if tools.is_empty() {
+        return None;
+    }
+
+    let content = message
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            MessageContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let direct_tool_calls = parse_tokenized_tool_calls(&content, tools);
+    if !direct_tool_calls.is_empty() {
+        return Some(append_tool_calls_to_message(
+            sanitize_message_after_tokenized_parse(message),
+            direct_tool_calls,
+        ));
+    }
+
+    let inline_json_tool_calls = parse_inline_json_tool_calls(&content, tools);
+    if !inline_json_tool_calls.is_empty() {
+        return Some(append_tool_calls_to_message(
+            sanitize_message_after_json_tool_parse(message),
+            inline_json_tool_calls,
+        ));
+    }
+
+    None
 }
 
 /// Returns `true` if the text contains any raw tool-use markers that should
@@ -497,7 +568,9 @@ fn has_tool_markers(text: &str) -> bool {
             return true;
         }
     }
-    lower.contains("using tool:") || (text.contains("\"name\"") && text.contains("\"arguments\""))
+    lower.contains("using tool:")
+        || (text.contains("\"arguments\"")
+            && (text.contains("\"name\"") || text.contains("\"command\"")))
 }
 
 /// Catch-all sanitization applied to every message leaving the toolshim
@@ -994,19 +1067,8 @@ pub async fn augment_message_with_tool_calls<T: ToolInterpreter>(
         .iter()
         .any(|content| matches!(content, MessageContent::ToolRequest(_)));
 
-    let direct_tool_calls = parse_tokenized_tool_calls(&content, tools);
-    if !direct_tool_calls.is_empty() {
-        let cleaned = sanitize_message_after_tokenized_parse(message);
-        return Ok(append_tool_calls_to_message(cleaned, direct_tool_calls));
-    }
-
-    let inline_json_tool_calls = parse_inline_json_tool_calls(&content, tools);
-    if !inline_json_tool_calls.is_empty() {
-        let cleaned = sanitize_message_after_json_tool_parse(message);
-        return Ok(append_tool_calls_to_message(
-            cleaned,
-            inline_json_tool_calls,
-        ));
+    if let Some(message) = augment_message_with_direct_tool_calls(message.clone(), tools) {
+        return Ok(message);
     }
 
     if has_existing_tool_request {
@@ -1167,6 +1229,43 @@ mod tests {
                 .and_then(|a| a.get("command"))
                 .and_then(|v| v.as_str()),
             Some("type Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn parses_an_exposed_command_from_a_structured_plan() {
+        let tools = vec![Tool::new(
+            "coding__workflow_start".to_string(),
+            "Start the coding workflow".to_string(),
+            serde_json::Map::new(),
+        )];
+
+        let content = r#"{
+          "objective": "create a small file",
+          "tasks": [
+            {
+              "description": "start the workflow",
+              "command": "coding__workflow_start",
+              "arguments": { "objective": "create progress_check.py" }
+            },
+            {
+              "description": "invented helper",
+              "command": "coding__workflow_run",
+              "arguments": {}
+            }
+          ]
+        }"#;
+        let calls = parse_inline_json_tool_calls(content, &tools);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "coding__workflow_start");
+        assert_eq!(
+            calls[0]
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("objective"))
+                .and_then(Value::as_str),
+            Some("create progress_check.py")
         );
     }
 

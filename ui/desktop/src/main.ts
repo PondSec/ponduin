@@ -61,6 +61,10 @@ if (process.env.PONDUIN_E2E_USER_DATA_DIR) {
 }
 
 function shouldSetupUpdater(): boolean {
+  if (process.env.PONDUIN_E2E_USER_DATA_DIR) {
+    return false;
+  }
+
   // Setup updater if either the flag is enabled OR dev updates are enabled
   return UPDATES_ENABLED || process.env.ENABLE_DEV_UPDATES === 'true';
 }

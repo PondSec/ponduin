@@ -1,4 +1,8 @@
 use crate::coding::config::CodingConfig;
+use crate::coding::outcome::{
+    action_result_from_error, decide_recovery, error_with_action, ActionFailureKind, ActionResult,
+    RecoveryDecision,
+};
 use crate::coding::strategy::MODEL_ROUTING_GUIDANCE;
 use crate::coding::tools;
 use crate::coding::{CodingWorkspace, ModelCapabilityProfile, TaskInteractionMode};
@@ -9,13 +13,23 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool,
 };
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+const MAX_IDLE_SESSION_TOOL_STATES: usize = 32;
 
 /// Internal coding capability owned directly by the main agent.
 #[derive(Debug, Clone)]
 pub struct CodingAgent {
     config: CodingConfig,
+    tool_state: Arc<tools::CodingToolState>,
+    session_tool_states: Arc<Mutex<VecDeque<SessionToolState>>>,
+}
+
+#[derive(Debug)]
+struct SessionToolState {
+    session_id: String,
     tool_state: Arc<tools::CodingToolState>,
 }
 
@@ -24,7 +38,41 @@ impl CodingAgent {
         Self {
             config,
             tool_state: Arc::new(tools::CodingToolState::default()),
+            session_tool_states: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    fn tool_state_for_session(&self, session_id: &str) -> Arc<tools::CodingToolState> {
+        let mut states = self
+            .session_tool_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(position) = states
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            if let Some(entry) = states.remove(position) {
+                let tool_state = Arc::clone(&entry.tool_state);
+                states.push_back(entry);
+                return tool_state;
+            }
+        }
+        let tool_state = Arc::new(tools::CodingToolState::default());
+        states.push_back(SessionToolState {
+            session_id: session_id.to_string(),
+            tool_state: Arc::clone(&tool_state),
+        });
+        while states.len() > MAX_IDLE_SESSION_TOOL_STATES {
+            let newest_state = states.len() - 1;
+            let Some(position) = states.iter().enumerate().find_map(|(position, entry)| {
+                (position != newest_state && !entry.tool_state.has_active_task_state())
+                    .then_some(position)
+            }) else {
+                break;
+            };
+            states.remove(position);
+        }
+        tool_state
     }
 
     pub fn config(&self) -> &CodingConfig {
@@ -49,28 +97,106 @@ impl CodingAgent {
         working_dir: &Path,
         model_config: &ModelConfig,
     ) -> Vec<Tool> {
+        self.tools_for_workspace_for_model_with_state(
+            &self.tool_state,
+            ponduin_mode,
+            working_dir,
+            model_config,
+        )
+    }
+
+    pub(crate) fn tools_for_workspace_for_model_for_session(
+        &self,
+        session_id: &str,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        model_config: &ModelConfig,
+    ) -> Vec<Tool> {
+        let tool_state = self.tool_state_for_session(session_id);
+        self.tools_for_workspace_for_model_with_state(
+            &tool_state,
+            ponduin_mode,
+            working_dir,
+            model_config,
+        )
+    }
+
+    fn tools_for_workspace_for_model_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        model_config: &ModelConfig,
+    ) -> Vec<Tool> {
         if !self.available(ponduin_mode) {
             return Vec::new();
         }
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return tools::definitions();
         };
-        if uses_compact_qwen_coding_tools(model_config) {
-            self.tool_state
-                .compact_native_definitions_for_workspace(workspace.root())
+        let tools = if uses_compact_qwen_coding_tools(model_config) {
+            tool_state.compact_native_definitions_for_workspace(workspace.root())
         } else {
-            self.tool_state.definitions_for_workspace(workspace.root())
-        }
+            tool_state.definitions_for_workspace(workspace.root())
+        };
+        tool_state.remember_model_tool_surface(workspace.root(), &tools);
+        tools
     }
 
     pub fn workflow_guidance(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state
-            .workflow_guidance_for_workspace(workspace.root())
+        self.workflow_guidance_for_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn workflow_guidance_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.workflow_guidance_for_state(&self.tool_state_for_session(session_id), working_dir)
+    }
+
+    fn workflow_guidance_for_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.workflow_guidance_for_workspace(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn register_task_context(
         &self,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        original_user_request: String,
+    ) {
+        self.register_task_context_with_state(
+            &self.tool_state,
+            ponduin_mode,
+            working_dir,
+            original_user_request,
+        );
+    }
+
+    pub(crate) fn register_task_context_for_session(
+        &self,
+        session_id: &str,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        original_user_request: String,
+    ) {
+        self.register_task_context_with_state(
+            &self.tool_state_for_session(session_id),
+            ponduin_mode,
+            working_dir,
+            original_user_request,
+        );
+    }
+
+    fn register_task_context_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
         ponduin_mode: PonduinMode,
         working_dir: &Path,
         original_user_request: String,
@@ -83,7 +209,7 @@ impl CodingAgent {
             PonduinMode::Approve | PonduinMode::SmartApprove => TaskInteractionMode::Ask,
             PonduinMode::Auto => TaskInteractionMode::Autonomous,
         };
-        if let Err(error) = self.tool_state.register_task_context(
+        if let Err(error) = tool_state.register_task_context(
             workspace.root(),
             original_user_request,
             interaction_mode,
@@ -92,46 +218,178 @@ impl CodingAgent {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn recovery_instruction(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.recovery_instruction(workspace.root())
+        self.recovery_instruction_with_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn recovery_instruction_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.recovery_instruction_with_state(&self.tool_state_for_session(session_id), working_dir)
+    }
+
+    fn recovery_instruction_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.recovery_instruction(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn recovery_exhausted_message(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.recovery_exhausted_message(workspace.root())
+        self.recovery_exhausted_message_with_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn recovery_exhausted_message_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.recovery_exhausted_message_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn recovery_exhausted_message_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.recovery_exhausted_message(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn active_workflow_continuation(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state
-            .active_workflow_continuation(workspace.root())
+        self.active_workflow_continuation_with_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn active_workflow_continuation_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.active_workflow_continuation_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn active_workflow_continuation_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.active_workflow_continuation(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn workflow_continuation(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.workflow_continuation(workspace.root())
+        self.workflow_continuation_with_state(&self.tool_state, working_dir)
     }
 
-    pub(crate) fn next_action_thinking_effort(&self, working_dir: &Path) -> ThinkingEffort {
+    pub(crate) fn workflow_continuation_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.workflow_continuation_with_state(&self.tool_state_for_session(session_id), working_dir)
+    }
+
+    fn workflow_continuation_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.workflow_continuation(workspace.root())
+    }
+
+    pub(crate) fn next_action_thinking_effort_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> ThinkingEffort {
+        self.next_action_thinking_effort_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn next_action_thinking_effort_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> ThinkingEffort {
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return ThinkingEffort::Off;
         };
-        self.tool_state
-            .next_action_thinking_effort(workspace.root())
+        tool_state.next_action_thinking_effort(workspace.root())
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal_workflow_message(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.terminal_workflow_message(workspace.root())
+        self.terminal_workflow_message_with_state(&self.tool_state, working_dir)
     }
 
-    pub(crate) fn block_for_action_limit(&self, working_dir: &Path, limit: u32) {
+    pub(crate) fn terminal_workflow_message_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.terminal_workflow_message_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn terminal_workflow_message_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.terminal_workflow_message(workspace.root())
+    }
+
+    pub(crate) fn block_for_action_limit_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+        limit: u32,
+    ) {
+        self.block_for_action_limit_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+            limit,
+        );
+    }
+
+    fn block_for_action_limit_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+        limit: u32,
+    ) {
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return;
         };
-        self.tool_state
-            .block_for_action_limit(workspace.root(), limit);
+        tool_state.block_for_action_limit(workspace.root(), limit);
+    }
+
+    pub(crate) fn cancel_active_workflow_for_session(&self, session_id: &str, working_dir: &Path) {
+        let Ok(workspace) = CodingWorkspace::new(working_dir) else {
+            return;
+        };
+        self.tool_state_for_session(session_id)
+            .cancel_active_workflow(workspace.root());
     }
 
     pub fn routing_tools(&self, ponduin_mode: PonduinMode) -> Vec<Tool> {
@@ -255,6 +513,38 @@ impl CodingAgent {
     pub async fn execute(
         &self,
         ponduin_mode: PonduinMode,
+        tool_call: CallToolRequestParams,
+        working_dir: &Path,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.execute_with_tool_state(
+            Arc::clone(&self.tool_state),
+            ponduin_mode,
+            tool_call,
+            working_dir,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_for_session(
+        &self,
+        session_id: &str,
+        ponduin_mode: PonduinMode,
+        tool_call: CallToolRequestParams,
+        working_dir: &Path,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.execute_with_tool_state(
+            self.tool_state_for_session(session_id),
+            ponduin_mode,
+            tool_call,
+            working_dir,
+        )
+        .await
+    }
+
+    async fn execute_with_tool_state(
+        &self,
+        tool_state: Arc<tools::CodingToolState>,
+        ponduin_mode: PonduinMode,
         mut tool_call: CallToolRequestParams,
         working_dir: &Path,
     ) -> Result<CallToolResult, ErrorData> {
@@ -281,35 +571,63 @@ impl CodingAgent {
         }
         let workspace = CodingWorkspace::new(working_dir)
             .map_err(|error| ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None))?;
-        self.fill_missing_workflow_objective(&mut tool_call, workspace.root());
+        self.fill_missing_workflow_objective(&tool_state, &mut tool_call, workspace.root());
         normalize_structured_tool_arguments(&mut tool_call);
-        let exposed = self.tool_state.definitions_for_workspace(workspace.root());
+        let action_arguments = tool_call.arguments.clone();
+        let exposed = tool_state.definitions_for_workspace(workspace.root());
         if !exposed.iter().any(|tool| tool.name == tool_call.name) {
             let next_tools = exposed
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(self.with_contract_recovery(
+            return Err(self.with_recovery_decision(
+                &tool_state,
                 workspace.root(),
                 tool_call.name.as_ref(),
-                ErrorData::new(
+                action_arguments.as_ref(),
+                false,
+                error_with_action(
                     ErrorCode::INVALID_PARAMS,
                     format!(
                     "internal coding tool `{}` is not currently allowed by the active workflow; \
                      choose one of: {next_tools}",
                     tool_call.name
                 ),
-                    None,
+                    ActionResult::failed(ActionFailureKind::WorkflowStateViolation, false),
                 ),
             ));
         }
+        let selection = tool_state.action_selection_for(
+            workspace.root(),
+            tool_call.name.as_ref(),
+            action_arguments.as_ref(),
+        );
+        if let Some(selection) = &selection {
+            if !selection.allowed {
+                let failure_kind = selection
+                    .blocked_by
+                    .unwrap_or(ActionFailureKind::RepeatedFailure);
+                return Err(self.with_recovery_decision(
+                    &tool_state,
+                    workspace.root(),
+                    tool_call.name.as_ref(),
+                    action_arguments.as_ref(),
+                    false,
+                    error_with_action(
+                        ErrorCode::INVALID_PARAMS,
+                        "the runtime action history requires a distinct selected strategy before this action can run",
+                        ActionResult::failed(failure_kind, false),
+                    ),
+                ));
+            }
+        }
         let tool_name = tool_call.name.to_string();
         let result = if tools::is_async_tool(&tool_call.name) {
-            tools::execute_async(&self.config, &self.tool_state, tool_call, working_dir).await
+            tools::execute_async(&self.config, &tool_state, tool_call, working_dir).await
         } else {
             let config = self.config.clone();
-            let tool_state = Arc::clone(&self.tool_state);
+            let tool_state = Arc::clone(&tool_state);
             let working_dir = PathBuf::from(working_dir);
             tokio::task::spawn_blocking(move || {
                 tools::execute_with_state(&config, &tool_state, tool_call, &working_dir)
@@ -323,101 +641,66 @@ impl CodingAgent {
                 )
             })?
         };
-        result.map_err(|error| self.with_contract_recovery(workspace.root(), &tool_name, error))
+        match result {
+            Ok(result) => {
+                if let Some(selection) = &selection {
+                    tool_state.record_successful_action(
+                        workspace.root(),
+                        &tool_name,
+                        action_arguments.as_ref(),
+                        selection,
+                    );
+                }
+                Ok(result)
+            }
+            Err(error) => Err(self.with_recovery_decision(
+                &tool_state,
+                workspace.root(),
+                &tool_name,
+                action_arguments.as_ref(),
+                true,
+                error,
+            )),
+        }
     }
 
-    fn with_contract_recovery(
+    fn with_recovery_decision(
         &self,
+        tool_state: &tools::CodingToolState,
         workspace_root: &Path,
         tool_name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+        action_was_dispatched: bool,
         error: ErrorData,
     ) -> ErrorData {
-        if error.code != ErrorCode::INVALID_PARAMS {
+        let mut action = action_result_from_error(&error);
+        let Some(failure_kind) = action.failure_kind else {
             return error;
+        };
+        if action_was_dispatched {
+            tool_state.record_failed_action(workspace_root, tool_name, arguments, action.clone());
         }
-        let repetitions = self
-            .tool_state
-            .record_tool_contract_failure(
-                workspace_root,
-                tool_name,
-                contract_failure_class(tool_name, &error.message),
-            )
+        let repetitions = tool_state
+            .record_action_failure(workspace_root, tool_name, failure_kind)
             .unwrap_or(1);
-        let workflow_hint = self
-            .tool_state
+        let selection = tool_state.action_selection_for(workspace_root, tool_name, arguments);
+        let workflow_hint = tool_state
             .active_workflow_id(workspace_root)
             .map(|workflow_id| format!(" Current workflow ID: `{workflow_id}`."))
             .unwrap_or_default();
-        let next_step_guidance = self
-            .tool_state
-            .workflow_guidance_for_workspace(workspace_root);
-        let recovery = match repetitions {
-            1 if error.message.contains("not currently allowed") => {
-                next_step_guidance.as_deref().unwrap_or(
-                    "The request was blocked. Read the active workflow status and take its next allowed step before retrying.",
-                )
-            }
-            1 if is_versioned_mutation_tool(tool_name)
-                && (error.message.contains("missing field `expected_digest`")
-                    || error.message.contains("digest conflict")
-                    || error.message.contains("file already exists")) => {
-                "Read the existing file with coding__read_file first, then retry the write with the exact expected_digest returned for that path."
-            }
-            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-                && error.message.contains("missing field `changes`") => {
-                "Apply changes requires a non-empty changes array. Read the target file for its current digest, then send one write change with operation, path, content, and that exact expected_digest."
-            }
-            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-                && error.message.contains("expected a sequence") => {
-                "The changes field must be a JSON array, not a quoted JSON string. Send changes: [{\"operation\":\"create\",\"path\":\"index.html\",\"content\":\"...\"}] directly, without JSON.stringify or extra quotes."
-            }
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("expected a sequence") => {
-                "The compact plan fields relevant_files, plan_steps, and args must be JSON arrays, never a formatted text block. Send intended_change as one plain sentence and send plan_steps: [\"Create index.html\",\"Style the page\",\"Add the button behavior\"] directly in the tool arguments."
-            }
-            1 if tool_name == tools::FIND_FILES_TOOL_NAME
-                && error.message.contains("search query must not be empty") => {
-                "Find-files requires a non-empty query. Search for a known filename such as \"lib.rs\" or a relevant symbol, never an empty string."
-            }
-            1 if tool_name == tools::WORKFLOW_START_TOOL_NAME
-                && error.message.contains("missing field `objective`") => {
-                "Start the workflow with a non-empty objective field, for example {\"objective\":\"Repair normalize_label in lib.rs so cargo test passes\"}."
-            }
-            1 if tool_name == tools::READ_FILE_TOOL_NAME
-                && error.message.contains("expected path string") => {
-                "The read path must be a plain string, for example {\"path\":\"lib.rs\"}. Do not wrap path in an object."
-            }
-            1 if error.message.contains("requested path is unavailable") => match tool_name {
-                tools::REPOSITORY_INSTRUCTIONS_TOOL_NAME => {
-                    "Repository-instructions accepts one existing workspace-relative path. Retry it with no path to inspect the workspace root, or supply exactly one existing relative path; never use /workspace or a comma-separated list."
-                }
-                tools::READ_FILE_TOOL_NAME => {
-                    "The file does not exist. Do not guess paths; call coding__find_files, then read only one returned workspace-relative file path."
-                }
-                _ => {
-                    "Use exactly one existing workspace-relative path, never /workspace or a comma-separated list. Call coding__find_files first if the path is unknown."
-                }
-            },
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("expected struct WorkflowPlan") => {
-                "The plan argument must be a JSON object, not serialized JSON inside a string. Use plan: {...}; use command program \"cargo\" with args [\"test\"]."
-            }
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("invalid workflow plan path") => {
-                "Plan relevant_files must contain individual workspace-relative files, never a directory or an absolute path. Use a returned file path such as src/lib.rs."
-            }
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("plan field `intended changes`") => {
-                "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"] with the current workflow_id."
-            }
-            1 => "The request was not executed. Correct the tool name and arguments from the currently exposed schema before retrying.",
-            2 => "Do not repeat this tool contract. Call coding__find_files with one concrete filename or symbol next, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
-            _ => "The workflow is now blocked after repeated identical tool-contract failures. Report the recorded stop reason and do not claim success.",
-        };
+        let mut recovery_context = tool_state.recovery_context(workspace_root);
+        recovery_context.repetitions = repetitions;
+        let decision = decide_recovery(failure_kind, recovery_context);
+        action.recovery_decision = Some(decision);
+        let recovery = recovery_guidance(decision, failure_kind);
         ErrorData::new(
             error.code,
             format!("{}{} Recovery: {recovery}", error.message, workflow_hint),
-            None,
+            Some(serde_json::json!({
+                "action": action,
+                "recovery_decision": decision,
+                "action_selection": selection,
+            })),
         )
     }
 
@@ -427,6 +710,7 @@ impl CodingAgent {
 
     fn fill_missing_workflow_objective(
         &self,
+        tool_state: &tools::CodingToolState,
         tool_call: &mut CallToolRequestParams,
         workspace_root: &Path,
     ) {
@@ -442,7 +726,7 @@ impl CodingAgent {
         if has_objective {
             return;
         }
-        let Some(task) = self.tool_state.pending_task_context(workspace_root) else {
+        let Some(task) = tool_state.pending_task_context(workspace_root) else {
             return;
         };
         tool_call
@@ -510,39 +794,45 @@ fn normalize_structured_tool_arguments(tool_call: &mut CallToolRequestParams) {
     }
 }
 
-fn contract_failure_class(tool_name: &str, message: &str) -> &'static str {
-    if message.contains("not currently allowed") {
-        "workflow_phase"
-    } else if is_versioned_mutation_tool(tool_name)
-        && message.contains("missing field `expected_digest`")
-    {
-        "missing_digest"
-    } else if is_versioned_mutation_tool(tool_name) && message.contains("digest conflict") {
-        "stale_digest"
-    } else if is_versioned_mutation_tool(tool_name) && message.contains("file already exists") {
-        "missing_digest"
-    } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-        && message.contains("missing field `changes`")
-    {
-        "missing_changes"
-    } else if message.contains("requested path is unavailable") {
-        "unavailable_path"
-    } else if message.contains("missing field `objective`") {
-        "missing_objective"
-    } else if message.contains("expected path string") {
-        "malformed_path"
-    } else if message.contains("search query must not be empty") {
-        "empty_file_query"
-    } else {
-        "invalid_tool_contract"
+fn recovery_guidance(decision: RecoveryDecision, failure_kind: ActionFailureKind) -> &'static str {
+    match decision {
+        RecoveryDecision::RetryWithCorrectedArguments => {
+            "The action was not executed. Correct the arguments against the currently exposed schema before retrying."
+        }
+        RecoveryDecision::RefreshState => {
+            "Refresh the current workspace state with a bounded read before retrying this action."
+        }
+        RecoveryDecision::ReinspectResource => {
+            "Reinspect the workspace and use only a discovered resource path before trying again."
+        }
+        RecoveryDecision::InspectDiagnostics => {
+            "Inspect the retained diagnostics, then make a targeted repair before validating again."
+        }
+        RecoveryDecision::Replan => {
+            "Read the active workflow status and take its currently allowed next action; do not repeat this phase violation."
+        }
+        RecoveryDecision::UseAlternativeCapability => {
+            "Use an available alternative capability from the current tool surface instead of retrying the unavailable action."
+        }
+        RecoveryDecision::ChangeStrategy => {
+            "A changed repair strategy is required before another attempt; do not repeat the same failing action."
+        }
+        RecoveryDecision::RequestApproval => {
+            "The action needs explicit approval before it can continue."
+        }
+        RecoveryDecision::StopBlocked => {
+            "This action is blocked by the available capability or policy. Report the factual blocker without retrying it."
+        }
+        RecoveryDecision::StopCancelled => {
+            "The workflow was cancelled and must not be resumed automatically."
+        }
+        RecoveryDecision::StopFailed => match failure_kind {
+            ActionFailureKind::RepeatedFailure => {
+                "The repeated failure reached a terminal workflow state. Report the retained evidence and do not claim completion."
+            }
+            _ => "The workflow reached a terminal state. Report the retained evidence and do not claim completion.",
+        },
     }
-}
-
-fn is_versioned_mutation_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        tools::APPLY_CHANGES_TOOL_NAME | tools::WRITE_FILE_TOOL_NAME
-    )
 }
 
 fn uses_compact_qwen_coding_tools(model_config: &ModelConfig) -> bool {
@@ -563,6 +853,21 @@ mod tests {
 
     fn enabled_agent() -> CodingAgent {
         CodingAgent::new(CodingConfig::default())
+    }
+
+    fn failure_kind(error: &ErrorData) -> ActionFailureKind {
+        action_result_from_error(error)
+            .failure_kind
+            .expect("coding action errors must carry a failure kind")
+    }
+
+    fn recovery_decision(error: &ErrorData) -> RecoveryDecision {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("recovery_decision"))
+            .and_then(|decision| serde_json::from_value(decision.clone()).ok())
+            .expect("coding action errors must carry a recovery decision")
     }
 
     #[test]
@@ -650,6 +955,281 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_scoped_workflows_do_not_share_task_or_cancellation_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let first_session = "session-first";
+        let second_session = "session-second";
+
+        agent.register_task_context_for_session(
+            first_session,
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Create first-session.txt.".to_string(),
+        );
+        agent.register_task_context_for_session(
+            second_session,
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Create second-session.txt.".to_string(),
+        );
+
+        let first = agent
+            .execute_for_session(
+                first_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let second = agent
+            .execute_for_session(
+                second_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&first.content[0].as_text().unwrap().text).unwrap();
+        let second: Value =
+            serde_json::from_str(&second.content[0].as_text().unwrap().text).unwrap();
+
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(first["objective"], "Create first-session.txt.");
+        assert_eq!(second["objective"], "Create second-session.txt.");
+
+        agent.cancel_active_workflow_for_session(first_session, temp_dir.path());
+
+        assert!(agent
+            .workflow_guidance_for_session(first_session, temp_dir.path())
+            .unwrap()
+            .contains("was cancelled"));
+        assert!(agent
+            .workflow_guidance_for_session(second_session, temp_dir.path())
+            .unwrap()
+            .contains("Analyzing"));
+        assert!(agent
+            .active_workflow_continuation_for_session(first_session, temp_dir.path())
+            .is_none());
+        assert!(agent
+            .active_workflow_continuation_for_session(second_session, temp_dir.path())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn session_scoped_workflows_do_not_share_action_history() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("fixture.txt"), "fixture\n").unwrap();
+        let agent = enabled_agent();
+        let first_session = "history-first";
+        let second_session = "history-second";
+
+        for session_id in [first_session, second_session] {
+            agent
+                .execute_for_session(
+                    session_id,
+                    PonduinMode::Auto,
+                    CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                        .with_arguments(object!({"objective": "inspect fixture.txt"})),
+                    temp_dir.path(),
+                )
+                .await
+                .unwrap();
+        }
+        agent
+            .execute_for_session(
+                first_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::READ_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": "fixture.txt"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let first_status = agent
+            .execute_for_session(
+                first_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let second_status = agent
+            .execute_for_session(
+                second_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let first_status: Value =
+            serde_json::from_str(&first_status.content[0].as_text().unwrap().text).unwrap();
+        let second_status: Value =
+            serde_json::from_str(&second_status.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(
+            first_status["memory"]["action_attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(second_status["memory"]["action_attempts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_mutation_history_requires_a_read_before_the_runtime_allows_a_retry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("lib.rs");
+        fs::write(&path, "pub fn label() {}\n").unwrap();
+        let agent = enabled_agent();
+        begin_editing_workflow(
+            &agent,
+            temp_dir.path(),
+            "repair lib.rs",
+            vec!["lib.rs".to_string()],
+        )
+        .await;
+        let snapshot = read_snapshot(&agent, temp_dir.path(), "lib.rs").await;
+        fs::write(&path, "pub fn label() { println!(\"changed\"); }\n").unwrap();
+        let stale_write = CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME)
+            .with_arguments(object!({
+                "changes": [{
+                    "operation": "write",
+                    "path": "lib.rs",
+                    "expected_digest": snapshot["digest"],
+                    "content": "pub fn label() { println!(\"fixed\"); }\n"
+                }]
+            }));
+
+        let stale = agent
+            .execute(PonduinMode::Auto, stale_write.clone(), temp_dir.path())
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&stale), ActionFailureKind::StaleState);
+        assert_eq!(recovery_decision(&stale), RecoveryDecision::RefreshState);
+        let after_stale = execute_json(
+            &agent,
+            temp_dir.path(),
+            CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                .with_arguments(object!({})),
+        )
+        .await;
+        let stale_mutation_attempts = after_stale["memory"]["action_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|attempt| attempt["capability"] == tools::APPLY_CHANGES_TOOL_NAME)
+            .count();
+
+        let blocked = agent
+            .execute(PonduinMode::Auto, stale_write, temp_dir.path())
+            .await
+            .unwrap_err();
+        let selection = blocked
+            .data
+            .as_ref()
+            .and_then(|data| data.get("action_selection"))
+            .expect("strategy selection is returned with the blocked action");
+        assert_eq!(selection["action"], "inspect");
+        assert_eq!(selection["strategy"], "refresh_then_mutate");
+        assert_eq!(selection["allowed"], false);
+        let after_blocked = execute_json(
+            &agent,
+            temp_dir.path(),
+            CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                .with_arguments(object!({})),
+        )
+        .await;
+        assert_eq!(
+            after_blocked["memory"]["action_attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|attempt| attempt["capability"] == tools::APPLY_CHANGES_TOOL_NAME)
+                .count(),
+            stale_mutation_attempts
+        );
+
+        let refreshed = read_snapshot(&agent, temp_dir.path(), "lib.rs").await;
+        let repaired = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(
+                    object!({
+                        "changes": [{
+                            "operation": "write",
+                            "path": "lib.rs",
+                            "expected_digest": refreshed["digest"],
+                            "content": "pub fn label() { println!(\"fixed\"); }\n"
+                        }]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert!(!repaired.is_error.unwrap_or(false));
+        let status = execute_json(
+            &agent,
+            temp_dir.path(),
+            CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                .with_arguments(object!({})),
+        )
+        .await;
+        assert!(status["memory"]["action_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| {
+                attempt["capability"] == tools::APPLY_CHANGES_TOOL_NAME
+                    && attempt["strategy"] == serde_json::json!("refresh_then_mutate")
+                    && attempt["result"]["outcome"] == serde_json::json!("succeeded")
+            }));
+    }
+
+    #[test]
+    fn incomplete_session_state_is_not_evicted_at_capacity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+
+        for index in 0..=MAX_IDLE_SESSION_TOOL_STATES {
+            agent.register_task_context_for_session(
+                &format!("session-{index}"),
+                PonduinMode::Auto,
+                temp_dir.path(),
+                format!("Create fixture-{index}.txt."),
+            );
+        }
+
+        let states = agent
+            .session_tool_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(states.len(), MAX_IDLE_SESSION_TOOL_STATES + 1);
+        let first = states
+            .iter()
+            .find(|entry| entry.session_id == "session-0")
+            .unwrap();
+        assert!(first
+            .tool_state
+            .pending_task_context(workspace.root())
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn recovery_uses_the_host_retained_task_instead_of_requesting_resubmission() {
         let temp_dir = tempfile::tempdir().unwrap();
         let agent = enabled_agent();
@@ -700,10 +1280,10 @@ mod tests {
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
 
         for _ in 0..3 {
-            agent.tool_state.record_tool_contract_failure(
+            agent.tool_state.record_action_failure(
                 workspace.root(),
                 tools::WORKFLOW_SET_PLAN_TOOL_NAME,
-                "invalid_tool_contract",
+                ActionFailureKind::InvalidArguments,
             );
         }
 
@@ -748,19 +1328,43 @@ mod tests {
             .await
             .unwrap();
 
+        let write =
+            CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
+                "changes": [{
+                    "operation": "create",
+                    "path": "lib.rs",
+                    "content": "pub fn label() {}\n"
+                }]
+            }));
         let error = agent
-            .execute(
-                PonduinMode::Auto,
-                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME)
-                    .with_arguments(object!({"changes": []})),
-                temp_dir.path(),
-            )
+            .execute(PonduinMode::Auto, write.clone(), temp_dir.path())
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("The plan is accepted"));
-        assert!(error.message.contains("coding__workflow_transition"));
-        assert!(error.message.contains("begin_editing"));
+        assert_eq!(
+            failure_kind(&error),
+            ActionFailureKind::WorkflowStateViolation
+        );
+        assert_eq!(recovery_decision(&error), RecoveryDecision::Replan);
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_TRANSITION_TOOL_NAME).with_arguments(
+                    object!({
+                        "workflow_id": started["id"].as_str().unwrap(),
+                        "transition": "begin_editing"
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let applied = agent
+            .execute(PonduinMode::Auto, write, temp_dir.path())
+            .await
+            .unwrap();
+        assert!(!applied.is_error.unwrap_or(false));
     }
 
     #[tokio::test]
@@ -798,10 +1402,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error
-            .message
-            .contains("intended_change must be one non-empty sentence"));
-        assert!(error.message.contains("validation_program \"cargo\""));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -817,10 +1422,10 @@ mod tests {
         )
         .await;
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
-        agent.tool_state.record_tool_contract_failure(
+        agent.tool_state.record_action_failure(
             workspace.root(),
             tools::APPLY_CHANGES_TOOL_NAME,
-            "workflow_phase",
+            ActionFailureKind::WorkflowStateViolation,
         );
 
         let error = agent
@@ -840,9 +1445,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("missing field `expected_digest`"));
-        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
-        assert!(error.message.contains("expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -870,9 +1477,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("file already exists"));
-        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
-        assert!(error.message.contains("expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::StaleState);
+        assert_eq!(recovery_decision(&error), RecoveryDecision::RefreshState);
     }
 
     #[tokio::test]
@@ -889,10 +1495,10 @@ mod tests {
         .await;
 
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
-        agent.tool_state.record_tool_contract_failure(
+        agent.tool_state.record_action_failure(
             workspace.root(),
             tools::APPLY_CHANGES_TOOL_NAME,
-            "workflow_phase",
+            ActionFailureKind::WorkflowStateViolation,
         );
 
         let error = agent
@@ -911,13 +1517,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error.message.contains("digest conflict"),
-            "{}",
-            error.message
-        );
-        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
-        assert!(error.message.contains("exact expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::StaleState);
+        assert_eq!(recovery_decision(&error), RecoveryDecision::RefreshState);
     }
 
     #[tokio::test]
@@ -943,9 +1544,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("missing field `changes`"));
-        assert!(error.message.contains("non-empty changes array"));
-        assert!(error.message.contains("expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1041,9 +1644,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("expected a sequence"));
-        assert!(error.message.contains("compact plan fields relevant_files"));
-        assert!(error.message.contains("formatted text block"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1140,8 +1745,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("missing field `objective`"));
-        assert!(error.message.contains("Repair normalize_label in lib.rs"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1169,8 +1777,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("Do not guess paths"));
-        assert!(error.message.contains(tools::FIND_FILES_TOOL_NAME));
+        assert_eq!(failure_kind(&error), ActionFailureKind::ResourceMissing);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::ReinspectResource
+        );
     }
 
     #[tokio::test]
@@ -1198,8 +1809,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("with no path"));
-        assert!(error.message.contains("comma-separated list"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1227,8 +1841,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("non-empty query"));
-        assert!(error.message.contains("lib.rs"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1256,8 +1873,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("plain string"));
-        assert!(error.message.contains("\"path\":\"lib.rs\""));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1285,8 +1905,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("JSON object"));
-        assert!(error.message.contains("program \"cargo\""));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1311,6 +1934,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            failure_kind(&error),
+            ActionFailureKind::WorkflowStateViolation
+        );
+        assert_eq!(recovery_decision(&error), RecoveryDecision::Replan);
         assert!(error.message.contains("not currently allowed"));
         assert!(error.message.contains(tools::WORKFLOW_START_TOOL_NAME));
         assert!(!temp_dir.path().join("must-not-exist.txt").exists());

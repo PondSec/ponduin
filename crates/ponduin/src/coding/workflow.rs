@@ -1,5 +1,6 @@
 use crate::coding::file::content_digest;
 use crate::coding::intelligence::CodeSymbol;
+use crate::coding::outcome::{ActionFailureKind, ActionOutcome, ActionResult};
 use crate::coding::patch::MutationPreview;
 use crate::coding::process::ProcessOutput;
 use crate::coding::review::{ReviewReport, ReviewSeverity};
@@ -12,6 +13,8 @@ use uuid::Uuid;
 const MAX_PLAN_ITEMS: usize = 200;
 const MAX_TEXT_BYTES: usize = 16 * 1_024;
 const MAX_EVIDENCE_RECORDS: usize = 200;
+const MAX_ACTION_ATTEMPTS: usize = 128;
+const MAX_CAPABILITY_FEEDBACK: usize = 64;
 const LOOP_THRESHOLD: usize = 3;
 
 /// Auditable state machine for multi-step coding tasks.
@@ -90,10 +93,36 @@ impl CodingWorkflow {
         self.phase
     }
 
+    pub fn next_action(&self) -> WorkflowNextAction {
+        match self.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching => WorkflowNextAction::Inspect,
+            WorkflowPhase::Planning => WorkflowNextAction::BeginEditing,
+            WorkflowPhase::Editing if self.can_begin_review() => WorkflowNextAction::BeginReview,
+            WorkflowPhase::Editing if !self.changed_files().is_empty() => {
+                WorkflowNextAction::BeginValidation
+            }
+            WorkflowPhase::Editing => WorkflowNextAction::Modify,
+            WorkflowPhase::Testing if self.can_begin_review() => WorkflowNextAction::BeginReview,
+            WorkflowPhase::Testing => WorkflowNextAction::Validate,
+            WorkflowPhase::Debugging if self.repair_strategy_required() => {
+                WorkflowNextAction::SetRepairStrategy
+            }
+            WorkflowPhase::Debugging => WorkflowNextAction::BeginRepair,
+            WorkflowPhase::Reviewing if self.can_complete() => WorkflowNextAction::Complete,
+            WorkflowPhase::Reviewing => WorkflowNextAction::Review,
+            WorkflowPhase::Completed => WorkflowNextAction::ReturnResult,
+            WorkflowPhase::Blocked | WorkflowPhase::Failed => WorkflowNextAction::ReportBlocked,
+            WorkflowPhase::Cancelled => WorkflowNextAction::ReportCancelled,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.phase,
-            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+            WorkflowPhase::Completed
+                | WorkflowPhase::Blocked
+                | WorkflowPhase::Failed
+                | WorkflowPhase::Cancelled
         )
     }
 
@@ -171,12 +200,16 @@ impl CodingWorkflow {
         Ok(())
     }
 
-    pub fn record_tool_contract_failure(&mut self, tool_name: &str, error_class: &str) -> usize {
+    pub fn record_action_failure(
+        &mut self,
+        tool_name: &str,
+        failure_kind: ActionFailureKind,
+    ) -> usize {
         if self.is_terminal() {
             return 0;
         }
         let diagnostic_fingerprint =
-            content_digest(format!("{tool_name}\0{error_class}").as_bytes());
+            content_digest(format!("{tool_name}\0{failure_kind:?}").as_bytes());
         let repetitions = self
             .memory
             .tool_contract_errors
@@ -189,6 +222,7 @@ impl CodingWorkflow {
             .push(ToolContractErrorEvidence {
                 revision: self.revision,
                 tool_name: tool_name.to_string(),
+                failure_kind,
                 diagnostic_fingerprint,
                 repetitions,
             });
@@ -202,6 +236,299 @@ impl CodingWorkflow {
             });
         }
         repetitions
+    }
+
+    pub fn select_action(
+        &self,
+        action: WorkflowAction,
+        capability: &str,
+        target_fingerprint: &str,
+        available_capabilities: &[String],
+    ) -> ActionSelection {
+        let direct = || ActionSelection {
+            action,
+            strategy: self.default_strategy_for(action),
+            allowed: true,
+            alternative_capability: None,
+            blocked_by: None,
+        };
+        if self.is_terminal() {
+            let blocked_by = match self.stop_reason {
+                Some(WorkflowStopReason::Cancelled) => ActionFailureKind::Cancelled,
+                _ => ActionFailureKind::RepeatedFailure,
+            };
+            return ActionSelection {
+                action,
+                strategy: ActionStrategy::Direct,
+                allowed: false,
+                alternative_capability: None,
+                blocked_by: Some(blocked_by),
+            };
+        }
+        if self.has_unavailable_capability(capability) {
+            let alternative =
+                self.usable_alternative_capability(capability, available_capabilities);
+            return ActionSelection {
+                action,
+                strategy: ActionStrategy::UseAlternativeCapability,
+                allowed: false,
+                alternative_capability: alternative,
+                blocked_by: Some(ActionFailureKind::CapabilityUnavailable),
+            };
+        }
+        if self.memory.action_attempts.iter().rev().any(|attempt| {
+            attempt.action == action
+                && attempt.target_fingerprint == target_fingerprint
+                && attempt.result.failure_kind == Some(ActionFailureKind::CapabilityUnavailable)
+                && self
+                    .usable_alternative_capability(&attempt.capability, available_capabilities)
+                    .as_deref()
+                    == Some(capability)
+        }) {
+            return ActionSelection {
+                action,
+                strategy: ActionStrategy::UseAlternativeCapability,
+                allowed: true,
+                alternative_capability: None,
+                blocked_by: None,
+            };
+        }
+        let attempts_since_state_change = self
+            .memory
+            .action_attempts
+            .iter()
+            .rposition(|attempt| {
+                attempt.result.state_changed
+                    && (attempt.action == WorkflowAction::Workflow
+                        || attempt.target_fingerprint == target_fingerprint
+                        || (matches!(action, WorkflowAction::Validate | WorkflowAction::Process)
+                            && attempt.action == WorkflowAction::Mutate))
+            })
+            .map_or(&self.memory.action_attempts[..], |index| {
+                &self.memory.action_attempts[index + 1..]
+            });
+        let relevant = attempts_since_state_change
+            .iter()
+            .rev()
+            .filter(|attempt| {
+                attempt.action == action
+                    && attempt.target_fingerprint == target_fingerprint
+                    && attempt.result.outcome == ActionOutcome::Failed
+            })
+            .collect::<Vec<_>>();
+        let Some(latest) = relevant.first() else {
+            return direct();
+        };
+        let Some(failure_kind) = latest.result.failure_kind else {
+            return direct();
+        };
+        let selected_strategy = self.default_strategy_for(action);
+        if action == WorkflowAction::Mutate
+            && matches!(selected_strategy, ActionStrategy::Repair(_))
+            && selected_strategy != latest.strategy
+            && matches!(
+                failure_kind,
+                ActionFailureKind::ValidationFailed
+                    | ActionFailureKind::ProcessFailed
+                    | ActionFailureKind::RepeatedFailure
+            )
+        {
+            return ActionSelection {
+                action,
+                strategy: selected_strategy,
+                allowed: true,
+                alternative_capability: None,
+                blocked_by: None,
+            };
+        }
+        match failure_kind {
+            ActionFailureKind::StaleState if action == WorkflowAction::Mutate => {
+                let refreshed = self
+                    .memory
+                    .action_attempts
+                    .iter()
+                    .rev()
+                    .take_while(|attempt| {
+                        !(attempt.action == action
+                            && attempt.target_fingerprint == target_fingerprint
+                            && attempt.result.outcome == ActionOutcome::Failed
+                            && attempt.result.failure_kind == Some(ActionFailureKind::StaleState))
+                    })
+                    .any(|attempt| {
+                        attempt.action == WorkflowAction::Inspect
+                            && attempt.target_fingerprint == target_fingerprint
+                            && attempt.progress != ActionProgress::NoProgress
+                    });
+                ActionSelection {
+                    action: if refreshed {
+                        WorkflowAction::Mutate
+                    } else {
+                        WorkflowAction::Inspect
+                    },
+                    strategy: ActionStrategy::RefreshThenMutate,
+                    allowed: refreshed,
+                    alternative_capability: None,
+                    blocked_by: (!refreshed).then_some(ActionFailureKind::StaleState),
+                }
+            }
+            ActionFailureKind::InvalidArguments => {
+                let corrected_failed = latest.strategy == ActionStrategy::CorrectArguments;
+                let alternative = corrected_failed
+                    .then(|| self.usable_alternative_capability(capability, available_capabilities))
+                    .flatten();
+                ActionSelection {
+                    action,
+                    strategy: if corrected_failed && alternative.is_some() {
+                        ActionStrategy::UseAlternativeCapability
+                    } else {
+                        ActionStrategy::CorrectArguments
+                    },
+                    allowed: !corrected_failed || alternative.is_some(),
+                    alternative_capability: alternative,
+                    blocked_by: corrected_failed.then_some(ActionFailureKind::RepeatedFailure),
+                }
+            }
+            ActionFailureKind::CapabilityUnavailable => {
+                let alternative =
+                    self.usable_alternative_capability(capability, available_capabilities);
+                ActionSelection {
+                    action,
+                    strategy: ActionStrategy::UseAlternativeCapability,
+                    allowed: false,
+                    alternative_capability: alternative,
+                    blocked_by: Some(ActionFailureKind::CapabilityUnavailable),
+                }
+            }
+            ActionFailureKind::PolicyBlocked | ActionFailureKind::PermissionRequired => {
+                ActionSelection {
+                    action,
+                    strategy: ActionStrategy::Direct,
+                    allowed: false,
+                    alternative_capability: None,
+                    blocked_by: Some(failure_kind),
+                }
+            }
+            ActionFailureKind::TimedOut if action == WorkflowAction::Validate => {
+                let same_validation = relevant.iter().any(|attempt| {
+                    attempt.strategy == ActionStrategy::NarrowerValidation
+                        && attempt.result.failure_kind == Some(ActionFailureKind::TimedOut)
+                        && attempt.progress == ActionProgress::NoProgress
+                });
+                ActionSelection {
+                    action,
+                    strategy: ActionStrategy::NarrowerValidation,
+                    allowed: false,
+                    alternative_capability: None,
+                    blocked_by: Some(if same_validation {
+                        ActionFailureKind::RepeatedFailure
+                    } else {
+                        ActionFailureKind::TimedOut
+                    }),
+                }
+            }
+            ActionFailureKind::TimedOut
+            | ActionFailureKind::ValidationFailed
+            | ActionFailureKind::ProcessFailed => ActionSelection {
+                action: WorkflowAction::Inspect,
+                strategy: ActionStrategy::InspectDiagnostics,
+                allowed: false,
+                alternative_capability: None,
+                blocked_by: Some(failure_kind),
+            },
+            ActionFailureKind::ResourceMissing => ActionSelection {
+                action: WorkflowAction::Inspect,
+                strategy: ActionStrategy::ReinspectResource,
+                allowed: false,
+                alternative_capability: None,
+                blocked_by: Some(failure_kind),
+            },
+            ActionFailureKind::WorkflowStateViolation => ActionSelection {
+                action: WorkflowAction::Workflow,
+                strategy: ActionStrategy::Replan,
+                allowed: false,
+                alternative_capability: None,
+                blocked_by: Some(failure_kind),
+            },
+            ActionFailureKind::Cancelled
+            | ActionFailureKind::RepeatedFailure
+            | ActionFailureKind::InternalFailure => ActionSelection {
+                action,
+                strategy: ActionStrategy::Direct,
+                allowed: false,
+                alternative_capability: None,
+                blocked_by: Some(failure_kind),
+            },
+            _ => direct(),
+        }
+    }
+
+    fn default_strategy_for(&self, action: WorkflowAction) -> ActionStrategy {
+        if action == WorkflowAction::Mutate && self.repair_pending {
+            if let Some(strategy) = self.memory.repair_strategies.last() {
+                return ActionStrategy::Repair(strategy.approach);
+            }
+        }
+        ActionStrategy::Direct
+    }
+
+    fn has_unavailable_capability(&self, capability: &str) -> bool {
+        self.memory
+            .capability_feedback
+            .iter()
+            .any(|feedback| feedback.capability == capability && feedback.unavailable)
+    }
+
+    fn usable_alternative_capability(
+        &self,
+        capability: &str,
+        available_capabilities: &[String],
+    ) -> Option<String> {
+        alternative_capability(capability, available_capabilities).filter(|alternative| {
+            self.memory
+                .capability_feedback
+                .iter()
+                .find(|feedback| feedback.capability == *alternative)
+                .is_none_or(|feedback| {
+                    !feedback.unavailable && (feedback.successes > 0 || feedback.failures == 0)
+                })
+        })
+    }
+
+    pub(crate) fn record_action_attempt(&mut self, attempt: ActionAttempt) {
+        if self.is_terminal() {
+            return;
+        }
+        let feedback_index = self
+            .memory
+            .capability_feedback
+            .iter()
+            .position(|feedback| feedback.capability == attempt.capability);
+        let feedback = if let Some(index) = feedback_index {
+            &mut self.memory.capability_feedback[index]
+        } else {
+            self.memory.capability_feedback.push(CapabilityFeedback {
+                capability: attempt.capability.clone(),
+                successes: 0,
+                failures: 0,
+                unavailable: false,
+            });
+            let index = self.memory.capability_feedback.len() - 1;
+            &mut self.memory.capability_feedback[index]
+        };
+        if attempt.result.outcome == ActionOutcome::Succeeded {
+            feedback.successes += 1;
+        } else {
+            feedback.failures += 1;
+            feedback.unavailable |=
+                attempt.result.failure_kind == Some(ActionFailureKind::CapabilityUnavailable);
+        }
+        self.memory.action_attempts.push(attempt);
+        if self.memory.action_attempts.len() > MAX_ACTION_ATTEMPTS {
+            self.memory.action_attempts.remove(0);
+        }
+        if self.memory.capability_feedback.len() > MAX_CAPABILITY_FEEDBACK {
+            self.memory.capability_feedback.remove(0);
+        }
     }
 
     pub fn block_for_action_limit(&mut self, limit: u32) {
@@ -505,12 +832,7 @@ impl CodingWorkflow {
             .get(&diagnostic_fingerprint)
             .copied()
             .unwrap_or_default();
-        if repetitions >= 2
-            && !self.memory.repair_strategies.iter().any(|strategy| {
-                strategy.revision == self.revision
-                    && strategy.diagnostic_fingerprint == diagnostic_fingerprint
-            })
-        {
+        if self.repair_strategy_required_for(&diagnostic_fingerprint, repetitions) {
             return Err(WorkflowError::RepairStrategyRequired);
         }
         if self.repair_attempts >= self.limits.max_repair_attempts {
@@ -587,6 +909,14 @@ impl CodingWorkflow {
                 .is_some_and(|review| review.revision == self.revision && review.complete)
     }
 
+    pub fn cancel(&mut self) {
+        if self.is_terminal() {
+            return;
+        }
+        self.phase = WorkflowPhase::Cancelled;
+        self.stop_reason = Some(WorkflowStopReason::Cancelled);
+    }
+
     pub fn complete(
         &mut self,
         summary: String,
@@ -628,6 +958,7 @@ impl CodingWorkflow {
             objective: self.objective.clone(),
             task: self.task.clone(),
             phase: self.phase,
+            next_action: self.next_action(),
             plan: self.plan.clone(),
             iterations: self.iterations,
             max_iterations: self.limits.max_iterations,
@@ -789,6 +1120,33 @@ impl CodingWorkflow {
         })
     }
 
+    fn repair_strategy_required(&self) -> bool {
+        let Some(diagnostic_fingerprint) = self
+            .current_failed_validation()
+            .map(|validation| &validation.diagnostic_fingerprint)
+        else {
+            return false;
+        };
+        let repetitions = self
+            .failure_counts
+            .get(diagnostic_fingerprint)
+            .copied()
+            .unwrap_or_default();
+        self.repair_strategy_required_for(diagnostic_fingerprint, repetitions)
+    }
+
+    fn repair_strategy_required_for(
+        &self,
+        diagnostic_fingerprint: &str,
+        repetitions: usize,
+    ) -> bool {
+        repetitions >= 2
+            && !self.memory.repair_strategies.iter().any(|strategy| {
+                strategy.revision == self.revision
+                    && strategy.diagnostic_fingerprint == diagnostic_fingerprint
+            })
+    }
+
     fn require_phase(&self, expected: &[WorkflowPhase]) -> Result<(), WorkflowError> {
         if expected.contains(&self.phase) {
             Ok(())
@@ -809,6 +1167,19 @@ impl CodingWorkflow {
         self.phase = WorkflowPhase::Failed;
         self.stop_reason = Some(reason);
     }
+}
+
+fn alternative_capability(capability: &str, available: &[String]) -> Option<String> {
+    let preferred = match capability {
+        "coding__apply_changes" => Some("coding__write_file"),
+        "coding__write_file" => Some("coding__apply_changes"),
+        "coding__run_validation" => Some("coding__run_process"),
+        "coding__run_process" => Some("coding__run_validation"),
+        _ => None,
+    };
+    preferred
+        .filter(|candidate| available.iter().any(|available| available == candidate))
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -908,6 +1279,27 @@ impl TaskIntent {
             .any(|term| request.contains(term))
         {
             Self::Create
+        } else if [
+            "modify",
+            "change",
+            "update",
+            "edit",
+            "implement",
+            "add",
+            "write",
+            "änder",
+            "aender",
+            "aktualis",
+            "anpass",
+            "bearbeit",
+            "hinzufüg",
+            "hinzufueg",
+            "schreib",
+        ]
+        .iter()
+        .any(|term| request.contains(term))
+        {
+            Self::Modify
         } else if [
             "analyse",
             "analys",
@@ -1106,6 +1498,29 @@ pub enum WorkflowPhase {
     Completed,
     Blocked,
     Failed,
+    Cancelled,
+}
+
+/// The runtime-derived next action for the workflow's retained task state.
+///
+/// This is not a second state machine: it is computed from phase, plan,
+/// requirement evidence, validation results, and recovery state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNextAction {
+    Inspect,
+    BeginEditing,
+    Modify,
+    BeginValidation,
+    Validate,
+    SetRepairStrategy,
+    BeginRepair,
+    BeginReview,
+    Review,
+    Complete,
+    ReturnResult,
+    ReportBlocked,
+    ReportCancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1114,6 +1529,7 @@ pub struct WorkflowStatus {
     pub objective: String,
     pub task: WorkflowTaskState,
     pub phase: WorkflowPhase,
+    pub next_action: WorkflowNextAction,
     pub plan: Option<WorkflowPlan>,
     pub iterations: u32,
     pub max_iterations: u32,
@@ -1187,13 +1603,87 @@ pub struct WorkflowMemory {
     pub known_errors: Vec<KnownErrorEvidence>,
     pub tool_contract_errors: Vec<ToolContractErrorEvidence>,
     pub repair_strategies: Vec<RepairStrategyEvidence>,
+    #[serde(default)]
+    pub action_attempts: Vec<ActionAttempt>,
+    #[serde(default)]
+    pub capability_feedback: Vec<CapabilityFeedback>,
     pub open_points: Vec<String>,
+}
+
+/// A compact, task-local record of an action and the runtime strategy that
+/// selected it. It deliberately retains fingerprints and evidence signals, not
+/// model reasoning, source content, or command output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionAttempt {
+    pub(crate) revision: u32,
+    pub(crate) action: WorkflowAction,
+    pub(crate) strategy: ActionStrategy,
+    pub(crate) capability: String,
+    pub(crate) target_fingerprint: String,
+    pub(crate) result: ActionResult,
+    pub(crate) progress: ActionProgress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFeedback {
+    pub capability: String,
+    pub successes: usize,
+    pub failures: usize,
+    pub unavailable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAction {
+    Inspect,
+    Mutate,
+    Validate,
+    Process,
+    Review,
+    Workflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionStrategy {
+    Direct,
+    RefreshThenMutate,
+    InspectDiagnostics,
+    CorrectArguments,
+    ReinspectResource,
+    UseAlternativeCapability,
+    NarrowerValidation,
+    Replan,
+    Repair(RepairApproach),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionProgress {
+    NoProgress,
+    Evidence,
+    State,
+    Requirement,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionSelection {
+    pub action: WorkflowAction,
+    pub strategy: ActionStrategy,
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternative_capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<ActionFailureKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolContractErrorEvidence {
     pub revision: u32,
     pub tool_name: String,
+    #[serde(default)]
+    pub failure_kind: ActionFailureKind,
     pub diagnostic_fingerprint: String,
     pub repetitions: usize,
 }
@@ -1319,6 +1809,8 @@ pub struct ValidationEvidence {
     pub output_truncated: bool,
     pub error_count: usize,
     pub diagnostic_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<ActionFailureKind>,
     #[serde(default)]
     pub planned_check_ids: Vec<String>,
 }
@@ -1367,6 +1859,7 @@ impl ValidationEvidence {
             output_truncated: output.output_truncated,
             error_count,
             diagnostic_fingerprint,
+            failure_kind: output.action_result().failure_kind,
             planned_check_ids,
         }
     }
@@ -1385,6 +1878,7 @@ impl ValidationEvidence {
                 planned_check_ids,
             );
             evidence.outcome = ValidationOutcome::from(execution.status);
+            evidence.failure_kind = execution.action.failure_kind;
             return evidence;
         }
 
@@ -1418,6 +1912,7 @@ impl ValidationEvidence {
             output_truncated: false,
             error_count: 0,
             diagnostic_fingerprint: content_digest(diagnostics.as_bytes()),
+            failure_kind: execution.action.failure_kind,
             planned_check_ids,
         }
     }
@@ -1464,6 +1959,7 @@ impl From<ValidationStatus> for ValidationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowStopReason {
+    Cancelled,
     ActionLimit {
         limit: u32,
     },
@@ -1732,6 +2228,27 @@ pub enum WorkflowError {
     TerminalMemoryUpdate,
 }
 
+impl WorkflowError {
+    pub(crate) fn failure_kind(&self) -> ActionFailureKind {
+        match self {
+            Self::InvalidTransition { .. }
+            | Self::PlanRequired
+            | Self::ChangeRequired
+            | Self::ValidationRequired
+            | Self::ReviewRequired
+            | Self::MandatoryRequirementsOpen(_)
+            | Self::TerminalMemoryUpdate => ActionFailureKind::WorkflowStateViolation,
+            Self::ValidationFailed | Self::ReviewFailed => ActionFailureKind::ValidationFailed,
+            Self::RepairStrategyRequired | Self::RepeatedRepairStrategy(_) => {
+                ActionFailureKind::RepeatedFailure
+            }
+            Self::IterationLimit(_) | Self::RepairLimit(_) => ActionFailureKind::RepeatedFailure,
+            Self::Evidence(_) => ActionFailureKind::InternalFailure,
+            _ => ActionFailureKind::InvalidArguments,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1831,6 +2348,29 @@ mod tests {
         workflow
     }
 
+    fn capabilities(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn action_attempt(
+        action: WorkflowAction,
+        strategy: ActionStrategy,
+        capability: &str,
+        target: &str,
+        result: ActionResult,
+        progress: ActionProgress,
+    ) -> ActionAttempt {
+        ActionAttempt {
+            revision: 0,
+            action,
+            strategy,
+            capability: capability.to_string(),
+            target_fingerprint: target.to_string(),
+            result,
+            progress,
+        }
+    }
+
     #[test]
     fn completes_only_after_real_change_validation_and_review() {
         let mut workflow = planned_workflow();
@@ -1855,6 +2395,95 @@ mod tests {
         assert_eq!(report.requirements[0].status, RequirementStatus::Verified);
         assert!(report.review.is_some());
         assert!(!report.validations[0].diagnostic_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn next_action_follows_evidence_backed_lifecycle() {
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Inspect);
+        workflow.set_plan(plan()).unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginEditing
+        );
+
+        workflow.begin_editing().unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Modify);
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-1".to_string(), &preview("+new"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginValidation
+        );
+
+        workflow.begin_validation().unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Validate);
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginReview
+        );
+
+        workflow.begin_review().unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Review);
+        workflow.record_review(&review()).unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Complete);
+
+        workflow
+            .complete("implemented safely".to_string(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::ReturnResult
+        );
+    }
+
+    #[test]
+    fn repeated_failure_requires_a_distinct_repair_strategy_before_retrying() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(false, "same error"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginRepair
+        );
+
+        workflow.begin_repair().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("retry".to_string(), &preview("retry"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(false, "same error"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::SetRepairStrategy
+        );
+
+        workflow
+            .set_repair_strategy(
+                RepairApproach::LocalLogic,
+                "correct the local branch".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginRepair
+        );
     }
 
     #[test]
@@ -2143,6 +2772,31 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_is_terminal_and_cannot_be_completed_later() {
+        let mut workflow = planned_workflow();
+        workflow.cancel();
+
+        assert!(workflow.is_terminal());
+        assert_eq!(workflow.phase(), WorkflowPhase::Cancelled);
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::ReportCancelled
+        );
+        assert!(matches!(
+            workflow.status().stop_reason,
+            Some(WorkflowStopReason::Cancelled)
+        ));
+        assert!(matches!(
+            workflow.begin_editing(),
+            Err(WorkflowError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            workflow.complete("must not complete".to_string(), Vec::new()),
+            Err(WorkflowError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
     fn unavailable_validation_cannot_close_a_required_validation_plan() {
         let mut workflow = planned_workflow();
         workflow.authorize_change().unwrap();
@@ -2156,11 +2810,44 @@ mod tests {
                 status: ValidationStatus::NotPresent,
                 reason: Some("not discovered".to_string()),
                 output: None,
+                action: ActionResult::failed(ActionFailureKind::CapabilityUnavailable, true),
             })
             .unwrap();
         assert!(matches!(
             workflow.begin_review(),
             Err(WorkflowError::ValidationRequired)
+        ));
+    }
+
+    #[test]
+    fn structured_validation_failure_enters_repair_and_blocks_completion() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change".to_string(), &preview("change"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_validation_execution(&ValidationExecution {
+                command: None,
+                status: ValidationStatus::Failed,
+                reason: Some("test command exited unsuccessfully".to_string()),
+                output: None,
+                action: ActionResult::failed(ActionFailureKind::ValidationFailed, true),
+            })
+            .unwrap();
+
+        let status = workflow.status();
+        assert_eq!(status.phase, WorkflowPhase::Debugging);
+        assert_eq!(status.next_action, WorkflowNextAction::BeginRepair);
+        assert_eq!(
+            workflow.validations[0].failure_kind,
+            Some(ActionFailureKind::ValidationFailed)
+        );
+        assert!(!workflow.can_complete());
+        assert!(matches!(
+            workflow.complete("must not complete".to_string(), Vec::new()),
+            Err(WorkflowError::InvalidTransition { .. })
         ));
     }
 
@@ -2248,19 +2935,40 @@ mod tests {
     }
 
     #[test]
+    fn mutation_intent_wins_over_inspection_and_validation_steps() {
+        assert_eq!(
+            TaskIntent::detect("Analysiere den Fehler und aktualisiere die Konfiguration."),
+            TaskIntent::Modify
+        );
+        assert_eq!(
+            TaskIntent::detect("Inspect the current implementation, then edit the parser."),
+            TaskIntent::Modify
+        );
+    }
+
+    #[test]
     fn blocks_repeated_tool_contract_failures_with_retained_evidence() {
         let mut workflow = CodingWorkflow::new("repair the fixture".to_string(), limits()).unwrap();
 
         assert_eq!(
-            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            workflow.record_action_failure(
+                "coding__apply_changes",
+                ActionFailureKind::InvalidArguments,
+            ),
             1
         );
         assert_eq!(
-            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            workflow.record_action_failure(
+                "coding__apply_changes",
+                ActionFailureKind::InvalidArguments,
+            ),
             2
         );
         assert_eq!(
-            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            workflow.record_action_failure(
+                "coding__apply_changes",
+                ActionFailureKind::InvalidArguments,
+            ),
             3
         );
 
@@ -2274,6 +2982,273 @@ mod tests {
                 repetitions: 3
             }) if tool_name == "coding__apply_changes"
         ));
+    }
+
+    #[test]
+    fn stale_mutation_requires_a_refresh_before_retrying() {
+        let mut workflow = planned_workflow();
+        let target = "lib-rs";
+        let capabilities = capabilities(&[
+            "coding__read_file",
+            "coding__apply_changes",
+            "coding__write_file",
+        ]);
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::Direct,
+            "coding__apply_changes",
+            target,
+            ActionResult::failed(ActionFailureKind::StaleState, true),
+            ActionProgress::Evidence,
+        ));
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::Direct,
+            "coding__apply_changes",
+            "unrelated-file",
+            ActionResult::succeeded(true, true),
+            ActionProgress::State,
+        ));
+
+        let refresh = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__apply_changes",
+            target,
+            &capabilities,
+        );
+        assert_eq!(refresh.action, WorkflowAction::Inspect);
+        assert_eq!(refresh.strategy, ActionStrategy::RefreshThenMutate);
+        assert!(!refresh.allowed);
+
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Inspect,
+            ActionStrategy::Direct,
+            "coding__read_file",
+            target,
+            ActionResult::succeeded(false, true),
+            ActionProgress::Evidence,
+        ));
+        let retry = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__apply_changes",
+            target,
+            &capabilities,
+        );
+        assert_eq!(retry.action, WorkflowAction::Mutate);
+        assert_eq!(retry.strategy, ActionStrategy::RefreshThenMutate);
+        assert!(retry.allowed);
+    }
+
+    #[test]
+    fn duplicate_validation_repair_requires_diagnostics_or_a_distinct_repair() {
+        let mut workflow = planned_workflow();
+        let target = "src/lib.rs";
+        let capabilities = capabilities(&["coding__apply_changes", "coding__read_file"]);
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::Repair(RepairApproach::LocalLogic),
+            "coding__apply_changes",
+            target,
+            ActionResult::failed(ActionFailureKind::ValidationFailed, true),
+            ActionProgress::NoProgress,
+        ));
+
+        let selection = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__apply_changes",
+            target,
+            &capabilities,
+        );
+        assert_eq!(selection.action, WorkflowAction::Inspect);
+        assert_eq!(selection.strategy, ActionStrategy::InspectDiagnostics);
+        assert!(!selection.allowed);
+    }
+
+    #[test]
+    fn a_distinct_recorded_repair_strategy_is_allowed_after_no_progress() {
+        let mut workflow = planned_workflow();
+        let target = "src/lib.rs";
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::Repair(RepairApproach::LocalLogic),
+            "coding__apply_changes",
+            target,
+            ActionResult::failed(ActionFailureKind::ValidationFailed, true),
+            ActionProgress::NoProgress,
+        ));
+        workflow.repair_pending = true;
+        workflow
+            .memory
+            .repair_strategies
+            .push(RepairStrategyEvidence {
+                revision: workflow.revision,
+                diagnostic_fingerprint: "changed-diagnostic".to_string(),
+                approach: RepairApproach::DependencyBoundary,
+                hypothesis_fingerprint: "hypothesis".to_string(),
+                target_files: vec![PathBuf::from("src/lib.rs")],
+            });
+
+        let selection = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__apply_changes",
+            target,
+            &capabilities(&["coding__apply_changes"]),
+        );
+        assert_eq!(
+            selection.strategy,
+            ActionStrategy::Repair(RepairApproach::DependencyBoundary)
+        );
+        assert!(selection.allowed);
+    }
+
+    #[test]
+    fn capability_feedback_selects_an_available_fallback_then_stops_when_exhausted() {
+        let mut workflow = planned_workflow();
+        let target = "src/lib.rs";
+        let capabilities = capabilities(&["coding__apply_changes", "coding__write_file"]);
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::Direct,
+            "coding__write_file",
+            target,
+            ActionResult::succeeded(true, true),
+            ActionProgress::State,
+        ));
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::Direct,
+            "coding__apply_changes",
+            target,
+            ActionResult::failed(ActionFailureKind::CapabilityUnavailable, false),
+            ActionProgress::NoProgress,
+        ));
+
+        let unavailable = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__apply_changes",
+            target,
+            &capabilities,
+        );
+        assert_eq!(
+            unavailable.strategy,
+            ActionStrategy::UseAlternativeCapability
+        );
+        assert_eq!(
+            unavailable.alternative_capability.as_deref(),
+            Some("coding__write_file")
+        );
+        assert!(!unavailable.allowed);
+
+        let fallback = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__write_file",
+            target,
+            &capabilities,
+        );
+        assert_eq!(fallback.strategy, ActionStrategy::UseAlternativeCapability);
+        assert!(fallback.allowed);
+
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::UseAlternativeCapability,
+            "coding__write_file",
+            target,
+            ActionResult::failed(ActionFailureKind::CapabilityUnavailable, false),
+            ActionProgress::NoProgress,
+        ));
+        let exhausted = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__write_file",
+            target,
+            &capabilities,
+        );
+        assert!(!exhausted.allowed);
+        assert_eq!(exhausted.alternative_capability, None);
+    }
+
+    #[test]
+    fn timed_out_validation_requires_a_different_validation_target() {
+        let mut workflow = planned_workflow();
+        let capabilities = capabilities(&["coding__run_validation"]);
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Validate,
+            ActionStrategy::Direct,
+            "coding__run_validation",
+            "full-test-suite",
+            ActionResult::failed(ActionFailureKind::TimedOut, true),
+            ActionProgress::Evidence,
+        ));
+
+        let timed_out = workflow.select_action(
+            WorkflowAction::Validate,
+            "coding__run_validation",
+            "full-test-suite",
+            &capabilities,
+        );
+        assert_eq!(timed_out.strategy, ActionStrategy::NarrowerValidation);
+        assert!(!timed_out.allowed);
+
+        let narrower = workflow.select_action(
+            WorkflowAction::Validate,
+            "coding__run_validation",
+            "focused-test",
+            &capabilities,
+        );
+        assert_eq!(narrower.strategy, ActionStrategy::Direct);
+        assert!(narrower.allowed);
+    }
+
+    #[test]
+    fn policy_blocks_and_cancellation_are_terminal_for_strategy_selection() {
+        let mut workflow = planned_workflow();
+        let capabilities = capabilities(&["coding__apply_changes"]);
+        workflow.record_action_attempt(action_attempt(
+            WorkflowAction::Mutate,
+            ActionStrategy::Direct,
+            "coding__apply_changes",
+            "restricted-path",
+            ActionResult::failed(ActionFailureKind::PolicyBlocked, true),
+            ActionProgress::NoProgress,
+        ));
+        let blocked = workflow.select_action(
+            WorkflowAction::Mutate,
+            "coding__apply_changes",
+            "restricted-path",
+            &capabilities,
+        );
+        assert!(!blocked.allowed);
+        assert_eq!(blocked.blocked_by, Some(ActionFailureKind::PolicyBlocked));
+
+        workflow.cancel();
+        let cancelled = workflow.select_action(
+            WorkflowAction::Inspect,
+            "coding__read_file",
+            "restricted-path",
+            &capabilities,
+        );
+        assert!(!cancelled.allowed);
+        assert_eq!(cancelled.blocked_by, Some(ActionFailureKind::Cancelled));
+    }
+
+    #[test]
+    fn action_history_is_bounded_and_redacted() {
+        let mut workflow = planned_workflow();
+        for index in 0..(MAX_ACTION_ATTEMPTS + 3) {
+            let target = content_digest(format!("secret-{index}").as_bytes());
+            workflow.record_action_attempt(action_attempt(
+                WorkflowAction::Inspect,
+                ActionStrategy::Direct,
+                "coding__read_file",
+                &target,
+                ActionResult::succeeded(false, true),
+                ActionProgress::Evidence,
+            ));
+        }
+
+        let memory = workflow.status().memory;
+        assert_eq!(memory.action_attempts.len(), MAX_ACTION_ATTEMPTS);
+        let serialized = serde_json::to_string(&memory).unwrap();
+        assert!(!serialized.contains("secret-"));
     }
 
     #[test]

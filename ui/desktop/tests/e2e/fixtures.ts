@@ -64,6 +64,7 @@ export const test = base.extend<PonduinTestFixtures>({
           ELECTRON_IS_DEV: '1',
           NODE_ENV: 'development',
           PONDUIN_ALLOWLIST_BYPASS: 'true',
+          PONDUIN_DISABLE_KEYRING: 'true',
           PONDUIN_E2E_PATH_ROOT: e2eUserDataDir,
           ENABLE_PLAYWRIGHT: 'true',
           PLAYWRIGHT_DEBUG_PORT: debugPort.toString(), // Unique port per test for parallel execution
@@ -110,7 +111,8 @@ export const test = base.extend<PonduinTestFixtures>({
 
       // Wait for Electron to create its first window after the CDP endpoint is up.
       let page: Page | null = null;
-      for (let attempt = 1; attempt <= 100; attempt++) {
+      const maxPageRetries = isLiveAgentE2e ? 600 : 100;
+      for (let attempt = 1; attempt <= maxPageRetries; attempt++) {
         const contexts = browser.contexts();
         page = contexts.flatMap((context) => context.pages())[0] ?? null;
         if (page) {
@@ -121,6 +123,15 @@ export const test = base.extend<PonduinTestFixtures>({
 
       if (!page) {
         throw new Error('No windows/pages found');
+      }
+
+      if (process.env.DEBUG_TESTS) {
+        page.on('console', (message) => {
+          console.log(`Renderer ${message.type()}: ${message.text()}`);
+        });
+        page.on('pageerror', (error) => {
+          console.log(`Renderer page error: ${error.message}`);
+        });
       }
 
       // Wait for page to be ready
