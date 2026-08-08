@@ -91,6 +91,19 @@ pub mod utils;
 pub mod xai;
 pub mod xai_oauth;
 
+#[cfg(feature = "native-tls")]
+pub(crate) fn install_jsonwebtoken_crypto_provider() {
+    let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
+}
+
+#[cfg(all(not(feature = "native-tls"), any(feature = "rustls-tls", test)))]
+pub(crate) fn install_jsonwebtoken_crypto_provider() {
+    let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+}
+
+#[cfg(all(not(feature = "native-tls"), not(feature = "rustls-tls"), not(test)))]
+pub(crate) fn install_jsonwebtoken_crypto_provider() {}
+
 pub use init::{
     cleanup_provider, create, create_with_default_model, create_with_named_model,
     create_with_working_dir, get_from_registry, inventory_identity, providers,
