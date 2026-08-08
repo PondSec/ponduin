@@ -413,6 +413,7 @@ async fn get_jwks(state: &ChatGptCodexAuthState) -> Result<JwkSet> {
 }
 
 fn parse_jwt_claims_with_jwks(token: &str, jwks: &JwkSet) -> Result<JwtClaims> {
+    crate::providers::install_jsonwebtoken_crypto_provider();
     let header = decode_header(token)?;
     let kid = header
         .kid
@@ -1407,6 +1408,7 @@ mod tests {
             exp: (Utc::now() + chrono::Duration::seconds(60)).timestamp() as usize,
             chatgpt_account_id: Some("account-1".to_string()),
         };
+        crate::providers::install_jsonwebtoken_crypto_provider();
         let token = jsonwebtoken::encode(
             &header,
             &claims,
