@@ -2,28 +2,38 @@ use crate::coding::config::CodingConfig;
 use crate::coding::context::{ContextLimits, ContextPlanner};
 use crate::coding::embedding::hybrid_context_candidates;
 use crate::coding::file::{
-    FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
+    FileReadError, FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
+    MIN_READ_LIMIT,
 };
-use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitOwnedPath, GitRepository};
+use crate::coding::git::{
+    GitDiff, GitDiffRequest, GitError, GitLimits, GitOwnedPath, GitRepository,
+};
 use crate::coding::intelligence::{IntelligenceLimits, RepositoryIndex, RepositoryIntelligence};
 use crate::coding::lsp::{
     LanguageServerClient, LanguageServerOperation, LanguageServerPosition, LanguageServerQuery,
 };
-use crate::coding::patch::{
-    MutationBatch, MutationPreview, MutationResult, PatchEngine, PatchLimits, RollbackRecord,
-    DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
+use crate::coding::outcome::{
+    error_with_action, ActionFailureKind, ActionResult, RecoveryContext, RecoveryDecision,
+    RecoveryPhase,
 };
-use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner};
+use crate::coding::patch::{
+    MutationBatch, MutationPreview, MutationResult, PatchEngine, PatchError, PatchLimits,
+    RollbackRecord, DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
+};
+use crate::coding::process::{
+    ProcessError, ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner,
+};
 use crate::coding::project::ProjectDiscovery;
 use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
     CodingWorkflow, RepairApproach, RequirementPriority, RequirementSource,
-    RequirementVerification, WorkflowCheck, WorkflowCommand, WorkflowId, WorkflowLimits,
-    WorkflowNextAction, WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowRequirement,
-    WorkflowStatus, WorkflowTaskState,
+    RequirementVerification, WorkflowCheck, WorkflowCommand, WorkflowError, WorkflowId,
+    WorkflowLimits, WorkflowNextAction, WorkflowPhase, WorkflowPlan, WorkflowReport,
+    WorkflowRequirement, WorkflowStatus, WorkflowTaskState,
 };
+use crate::coding::workspace::WorkspaceError;
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use ponduin_providers::thinking::ThinkingEffort;
 use rmcp::model::{
@@ -149,6 +159,52 @@ impl CodingToolState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty()
+    }
+
+    pub(crate) fn recovery_context(&self, workspace_root: &Path) -> RecoveryContext {
+        let Some(status) = self.workflow_status(workspace_root, None).ok() else {
+            return RecoveryContext {
+                phase: RecoveryPhase::Inspecting,
+                repetitions: 0,
+                alternative_available: false,
+                strategy_change_required: false,
+            };
+        };
+        let phase = match status.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching | WorkflowPhase::Planning => {
+                RecoveryPhase::Inspecting
+            }
+            WorkflowPhase::Editing => RecoveryPhase::Editing,
+            WorkflowPhase::Testing => RecoveryPhase::Validating,
+            WorkflowPhase::Debugging | WorkflowPhase::Reviewing => RecoveryPhase::Repairing,
+            WorkflowPhase::Completed
+            | WorkflowPhase::Blocked
+            | WorkflowPhase::Failed
+            | WorkflowPhase::Cancelled => RecoveryPhase::Terminal,
+        };
+        RecoveryContext {
+            phase,
+            repetitions: 0,
+            alternative_available: definitions_for_workflow(
+                self.workflow_tool_context(workspace_root).as_ref(),
+            )
+            .iter()
+            .any(|tool| tool.name.as_ref() != WORKFLOW_STATUS_TOOL_NAME),
+            strategy_change_required: status.next_action == WorkflowNextAction::SetRepairStrategy,
+        }
+    }
+
+    fn recovery_decision_for(
+        &self,
+        workspace_root: &Path,
+        action: &ActionResult,
+    ) -> Option<RecoveryDecision> {
+        action.failure_kind.map(|failure_kind| {
+            crate::coding::outcome::decide_recovery(
+                failure_kind,
+                self.recovery_context(workspace_root),
+            )
+        })
     }
 
     pub(crate) fn next_action_thinking_effort(&self, workspace_root: &Path) -> ThinkingEffort {
@@ -538,8 +594,10 @@ impl CodingToolState {
             .iter()
             .any(|entry| entry.workspace_root == workspace_root && !entry.workflow.is_terminal())
         {
-            return Err(invalid_arguments(
+            return Err(action_error(
+                ErrorCode::INVALID_PARAMS,
                 "an unfinished coding workflow already exists for this workspace",
+                ActionFailureKind::WorkflowStateViolation,
             ));
         }
         workflows.retain(|entry| entry.workspace_root != workspace_root);
@@ -554,7 +612,7 @@ impl CodingToolState {
                 .expect("a validated workflow objective must form a task state")
             })
             .with_objective(objective.clone())
-            .map_err(|error| invalid_arguments(error.to_string()))?;
+            .map_err(workflow_error)?;
         let workflow = CodingWorkflow::new_with_task(
             objective,
             task,
@@ -563,7 +621,7 @@ impl CodingToolState {
                 max_repair_attempts: config.max_repair_attempts,
             },
         )
-        .map_err(|error| invalid_arguments(error.to_string()))?;
+        .map_err(workflow_error)?;
         let status = workflow.status();
         workflows.push_back(WorkspaceWorkflow {
             workspace_root: workspace_root.to_path_buf(),
@@ -590,7 +648,7 @@ impl CodingToolState {
             interaction_mode,
             workspace_root.to_path_buf(),
         )
-        .map_err(|error| invalid_arguments(error.to_string()))?;
+        .map_err(workflow_error)?;
         let workflows = self
             .workflows
             .lock()
@@ -796,9 +854,7 @@ impl CodingToolState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
-            workflow
-                .set_plan(plan)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            workflow.set_plan(plan).map_err(workflow_error)?;
             Ok(workflow.status())
         })
     }
@@ -817,7 +873,7 @@ impl CodingToolState {
         self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
             workflow
                 .update_memory_notes(assumptions, open_points)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(workflow_error)?;
             Ok(workflow.status())
         })
     }
@@ -837,7 +893,7 @@ impl CodingToolState {
         self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
             workflow
                 .set_repair_strategy(approach, hypothesis, target_files)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(workflow_error)?;
             Ok(workflow.status())
         })
     }
@@ -859,7 +915,7 @@ impl CodingToolState {
                 WorkflowTransition::Repair => workflow.begin_repair(),
                 WorkflowTransition::Review => workflow.begin_review(),
             }
-            .map_err(|error| invalid_arguments(error.to_string()))?;
+            .map_err(workflow_error)?;
             Ok(workflow.status())
         })
     }
@@ -879,7 +935,13 @@ impl CodingToolState {
                     && workflow_id.is_none_or(|id| entry.workflow.id() == id)
             })
             .map(|entry| entry.workflow.status())
-            .ok_or_else(|| invalid_arguments("no matching coding workflow exists"))
+            .ok_or_else(|| {
+                action_error(
+                    ErrorCode::INVALID_PARAMS,
+                    "no matching coding workflow exists",
+                    ActionFailureKind::WorkflowStateViolation,
+                )
+            })
     }
 
     fn complete_workflow(
@@ -896,7 +958,7 @@ impl CodingToolState {
         self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
             workflow
                 .complete(summary, remaining_risks)
-                .map_err(|error| invalid_arguments(error.to_string()))
+                .map_err(workflow_error)
         })
     }
 
@@ -914,7 +976,7 @@ impl CodingToolState {
         if let Some(result) = self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow
                 .record_process(program, args, output)
-                .map_err(|error| internal_error(error.to_string()))
+                .map_err(workflow_error)
         }) {
             result?;
         }
@@ -933,7 +995,7 @@ impl CodingToolState {
         if let Some(result) = self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow
                 .record_validation_execution(execution)
-                .map_err(|error| internal_error(error.to_string()))
+                .map_err(workflow_error)
         }) {
             result?;
         }
@@ -946,27 +1008,25 @@ impl CodingToolState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(result) = self.with_current_workflow_mut(workspace_root, |workflow| {
-            workflow
-                .record_review(review)
-                .map_err(|error| invalid_arguments(error.to_string()))
+            workflow.record_review(review).map_err(workflow_error)
         }) {
             result?;
         }
         Ok(())
     }
 
-    pub(crate) fn record_tool_contract_failure(
+    pub(crate) fn record_action_failure(
         &self,
         workspace_root: &Path,
         tool_name: &str,
-        error_class: &str,
+        failure_kind: ActionFailureKind,
     ) -> Option<usize> {
         let _mutation = self
             .mutation_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.with_current_workflow_mut(workspace_root, |workflow| {
-            workflow.record_tool_contract_failure(tool_name, error_class)
+            workflow.record_action_failure(tool_name, failure_kind)
         })
     }
 
@@ -1003,11 +1063,7 @@ impl CodingToolState {
             if workflow.is_terminal() {
                 None
             } else {
-                Some(
-                    workflow
-                        .authorize_change()
-                        .map_err(|error| invalid_arguments(error.to_string())),
-                )
+                Some(workflow.authorize_change().map_err(workflow_error))
             }
         });
         match authorization.flatten() {
@@ -1684,7 +1740,7 @@ pub(crate) async fn execute_async(
             )
             .run(request)
             .await
-            .map_err(|error| invalid_arguments(error.to_string()))?;
+            .map_err(process_error)?;
             state.invalidate_intelligence(workspace.root());
             state.record_process(workspace.root(), &evidence_program, &evidence_args, &output)?;
             bounded_process_result(output, config.output_limit)
@@ -1694,33 +1750,27 @@ pub(crate) async fn execute_async(
             let repository =
                 GitRepository::open(&workspace, git_limits(config, params.max_entries))
                     .await
-                    .map_err(|error| invalid_arguments(error.to_string()))?;
-            let status = repository
-                .status()
-                .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                    .map_err(git_error)?;
+            let status = repository.status().await.map_err(git_error)?;
             json_result(&status, config.output_limit)
         }
         GIT_DIFF_TOOL_NAME => {
             let request: GitDiffRequest = parse_arguments(&tool_call)?;
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
-            let diff = repository
-                .diff(request)
-                .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
+            let diff = repository.diff(request).await.map_err(git_error)?;
             bounded_git_diff_result(diff, config.output_limit)
         }
         GIT_HISTORY_TOOL_NAME => {
             let params: GitHistoryParams = parse_arguments(&tool_call)?;
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             let history = repository
                 .history(params.max_entries)
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             json_result(&history, config.output_limit)
         }
         GIT_STAGE_OWNED_TOOL_NAME => {
@@ -1728,11 +1778,8 @@ pub(crate) async fn execute_async(
             let owned = state.owned_paths(workspace.root(), &params.paths)?;
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
-            let result = repository
-                .stage_owned(&owned)
-                .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
+            let result = repository.stage_owned(&owned).await.map_err(git_error)?;
             state.mark_staged(workspace.root(), &result.staged_files);
             json_result(&result, config.output_limit)
         }
@@ -1741,11 +1788,8 @@ pub(crate) async fn execute_async(
             let owned = state.owned_paths(workspace.root(), &params.paths)?;
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
-            let result = repository
-                .unstage_owned(&owned)
-                .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
+            let result = repository.unstage_owned(&owned).await.map_err(git_error)?;
             state.mark_unstaged(workspace.root(), &result.unstaged_files);
             json_result(&result, config.output_limit)
         }
@@ -1754,11 +1798,11 @@ pub(crate) async fn execute_async(
             let owned = state.owned_paths(workspace.root(), &params.paths)?;
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             let result = repository
                 .commit_owned(&params.message, &owned)
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             state.remember_commit(workspace.root(), &result.oid);
             state.expire_committed(workspace.root(), &result.committed_files);
             json_result(&result, config.output_limit)
@@ -1773,11 +1817,11 @@ pub(crate) async fn execute_async(
             }
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             let result = repository
                 .revert_owned_commit(&params.oid)
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             state.replace_commit(workspace.root(), &result.reverted_oid, &result.revert_oid);
             json_result(&result, config.output_limit)
         }
@@ -1785,11 +1829,11 @@ pub(crate) async fn execute_async(
             let params: GitCreateBranchParams = parse_arguments(&tool_call)?;
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             let result = repository
                 .create_branch(&params.name, params.start_point.as_deref())
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             json_result(&result, config.output_limit)
         }
         GIT_PUSH_OWNED_TOOL_NAME => {
@@ -1802,22 +1846,19 @@ pub(crate) async fn execute_async(
             }
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             let result = repository
                 .push_current_branch(&params.oid, &params.remote)
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
             json_result(&result, config.output_limit)
         }
         REVIEW_CHANGES_TOOL_NAME => {
             let request: GitDiffRequest = parse_arguments(&tool_call)?;
             let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
                 .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
-            let diff = repository
-                .diff(request)
-                .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(git_error)?;
+            let diff = repository.diff(request).await.map_err(git_error)?;
             let review = ReviewAnalyzer::analyze(&diff);
             state.record_review(workspace.root(), &review)?;
             bounded_review_result(review, config.output_limit)
@@ -1841,7 +1882,7 @@ pub(crate) async fn execute_async(
             }
             let capabilities = ProjectDiscovery::discover(&workspace, params.max_files)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
-            let execution = ValidationService::run(
+            let mut execution = ValidationService::run(
                 &workspace,
                 &capabilities,
                 &params.command_id,
@@ -1853,6 +1894,8 @@ pub(crate) async fn execute_async(
             .await;
             state.invalidate_intelligence(workspace.root());
             state.record_validation_execution(workspace.root(), &execution)?;
+            execution.action.recovery_decision =
+                state.recovery_decision_for(workspace.root(), &execution.action);
             bounded_validation_result(execution, config.output_limit)
         }
         LSP_QUERY_TOOL_NAME => {
@@ -1969,16 +2012,14 @@ pub(crate) fn execute_with_state(
                     end_line: params.end_line,
                 },
             )
-            .map_err(|error| invalid_arguments(error.to_string()))?;
+            .map_err(file_error)?;
             state.note_read_files(workspace.root(), vec![snapshot.path.clone()]);
             json_result(&snapshot, config.output_limit)
         }
         PREVIEW_CHANGES_TOOL_NAME => {
             let batch: MutationBatch = parse_arguments(&tool_call)?;
             let engine = PatchEngine::new(&workspace, patch_limits(config));
-            let prepared = engine
-                .prepare(batch)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let prepared = engine.prepare(batch).map_err(patch_error)?;
             json_result(&prepared.preview, config.output_limit)
         }
         APPLY_CHANGES_TOOL_NAME => {
@@ -1986,17 +2027,14 @@ pub(crate) fn execute_with_state(
             let _mutation = state.mutation_guard();
             state.authorize_mutation_locked(workspace.root())?;
             let engine = PatchEngine::new(&workspace, patch_limits(config));
-            let prepared = engine
-                .prepare(batch)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let prepared = engine.prepare(batch).map_err(patch_error)?;
             let prospective_result = MutationResult {
                 rollback_id: "00000000-0000-7000-8000-000000000000".to_string(),
                 preview: prepared.preview.clone(),
+                action: ActionResult::succeeded(true, true),
             };
             ensure_json_fits(&prospective_result, config.output_limit)?;
-            let applied = engine
-                .apply(prepared)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let applied = engine.apply(prepared).map_err(patch_error)?;
             let change_id = applied.result.rollback_id.clone();
             state.remember(workspace.root(), applied.rollback, &applied.result.preview);
             state.record_mutation_locked(workspace.root(), change_id, &applied.result.preview)?;
@@ -2007,7 +2045,7 @@ pub(crate) fn execute_with_state(
             let params: WriteFileParams = parse_arguments(&tool_call)?;
             let write_path = workspace
                 .resolve_for_write(&params.path)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+                .map_err(workspace_error)?;
             let path_exists = match write_path.symlink_metadata() {
                 Ok(_) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -2060,9 +2098,7 @@ pub(crate) fn execute_with_state(
                 ))
             })?;
             let engine = PatchEngine::new(&workspace, patch_limits(config));
-            let result = engine
-                .rollback(record)
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let result = engine.rollback(record).map_err(patch_error)?;
             state.forget(&params.rollback_id);
             state.record_rollback_locked(workspace.root(), &params.rollback_id)?;
             state.invalidate_intelligence(workspace.root());
@@ -3579,7 +3615,7 @@ fn normalize_plan_paths(
     ) {
         let resolved = workspace
             .resolve_for_write(&*path)
-            .map_err(|error| invalid_arguments(error.to_string()))?;
+            .map_err(workspace_error)?;
         let relative = resolved
             .strip_prefix(workspace.root())
             .map(Path::to_path_buf)
@@ -3778,20 +3814,92 @@ fn output_too_large(size: usize, output_limit: usize) -> ErrorData {
     ))
 }
 
-fn invalid_workspace(error: impl std::fmt::Display) -> ErrorData {
-    invalid_arguments(format!("invalid coding workspace: {error}"))
+fn invalid_workspace(error: WorkspaceError) -> ErrorData {
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        format!("invalid coding workspace: {error}"),
+        error.failure_kind(),
+    )
+}
+
+fn workspace_error(error: WorkspaceError) -> ErrorData {
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        error.to_string(),
+        error.failure_kind(),
+    )
 }
 
 fn invalid_arguments(message: impl Into<String>) -> ErrorData {
-    ErrorData::new(ErrorCode::INVALID_PARAMS, message.into(), None)
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        message,
+        ActionFailureKind::InvalidArguments,
+    )
 }
 
 fn internal_error(message: impl Into<String>) -> ErrorData {
-    ErrorData::new(ErrorCode::INTERNAL_ERROR, message.into(), None)
+    action_error(
+        ErrorCode::INTERNAL_ERROR,
+        message,
+        ActionFailureKind::InternalFailure,
+    )
 }
 
 fn tool_unavailable(message: impl Into<String>) -> ErrorData {
-    ErrorData::new(ErrorCode::INVALID_REQUEST, message.into(), None)
+    action_error(
+        ErrorCode::INVALID_REQUEST,
+        message,
+        ActionFailureKind::CapabilityUnavailable,
+    )
+}
+
+fn action_error(
+    code: ErrorCode,
+    message: impl Into<String>,
+    failure_kind: ActionFailureKind,
+) -> ErrorData {
+    error_with_action(code, message, ActionResult::failed(failure_kind, false))
+}
+
+fn file_error(error: FileReadError) -> ErrorData {
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        error.to_string(),
+        error.failure_kind(),
+    )
+}
+
+fn patch_error(error: PatchError) -> ErrorData {
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        error.to_string(),
+        error.failure_kind(),
+    )
+}
+
+fn process_error(error: ProcessError) -> ErrorData {
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        error.to_string(),
+        error.failure_kind(),
+    )
+}
+
+fn git_error(error: GitError) -> ErrorData {
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        error.to_string(),
+        error.failure_kind(),
+    )
+}
+
+fn workflow_error(error: WorkflowError) -> ErrorData {
+    action_error(
+        ErrorCode::INVALID_PARAMS,
+        error.to_string(),
+        error.failure_kind(),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -5364,6 +5472,8 @@ mod tests {
         assert_eq!(json["status"], "not_present");
         assert!(json["command"].is_null());
         assert!(json["output"].is_null());
+        assert_eq!(json["action"]["failure_kind"], "capability_unavailable");
+        assert_eq!(json["action"]["recovery_decision"], "stop_blocked");
     }
 
     #[test]

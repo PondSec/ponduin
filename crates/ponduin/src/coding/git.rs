@@ -1,4 +1,5 @@
 use crate::coding::file::{content_digest, FileReadOptions, FileSnapshot, MAX_READ_LIMIT};
+use crate::coding::outcome::ActionFailureKind;
 use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRunner};
 use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
@@ -1419,6 +1420,39 @@ pub enum GitError {
         remote: String,
         exit_code: Option<i32>,
     },
+}
+
+impl GitError {
+    pub(crate) fn failure_kind(&self) -> ActionFailureKind {
+        match self {
+            Self::TimedOut(_) => ActionFailureKind::TimedOut,
+            Self::Process(error) => error.failure_kind(),
+            Self::Workspace(error) => error.failure_kind(),
+            Self::RepositoryOutsideWorkspace(_)
+            | Self::SensitivePath(_)
+            | Self::UnsafePushRemote(_) => ActionFailureKind::PolicyBlocked,
+            Self::AppliedDigestMismatch { .. }
+            | Self::PreexistingStagedChange(_)
+            | Self::OriginalIndexStateMismatch(_)
+            | Self::OriginalDoesNotMatchIndex { .. }
+            | Self::StagedPathsMismatch { .. }
+            | Self::RevertHeadMismatch { .. }
+            | Self::PushHeadMismatch { .. } => ActionFailureKind::StaleState,
+            Self::RepositoryRootNotDirectory(_)
+            | Self::OwnedWorktreeUnavailable { .. }
+            | Self::IndexBlobUnavailable(_) => ActionFailureKind::ResourceMissing,
+            Self::CommandFailed { .. } | Self::PushFailed { .. } => {
+                ActionFailureKind::ProcessFailed
+            }
+            Self::FilterConfigurationTruncated
+            | Self::ChangedPathOutputTruncated
+            | Self::MalformedOutput(_)
+            | Self::RevertCleanupFailed { .. }
+            | Self::RevertCleanupIncomplete => ActionFailureKind::InternalFailure,
+            Self::InvalidPushRemote(_) => ActionFailureKind::InvalidArguments,
+            _ => ActionFailureKind::InvalidArguments,
+        }
+    }
 }
 
 #[cfg(test)]

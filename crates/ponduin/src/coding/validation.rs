@@ -1,3 +1,4 @@
+use crate::coding::outcome::{ActionFailureKind, ActionResult};
 use crate::coding::process::{
     ProcessError, ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner,
 };
@@ -30,6 +31,7 @@ impl ValidationService {
                     "validation command id `{command_id}` was not found in current project discovery"
                 )),
                 output: None,
+                action: ActionResult::failed(ActionFailureKind::CapabilityUnavailable, true),
             };
         };
 
@@ -42,17 +44,27 @@ impl ValidationService {
             })
             .await;
         match output {
-            Ok(output) => ValidationExecution {
-                command: Some(command.clone()),
-                status: status_for_output(&output),
-                reason: None,
-                output: Some(output),
-            },
+            Ok(output) => {
+                let status = status_for_output(&output);
+                let action = if status == ValidationStatus::Failed {
+                    ActionResult::failed(ActionFailureKind::ValidationFailed, true)
+                } else {
+                    output.action_result()
+                };
+                ValidationExecution {
+                    command: Some(command.clone()),
+                    status,
+                    reason: None,
+                    output: Some(output),
+                    action,
+                }
+            }
             Err(error) => ValidationExecution {
                 command: Some(command.clone()),
                 status: status_for_error(&error),
                 reason: Some(error.to_string()),
                 output: None,
+                action: ActionResult::failed(error.failure_kind(), true),
             },
         }
     }
@@ -63,6 +75,7 @@ impl ValidationService {
             status: ValidationStatus::Skipped,
             reason: Some(reason),
             output: None,
+            action: ActionResult::failed(ActionFailureKind::PermissionRequired, true),
         }
     }
 }
@@ -73,6 +86,8 @@ pub struct ValidationExecution {
     pub status: ValidationStatus,
     pub reason: Option<String>,
     pub output: Option<ProcessOutput>,
+    #[serde(default)]
+    pub action: ActionResult,
 }
 
 impl ValidationExecution {
@@ -192,9 +207,25 @@ mod tests {
 
         assert_eq!(passed.status, ValidationStatus::Passed);
         assert!(passed.passed());
+        assert_eq!(
+            passed.action.outcome,
+            crate::coding::outcome::ActionOutcome::Succeeded
+        );
         assert_eq!(failed.status, ValidationStatus::Failed);
+        assert_eq!(
+            failed.action.failure_kind,
+            Some(ActionFailureKind::ValidationFailed)
+        );
         assert_eq!(missing.status, ValidationStatus::NotExecutable);
+        assert_eq!(
+            missing.action.failure_kind,
+            Some(ActionFailureKind::CapabilityUnavailable)
+        );
         assert_eq!(absent.status, ValidationStatus::NotPresent);
+        assert_eq!(
+            absent.action.failure_kind,
+            Some(ActionFailureKind::CapabilityUnavailable)
+        );
     }
 
     #[tokio::test]
@@ -207,6 +238,10 @@ mod tests {
 
         assert_eq!(result.status, ValidationStatus::Blocked);
         assert!(result.output.is_none());
+        assert_eq!(
+            result.action.failure_kind,
+            Some(ActionFailureKind::PolicyBlocked)
+        );
     }
 
     #[test]
@@ -216,5 +251,9 @@ mod tests {
 
         assert_eq!(result.status, ValidationStatus::Skipped);
         assert!(!result.passed());
+        assert_eq!(
+            result.action.failure_kind,
+            Some(ActionFailureKind::PermissionRequired)
+        );
     }
 }

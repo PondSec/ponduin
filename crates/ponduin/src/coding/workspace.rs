@@ -1,3 +1,4 @@
+use crate::coding::outcome::ActionFailureKind;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
@@ -166,9 +167,34 @@ pub enum WorkspaceError {
     NoExistingAncestor(PathBuf),
 }
 
+impl WorkspaceError {
+    pub(crate) fn failure_kind(&self) -> ActionFailureKind {
+        match self {
+            Self::RootUnavailable { source, .. } | Self::PathUnavailable { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                ActionFailureKind::ResourceMissing
+            }
+            Self::RootNotDirectory(_) | Self::NoExistingAncestor(_) => {
+                ActionFailureKind::ResourceMissing
+            }
+            Self::OutsideWorkspace(_) | Self::ParentTraversal(_) => {
+                ActionFailureKind::PolicyBlocked
+            }
+            Self::RootUnavailable { .. } | Self::PathUnavailable { .. } => {
+                ActionFailureKind::TransientFailure
+            }
+            Self::EmptyRoot | Self::RootNotAbsolute(_) | Self::EmptyPath => {
+                ActionFailureKind::InvalidArguments
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::outcome::ActionFailureKind;
     use std::fs;
 
     #[test]
@@ -185,6 +211,22 @@ mod tests {
             CodingWorkspace::new(&file),
             Err(WorkspaceError::RootNotDirectory(_))
         ));
+    }
+
+    #[test]
+    fn classifies_missing_and_policy_workspace_failures() {
+        assert_eq!(
+            WorkspaceError::NoExistingAncestor(PathBuf::from("missing/file")).failure_kind(),
+            ActionFailureKind::ResourceMissing
+        );
+        assert_eq!(
+            WorkspaceError::ParentTraversal(PathBuf::from("../outside")).failure_kind(),
+            ActionFailureKind::PolicyBlocked
+        );
+        assert_eq!(
+            WorkspaceError::EmptyPath.failure_kind(),
+            ActionFailureKind::InvalidArguments
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::coding::outcome::ActionFailureKind;
 use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
 use serde::{Deserialize, Serialize};
@@ -194,6 +195,24 @@ pub enum FileReadError {
         #[source]
         source: io::Error,
     },
+}
+
+impl FileReadError {
+    pub(crate) fn failure_kind(&self) -> ActionFailureKind {
+        match self {
+            Self::NotFile(_) => ActionFailureKind::ResourceMissing,
+            Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                ActionFailureKind::ResourceMissing
+            }
+            Self::Workspace(error) => error.failure_kind(),
+            Self::OutsideWorkspace(_) | Self::Sensitive(_) => ActionFailureKind::PolicyBlocked,
+            Self::Io { .. } => ActionFailureKind::TransientFailure,
+            Self::Binary(_) | Self::TooLarge { .. } => ActionFailureKind::CapabilityUnavailable,
+            Self::InvalidLimit { .. } | Self::InvalidLineRange { .. } => {
+                ActionFailureKind::InvalidArguments
+            }
+        }
+    }
 }
 
 #[cfg(test)]

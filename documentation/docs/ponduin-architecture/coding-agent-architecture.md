@@ -353,6 +353,30 @@ The record contains the command, working directory, exit code, duration,
 bounded stdout and stderr, and reason. Completion reports are generated from
 these records, so an unexecuted check cannot be presented as passed.
 
+### Structured action outcomes and recovery
+
+Coding subsystems classify a failed action at the boundary that has the needed
+context. File reads and mutations distinguish stale workspace state, missing
+resources, and workspace policy denials; processes distinguish timeout,
+capability, policy, and transient failures; validation distinguishes a failed
+check from an unavailable or blocked check; and workflow dispatch distinguishes
+invalid arguments from an invalid phase.
+
+The shared `ActionResult` carries the outcome, optional semantic failure kind,
+retryability, whether state changed, and whether detailed evidence was
+retained. Tool errors include that result as machine-readable data while
+retaining their original diagnostic text. Validation returns its result in the
+normal tool payload, so the model can inspect bounded diagnostics without a
+failed check ever qualifying as completion.
+
+`decide_recovery` is the single runtime mapping from a semantic failure plus
+workflow context to a recovery decision. It refreshes stale state, reinspects
+missing resources, asks for corrected arguments, requires diagnostics or a new
+repair strategy for failed checks, selects an alternative capability when one
+is exposed, and stops policy-blocked, cancelled, or internal failures. The
+workflow's existing phase, attempt history, and `next_action` provide that
+context; this does not introduce another state machine.
+
 ## Coding loop and progress detection
 
 The coding strategy uses the current agent loop:

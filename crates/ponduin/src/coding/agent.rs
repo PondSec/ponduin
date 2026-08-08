@@ -1,4 +1,8 @@
 use crate::coding::config::CodingConfig;
+use crate::coding::outcome::{
+    action_result_from_error, decide_recovery, error_with_action, ActionFailureKind, ActionResult,
+    RecoveryDecision,
+};
 use crate::coding::strategy::MODEL_ROUTING_GUIDANCE;
 use crate::coding::tools;
 use crate::coding::{CodingWorkspace, ModelCapabilityProfile, TaskInteractionMode};
@@ -574,18 +578,18 @@ impl CodingAgent {
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(self.with_contract_recovery(
+            return Err(self.with_recovery_decision(
                 &tool_state,
                 workspace.root(),
                 tool_call.name.as_ref(),
-                ErrorData::new(
+                error_with_action(
                     ErrorCode::INVALID_PARAMS,
                     format!(
                     "internal coding tool `{}` is not currently allowed by the active workflow; \
                      choose one of: {next_tools}",
                     tool_call.name
                 ),
-                    None,
+                    ActionResult::failed(ActionFailureKind::WorkflowStateViolation, false),
                 ),
             ));
         }
@@ -609,99 +613,40 @@ impl CodingAgent {
             })?
         };
         result.map_err(|error| {
-            self.with_contract_recovery(&tool_state, workspace.root(), &tool_name, error)
+            self.with_recovery_decision(&tool_state, workspace.root(), &tool_name, error)
         })
     }
 
-    fn with_contract_recovery(
+    fn with_recovery_decision(
         &self,
         tool_state: &tools::CodingToolState,
         workspace_root: &Path,
         tool_name: &str,
         error: ErrorData,
     ) -> ErrorData {
-        if error.code != ErrorCode::INVALID_PARAMS {
+        let mut action = action_result_from_error(&error);
+        let Some(failure_kind) = action.failure_kind else {
             return error;
-        }
+        };
         let repetitions = tool_state
-            .record_tool_contract_failure(
-                workspace_root,
-                tool_name,
-                contract_failure_class(tool_name, &error.message),
-            )
+            .record_action_failure(workspace_root, tool_name, failure_kind)
             .unwrap_or(1);
         let workflow_hint = tool_state
             .active_workflow_id(workspace_root)
             .map(|workflow_id| format!(" Current workflow ID: `{workflow_id}`."))
             .unwrap_or_default();
-        let next_step_guidance = tool_state.workflow_guidance_for_workspace(workspace_root);
-        let recovery = match repetitions {
-            1 if error.message.contains("not currently allowed") => {
-                next_step_guidance.as_deref().unwrap_or(
-                    "The request was blocked. Read the active workflow status and take its next allowed step before retrying.",
-                )
-            }
-            1 if is_versioned_mutation_tool(tool_name)
-                && (error.message.contains("missing field `expected_digest`")
-                    || error.message.contains("digest conflict")
-                    || error.message.contains("file already exists")) => {
-                "Read the existing file with coding__read_file first, then retry the write with the exact expected_digest returned for that path."
-            }
-            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-                && error.message.contains("missing field `changes`") => {
-                "Apply changes requires a non-empty changes array. Read the target file for its current digest, then send one write change with operation, path, content, and that exact expected_digest."
-            }
-            1 if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-                && error.message.contains("expected a sequence") => {
-                "The changes field must be a JSON array, not a quoted JSON string. Send changes: [{\"operation\":\"create\",\"path\":\"index.html\",\"content\":\"...\"}] directly, without JSON.stringify or extra quotes."
-            }
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("expected a sequence") => {
-                "The compact plan fields relevant_files, plan_steps, and args must be JSON arrays, never a formatted text block. Send intended_change as one plain sentence and send plan_steps: [\"Create index.html\",\"Style the page\",\"Add the button behavior\"] directly in the tool arguments."
-            }
-            1 if tool_name == tools::FIND_FILES_TOOL_NAME
-                && error.message.contains("search query must not be empty") => {
-                "Find-files requires a non-empty query. Search for a known filename such as \"lib.rs\" or a relevant symbol, never an empty string."
-            }
-            1 if tool_name == tools::WORKFLOW_START_TOOL_NAME
-                && error.message.contains("missing field `objective`") => {
-                "Start the workflow with a non-empty objective field, for example {\"objective\":\"Repair normalize_label in lib.rs so cargo test passes\"}."
-            }
-            1 if tool_name == tools::READ_FILE_TOOL_NAME
-                && error.message.contains("expected path string") => {
-                "The read path must be a plain string, for example {\"path\":\"lib.rs\"}. Do not wrap path in an object."
-            }
-            1 if error.message.contains("requested path is unavailable") => match tool_name {
-                tools::REPOSITORY_INSTRUCTIONS_TOOL_NAME => {
-                    "Repository-instructions accepts one existing workspace-relative path. Retry it with no path to inspect the workspace root, or supply exactly one existing relative path; never use /workspace or a comma-separated list."
-                }
-                tools::READ_FILE_TOOL_NAME => {
-                    "The file does not exist. Do not guess paths; call coding__find_files, then read only one returned workspace-relative file path."
-                }
-                _ => {
-                    "Use exactly one existing workspace-relative path, never /workspace or a comma-separated list. Call coding__find_files first if the path is unknown."
-                }
-            },
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("expected struct WorkflowPlan") => {
-                "The plan argument must be a JSON object, not serialized JSON inside a string. Use plan: {...}; use command program \"cargo\" with args [\"test\"]."
-            }
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("invalid workflow plan path") => {
-                "Plan relevant_files must contain individual workspace-relative files, never a directory or an absolute path. Use a returned file path such as src/lib.rs."
-            }
-            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
-                && error.message.contains("plan field `intended changes`") => {
-                "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"] with the current workflow_id."
-            }
-            1 => "The request was not executed. Correct the tool name and arguments from the currently exposed schema before retrying.",
-            2 => "Do not repeat this tool contract. Call coding__find_files with one concrete filename or symbol next, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
-            _ => "The workflow is now blocked after repeated identical tool-contract failures. Report the recorded stop reason and do not claim success.",
-        };
+        let mut recovery_context = tool_state.recovery_context(workspace_root);
+        recovery_context.repetitions = repetitions;
+        let decision = decide_recovery(failure_kind, recovery_context);
+        action.recovery_decision = Some(decision);
+        let recovery = recovery_guidance(decision, failure_kind);
         ErrorData::new(
             error.code,
             format!("{}{} Recovery: {recovery}", error.message, workflow_hint),
-            None,
+            Some(serde_json::json!({
+                "action": action,
+                "recovery_decision": decision,
+            })),
         )
     }
 
@@ -795,39 +740,45 @@ fn normalize_structured_tool_arguments(tool_call: &mut CallToolRequestParams) {
     }
 }
 
-fn contract_failure_class(tool_name: &str, message: &str) -> &'static str {
-    if message.contains("not currently allowed") {
-        "workflow_phase"
-    } else if is_versioned_mutation_tool(tool_name)
-        && message.contains("missing field `expected_digest`")
-    {
-        "missing_digest"
-    } else if is_versioned_mutation_tool(tool_name) && message.contains("digest conflict") {
-        "stale_digest"
-    } else if is_versioned_mutation_tool(tool_name) && message.contains("file already exists") {
-        "missing_digest"
-    } else if tool_name == tools::APPLY_CHANGES_TOOL_NAME
-        && message.contains("missing field `changes`")
-    {
-        "missing_changes"
-    } else if message.contains("requested path is unavailable") {
-        "unavailable_path"
-    } else if message.contains("missing field `objective`") {
-        "missing_objective"
-    } else if message.contains("expected path string") {
-        "malformed_path"
-    } else if message.contains("search query must not be empty") {
-        "empty_file_query"
-    } else {
-        "invalid_tool_contract"
+fn recovery_guidance(decision: RecoveryDecision, failure_kind: ActionFailureKind) -> &'static str {
+    match decision {
+        RecoveryDecision::RetryWithCorrectedArguments => {
+            "The action was not executed. Correct the arguments against the currently exposed schema before retrying."
+        }
+        RecoveryDecision::RefreshState => {
+            "Refresh the current workspace state with a bounded read before retrying this action."
+        }
+        RecoveryDecision::ReinspectResource => {
+            "Reinspect the workspace and use only a discovered resource path before trying again."
+        }
+        RecoveryDecision::InspectDiagnostics => {
+            "Inspect the retained diagnostics, then make a targeted repair before validating again."
+        }
+        RecoveryDecision::Replan => {
+            "Read the active workflow status and take its currently allowed next action; do not repeat this phase violation."
+        }
+        RecoveryDecision::UseAlternativeCapability => {
+            "Use an available alternative capability from the current tool surface instead of retrying the unavailable action."
+        }
+        RecoveryDecision::ChangeStrategy => {
+            "A changed repair strategy is required before another attempt; do not repeat the same failing action."
+        }
+        RecoveryDecision::RequestApproval => {
+            "The action needs explicit approval before it can continue."
+        }
+        RecoveryDecision::StopBlocked => {
+            "This action is blocked by the available capability or policy. Report the factual blocker without retrying it."
+        }
+        RecoveryDecision::StopCancelled => {
+            "The workflow was cancelled and must not be resumed automatically."
+        }
+        RecoveryDecision::StopFailed => match failure_kind {
+            ActionFailureKind::RepeatedFailure => {
+                "The repeated failure reached a terminal workflow state. Report the retained evidence and do not claim completion."
+            }
+            _ => "The workflow reached a terminal state. Report the retained evidence and do not claim completion.",
+        },
     }
-}
-
-fn is_versioned_mutation_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        tools::APPLY_CHANGES_TOOL_NAME | tools::WRITE_FILE_TOOL_NAME
-    )
 }
 
 fn uses_compact_qwen_coding_tools(model_config: &ModelConfig) -> bool {
@@ -848,6 +799,21 @@ mod tests {
 
     fn enabled_agent() -> CodingAgent {
         CodingAgent::new(CodingConfig::default())
+    }
+
+    fn failure_kind(error: &ErrorData) -> ActionFailureKind {
+        action_result_from_error(error)
+            .failure_kind
+            .expect("coding action errors must carry a failure kind")
+    }
+
+    fn recovery_decision(error: &ErrorData) -> RecoveryDecision {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("recovery_decision"))
+            .and_then(|decision| serde_json::from_value(decision.clone()).ok())
+            .expect("coding action errors must carry a recovery decision")
     }
 
     #[test]
@@ -1081,10 +1047,10 @@ mod tests {
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
 
         for _ in 0..3 {
-            agent.tool_state.record_tool_contract_failure(
+            agent.tool_state.record_action_failure(
                 workspace.root(),
                 tools::WORKFLOW_SET_PLAN_TOOL_NAME,
-                "invalid_tool_contract",
+                ActionFailureKind::InvalidArguments,
             );
         }
 
@@ -1139,9 +1105,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("The plan is accepted"));
-        assert!(error.message.contains("coding__workflow_transition"));
-        assert!(error.message.contains("begin_editing"));
+        assert_eq!(
+            failure_kind(&error),
+            ActionFailureKind::WorkflowStateViolation
+        );
+        assert_eq!(recovery_decision(&error), RecoveryDecision::Replan);
     }
 
     #[tokio::test]
@@ -1179,10 +1147,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error
-            .message
-            .contains("intended_change must be one non-empty sentence"));
-        assert!(error.message.contains("validation_program \"cargo\""));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1198,10 +1167,10 @@ mod tests {
         )
         .await;
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
-        agent.tool_state.record_tool_contract_failure(
+        agent.tool_state.record_action_failure(
             workspace.root(),
             tools::APPLY_CHANGES_TOOL_NAME,
-            "workflow_phase",
+            ActionFailureKind::WorkflowStateViolation,
         );
 
         let error = agent
@@ -1221,9 +1190,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("missing field `expected_digest`"));
-        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
-        assert!(error.message.contains("expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1251,9 +1222,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("file already exists"));
-        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
-        assert!(error.message.contains("expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::StaleState);
+        assert_eq!(recovery_decision(&error), RecoveryDecision::RefreshState);
     }
 
     #[tokio::test]
@@ -1270,10 +1240,10 @@ mod tests {
         .await;
 
         let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
-        agent.tool_state.record_tool_contract_failure(
+        agent.tool_state.record_action_failure(
             workspace.root(),
             tools::APPLY_CHANGES_TOOL_NAME,
-            "workflow_phase",
+            ActionFailureKind::WorkflowStateViolation,
         );
 
         let error = agent
@@ -1292,13 +1262,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error.message.contains("digest conflict"),
-            "{}",
-            error.message
-        );
-        assert!(error.message.contains(tools::READ_FILE_TOOL_NAME));
-        assert!(error.message.contains("exact expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::StaleState);
+        assert_eq!(recovery_decision(&error), RecoveryDecision::RefreshState);
     }
 
     #[tokio::test]
@@ -1324,9 +1289,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("missing field `changes`"));
-        assert!(error.message.contains("non-empty changes array"));
-        assert!(error.message.contains("expected_digest"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1422,9 +1389,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("expected a sequence"));
-        assert!(error.message.contains("compact plan fields relevant_files"));
-        assert!(error.message.contains("formatted text block"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1521,8 +1490,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("missing field `objective`"));
-        assert!(error.message.contains("Repair normalize_label in lib.rs"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1550,8 +1522,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("Do not guess paths"));
-        assert!(error.message.contains(tools::FIND_FILES_TOOL_NAME));
+        assert_eq!(failure_kind(&error), ActionFailureKind::ResourceMissing);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::ReinspectResource
+        );
     }
 
     #[tokio::test]
@@ -1579,8 +1554,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("with no path"));
-        assert!(error.message.contains("comma-separated list"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1608,8 +1586,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("non-empty query"));
-        assert!(error.message.contains("lib.rs"));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1637,8 +1618,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("plain string"));
-        assert!(error.message.contains("\"path\":\"lib.rs\""));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1666,8 +1650,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        assert!(error.message.contains("JSON object"));
-        assert!(error.message.contains("program \"cargo\""));
+        assert_eq!(failure_kind(&error), ActionFailureKind::InvalidArguments);
+        assert_eq!(
+            recovery_decision(&error),
+            RecoveryDecision::RetryWithCorrectedArguments
+        );
     }
 
     #[tokio::test]
@@ -1692,6 +1679,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            failure_kind(&error),
+            ActionFailureKind::WorkflowStateViolation
+        );
+        assert_eq!(recovery_decision(&error), RecoveryDecision::Replan);
         assert!(error.message.contains("not currently allowed"));
         assert!(error.message.contains(tools::WORKFLOW_START_TOOL_NAME));
         assert!(!temp_dir.path().join("must-not-exist.txt").exists());

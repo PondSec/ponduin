@@ -1,5 +1,8 @@
 use crate::coding::file::content_digest;
 use crate::coding::intelligence::CodeSymbol;
+use crate::coding::outcome::ActionFailureKind;
+#[cfg(test)]
+use crate::coding::outcome::ActionResult;
 use crate::coding::patch::MutationPreview;
 use crate::coding::process::ProcessOutput;
 use crate::coding::review::{ReviewReport, ReviewSeverity};
@@ -197,12 +200,16 @@ impl CodingWorkflow {
         Ok(())
     }
 
-    pub fn record_tool_contract_failure(&mut self, tool_name: &str, error_class: &str) -> usize {
+    pub fn record_action_failure(
+        &mut self,
+        tool_name: &str,
+        failure_kind: ActionFailureKind,
+    ) -> usize {
         if self.is_terminal() {
             return 0;
         }
         let diagnostic_fingerprint =
-            content_digest(format!("{tool_name}\0{error_class}").as_bytes());
+            content_digest(format!("{tool_name}\0{failure_kind:?}").as_bytes());
         let repetitions = self
             .memory
             .tool_contract_errors
@@ -215,6 +222,7 @@ impl CodingWorkflow {
             .push(ToolContractErrorEvidence {
                 revision: self.revision,
                 tool_name: tool_name.to_string(),
+                failure_kind,
                 diagnostic_fingerprint,
                 repetitions,
             });
@@ -1296,6 +1304,8 @@ pub struct WorkflowMemory {
 pub struct ToolContractErrorEvidence {
     pub revision: u32,
     pub tool_name: String,
+    #[serde(default)]
+    pub failure_kind: ActionFailureKind,
     pub diagnostic_fingerprint: String,
     pub repetitions: usize,
 }
@@ -1421,6 +1431,8 @@ pub struct ValidationEvidence {
     pub output_truncated: bool,
     pub error_count: usize,
     pub diagnostic_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<ActionFailureKind>,
     #[serde(default)]
     pub planned_check_ids: Vec<String>,
 }
@@ -1469,6 +1481,7 @@ impl ValidationEvidence {
             output_truncated: output.output_truncated,
             error_count,
             diagnostic_fingerprint,
+            failure_kind: output.action_result().failure_kind,
             planned_check_ids,
         }
     }
@@ -1487,6 +1500,7 @@ impl ValidationEvidence {
                 planned_check_ids,
             );
             evidence.outcome = ValidationOutcome::from(execution.status);
+            evidence.failure_kind = execution.action.failure_kind;
             return evidence;
         }
 
@@ -1520,6 +1534,7 @@ impl ValidationEvidence {
             output_truncated: false,
             error_count: 0,
             diagnostic_fingerprint: content_digest(diagnostics.as_bytes()),
+            failure_kind: execution.action.failure_kind,
             planned_check_ids,
         }
     }
@@ -1833,6 +1848,27 @@ pub enum WorkflowError {
     Evidence(String),
     #[error("completed, blocked, or failed workflows cannot update working memory")]
     TerminalMemoryUpdate,
+}
+
+impl WorkflowError {
+    pub(crate) fn failure_kind(&self) -> ActionFailureKind {
+        match self {
+            Self::InvalidTransition { .. }
+            | Self::PlanRequired
+            | Self::ChangeRequired
+            | Self::ValidationRequired
+            | Self::ReviewRequired
+            | Self::MandatoryRequirementsOpen(_)
+            | Self::TerminalMemoryUpdate => ActionFailureKind::WorkflowStateViolation,
+            Self::ValidationFailed | Self::ReviewFailed => ActionFailureKind::ValidationFailed,
+            Self::RepairStrategyRequired | Self::RepeatedRepairStrategy(_) => {
+                ActionFailureKind::RepeatedFailure
+            }
+            Self::IterationLimit(_) | Self::RepairLimit(_) => ActionFailureKind::RepeatedFailure,
+            Self::Evidence(_) => ActionFailureKind::InternalFailure,
+            _ => ActionFailureKind::InvalidArguments,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2373,11 +2409,44 @@ mod tests {
                 status: ValidationStatus::NotPresent,
                 reason: Some("not discovered".to_string()),
                 output: None,
+                action: ActionResult::failed(ActionFailureKind::CapabilityUnavailable, true),
             })
             .unwrap();
         assert!(matches!(
             workflow.begin_review(),
             Err(WorkflowError::ValidationRequired)
+        ));
+    }
+
+    #[test]
+    fn structured_validation_failure_enters_repair_and_blocks_completion() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change".to_string(), &preview("change"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_validation_execution(&ValidationExecution {
+                command: None,
+                status: ValidationStatus::Failed,
+                reason: Some("test command exited unsuccessfully".to_string()),
+                output: None,
+                action: ActionResult::failed(ActionFailureKind::ValidationFailed, true),
+            })
+            .unwrap();
+
+        let status = workflow.status();
+        assert_eq!(status.phase, WorkflowPhase::Debugging);
+        assert_eq!(status.next_action, WorkflowNextAction::BeginRepair);
+        assert_eq!(
+            workflow.validations[0].failure_kind,
+            Some(ActionFailureKind::ValidationFailed)
+        );
+        assert!(!workflow.can_complete());
+        assert!(matches!(
+            workflow.complete("must not complete".to_string(), Vec::new()),
+            Err(WorkflowError::InvalidTransition { .. })
         ));
     }
 
@@ -2481,15 +2550,24 @@ mod tests {
         let mut workflow = CodingWorkflow::new("repair the fixture".to_string(), limits()).unwrap();
 
         assert_eq!(
-            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            workflow.record_action_failure(
+                "coding__apply_changes",
+                ActionFailureKind::InvalidArguments,
+            ),
             1
         );
         assert_eq!(
-            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            workflow.record_action_failure(
+                "coding__apply_changes",
+                ActionFailureKind::InvalidArguments,
+            ),
             2
         );
         assert_eq!(
-            workflow.record_tool_contract_failure("coding__apply_changes", "invalid_params"),
+            workflow.record_action_failure(
+                "coding__apply_changes",
+                ActionFailureKind::InvalidArguments,
+            ),
             3
         );
 
