@@ -119,6 +119,22 @@ impl TestProvider {
         bytes_to_hex(hasher.finalize())
     }
 
+    fn replay_signature(messages: &[Message]) -> Vec<(rmcp::model::Role, Vec<String>)> {
+        messages
+            .iter()
+            .map(|message| {
+                (
+                    message.role.clone(),
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|content| content.as_text().map(str::to_string))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     fn load_records(file_path: &str) -> Result<HashMap<String, TestRecord>> {
         if !Path::new(file_path).exists() {
             return Ok(HashMap::new());
@@ -214,6 +230,19 @@ impl Provider for TestProvider {
                 let usage = record.output.usage.clone();
                 Ok(super::base::stream_from_single_message(message, usage))
             } else {
+                let signature = Self::replay_signature(messages);
+                let mut matches = records
+                    .values()
+                    .filter(|record| Self::replay_signature(&record.input.messages) == signature);
+                match (matches.next(), matches.next()) {
+                    (Some(record), None) => {
+                        return Ok(super::base::stream_from_single_message(
+                            record.output.message.clone(),
+                            record.output.usage.clone(),
+                        ));
+                    }
+                    _ => {}
+                }
                 Err(ProviderError::ExecutionError(format!(
                     "No recorded response found for input hash: {}",
                     hash
