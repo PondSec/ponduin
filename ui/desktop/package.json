@@ -50,7 +50,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.19.0",
-    "@mcp-ui/client": "6.1.0",
+    "@mcp-ui/client": "7.1.1",
     "@modelcontextprotocol/ext-apps": "^1.1.1",
     "@pondsec/ponduin-sdk": "workspace:*",
     "@radix-ui/react-accordion": "^1.2.12",
