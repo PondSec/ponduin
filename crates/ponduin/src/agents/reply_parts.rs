@@ -19,8 +19,8 @@ use crate::conversation::{fix_conversation, Conversation};
 use crate::providers::base::stream_from_single_message;
 use crate::providers::base::{MessageStream, Provider};
 use crate::providers::toolshim::{
-    augment_message_with_selected_tool_interpreter, convert_tool_messages_to_text,
-    modify_system_prompt_for_tool_json, sanitize_residual_markers,
+    augment_message_with_direct_tool_calls, augment_message_with_selected_tool_interpreter,
+    convert_tool_messages_to_text, modify_system_prompt_for_tool_json, sanitize_residual_markers,
 };
 use ponduin_providers::conversation::token_usage::{
     CostSource, ProviderStats, ProviderUsage, Usage,
@@ -146,6 +146,32 @@ async fn toolshim_postprocess(
     }
 }
 
+fn append_stream_message(previous: Option<Message>, message: Message) -> Message {
+    match previous {
+        Some(mut previous) => {
+            for new_content in message.content {
+                match (&mut previous.content.last_mut(), &new_content) {
+                    (Some(MessageContent::Text(last_text)), MessageContent::Text(new_text))
+                        if last_text
+                            .annotations
+                            .as_ref()
+                            .and_then(|a| a.audience.as_ref())
+                            == new_text
+                                .annotations
+                                .as_ref()
+                                .and_then(|a| a.audience.as_ref()) =>
+                    {
+                        last_text.text.push_str(&new_text.text);
+                    }
+                    _ => previous.content.push(new_content),
+                }
+            }
+            previous
+        }
+        None => message,
+    }
+}
+
 /// Fill `usage.stats` timing fields measured by the stream wrapper, keeping any
 /// values the provider already reported (e.g. MLX's own `elapsed_ms`).
 fn fill_stream_timing(
@@ -204,7 +230,8 @@ impl Agent {
         if coding_exposure == CodingToolExposure::Active {
             tools.retain(|tool| !crate::coding::tools::is_reserved_name(&tool.name));
             tools.retain(|tool| tool.name.as_ref() == FINAL_OUTPUT_TOOL_NAME);
-            tools.extend(self.coding_agent.tools_for_workspace_for_model(
+            tools.extend(self.coding_agent.tools_for_workspace_for_model_for_session(
+                session_id,
                 ponduin_mode,
                 working_dir,
                 &model_config,
@@ -318,7 +345,10 @@ impl Agent {
             system_prompt.push_str(&coding_prompt);
         }
         if coding_exposure == CodingToolExposure::Active {
-            if let Some(workflow_guidance) = self.coding_agent.workflow_guidance(working_dir) {
+            if let Some(workflow_guidance) = self
+                .coding_agent
+                .workflow_guidance_for_session(session_id, working_dir)
+            {
                 system_prompt.push_str("\n\n");
                 system_prompt.push_str(&workflow_guidance);
             }
@@ -333,6 +363,12 @@ impl Agent {
             toolshim_tools = tools.clone();
             // Empty the tools vector for provider completion
             tools = vec![];
+        } else if coding_exposure == CodingToolExposure::Active {
+            toolshim_tools = tools
+                .iter()
+                .filter(|tool| tool.name.as_ref().starts_with("coding__"))
+                .cloned()
+                .collect();
         }
 
         Ok((tools, toolshim_tools, system_prompt, model_config))
@@ -418,25 +454,7 @@ impl Agent {
                         if first_content_at.is_none() && message_has_timing_content(&msg) {
                             first_content_at = Some(std::time::Instant::now());
                         }
-                        accumulated_message = Some(match accumulated_message {
-                            Some(mut prev) => {
-                                for new_content in msg.content {
-                                    match (&mut prev.content.last_mut(), &new_content) {
-                                        (
-                                            Some(MessageContent::Text(last_text)),
-                                            MessageContent::Text(new_text),
-                                        ) if last_text.annotations.as_ref().and_then(|a| a.audience.as_ref()) == new_text.annotations.as_ref().and_then(|a| a.audience.as_ref()) => {
-                                            last_text.text.push_str(&new_text.text);
-                                        }
-                                        _ => {
-                                            prev.content.push(new_content);
-                                        }
-                                    }
-                                }
-                                prev
-                            }
-                            None => msg,
-                        });
+                        accumulated_message = Some(append_stream_message(accumulated_message, msg));
                     }
 
                     if let Some(usage) = usage_opt {
@@ -459,6 +477,44 @@ impl Agent {
                     // Preserve usage-only responses (no message content)
                     yield (None, final_usage);
                 }
+            } else if !toolshim_tools.is_empty() {
+                // Native providers stream text in small deltas. A local model can emit a valid
+                // JSON tool directive across several deltas, so interpret the complete response
+                // once before exposing it to the workflow. This only affects active coding turns
+                // that have a bounded set of recovery tools.
+                let mut accumulated_message: Option<Message> = None;
+                let mut final_usage: Option<ProviderUsage> = None;
+                let mut first_content_at: Option<std::time::Instant> = None;
+
+                while let Some(result) = stream.next().await {
+                    let (message, usage) = result?;
+
+                    if let Some(message) = message {
+                        if first_content_at.is_none() && message_has_timing_content(&message) {
+                            first_content_at = Some(std::time::Instant::now());
+                        }
+                        accumulated_message = Some(append_stream_message(accumulated_message, message));
+                    }
+                    if let Some(usage) = usage {
+                        final_usage = Some(usage);
+                    }
+
+                    // Preserve the agent loop's cancellation observation while buffering a
+                    // potential structured directive.
+                    yield (None, None);
+                }
+
+                if let Some(usage) = final_usage.as_mut() {
+                    fill_stream_timing(usage, request_started, first_content_at);
+                }
+
+                if let Some(message) = accumulated_message {
+                    let message = augment_message_with_direct_tool_calls(message.clone(), &toolshim_tools)
+                        .unwrap_or(message);
+                    yield (Some(message), final_usage);
+                } else if final_usage.is_some() {
+                    yield (None, final_usage);
+                }
             } else {
                 let mut first_content_at: Option<std::time::Instant> = None;
                 while let Some(result) = stream.next().await {
@@ -472,6 +528,11 @@ impl Agent {
                     if let Some(usage) = usage.as_mut() {
                         fill_stream_timing(usage, request_started, first_content_at);
                     }
+
+                    let message = message.map(|message| {
+                        augment_message_with_direct_tool_calls(message.clone(), &toolshim_tools)
+                            .unwrap_or(message)
+                    });
 
                     yield (message, usage);
                 }
@@ -827,6 +888,65 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct JsonToolDirectiveProvider;
+
+    #[async_trait]
+    impl Provider for JsonToolDirectiveProvider {
+        fn get_name(&self) -> &str {
+            "json-tool-directive"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            Ok(stream_from_single_message(
+                Message::assistant().with_text(
+                    "I will inspect first.\n{\"name\":\"coding__repository_profile\",\"arguments\":{}}",
+                ),
+                ProviderUsage::new("json-tool-directive".to_string(), Usage::default()),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ChunkedJsonToolDirectiveProvider;
+
+    #[async_trait]
+    impl Provider for ChunkedJsonToolDirectiveProvider {
+        fn get_name(&self) -> &str {
+            "chunked-json-tool-directive"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let usage =
+                ProviderUsage::new("chunked-json-tool-directive".to_string(), Usage::default());
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok((
+                    Some(Message::assistant().with_text("{\"name\":\"coding__workflow_")),
+                    None,
+                )),
+                Ok((
+                    Some(
+                        Message::assistant()
+                            .with_text("start\",\"arguments\":{\"objective\":\"inspect\"}}"),
+                    ),
+                    Some(usage),
+                )),
+            ])))
+        }
+    }
+
     #[tokio::test]
     async fn provider_input_drops_rows_empty_after_agent_projection() {
         let user_only = TextContent::new("user-only ACP output")
@@ -952,6 +1072,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_coding_response_recovers_an_inline_json_tool_directive() {
+        let tool = Tool::new(
+            "coding__repository_profile".to_string(),
+            "Inspect the workspace".to_string(),
+            object!({ "type": "object", "properties": {} }),
+        );
+        let mut stream = crate::agents::Agent::stream_response_from_provider(
+            Arc::new(JsonToolDirectiveProvider),
+            ModelConfig::new("local-coder"),
+            "test-session",
+            "system",
+            &[Message::user().with_text("inspect")],
+            std::slice::from_ref(&tool),
+            std::slice::from_ref(&tool),
+        )
+        .await
+        .unwrap();
+
+        let mut recovered = None;
+        while let Some(item) = stream.next().await {
+            let (message, _) = item.unwrap();
+            if message.is_some() {
+                recovered = message;
+            }
+        }
+        let message = recovered.expect("provider should return a message");
+        let tool_call = message
+            .content
+            .iter()
+            .find_map(|content| match content {
+                MessageContent::ToolRequest(request) => request.tool_call.as_ref().ok(),
+                _ => None,
+            })
+            .expect("inline JSON directive should become a tool request");
+
+        assert_eq!(tool_call.name, "coding__repository_profile");
+        assert!(!message.as_concat_text().contains("\"arguments\""));
+    }
+
+    #[tokio::test]
+    async fn native_coding_response_recovers_a_json_tool_directive_split_across_stream_chunks() {
+        let tool = Tool::new(
+            "coding__workflow_start".to_string(),
+            "Start the coding workflow".to_string(),
+            object!({
+                "type": "object",
+                "properties": { "objective": { "type": "string" } },
+                "required": ["objective"]
+            }),
+        );
+        let mut stream = crate::agents::Agent::stream_response_from_provider(
+            Arc::new(ChunkedJsonToolDirectiveProvider),
+            ModelConfig::new("local-coder"),
+            "test-session",
+            "system",
+            &[Message::user().with_text("inspect")],
+            std::slice::from_ref(&tool),
+            std::slice::from_ref(&tool),
+        )
+        .await
+        .unwrap();
+
+        let mut recovered = None;
+        while let Some(item) = stream.next().await {
+            let (message, _) = item.unwrap();
+            if message.is_some() {
+                recovered = message;
+            }
+        }
+        let message =
+            recovered.expect("provider response should be recovered at stream completion");
+        let tool_call = message
+            .content
+            .iter()
+            .find_map(|content| match content {
+                MessageContent::ToolRequest(request) => request.tool_call.as_ref().ok(),
+                _ => None,
+            })
+            .expect("split inline JSON directive should become a tool request");
+
+        assert_eq!(tool_call.name, "coding__workflow_start");
+        assert_eq!(
+            tool_call.arguments.as_ref().unwrap()["objective"],
+            "inspect"
+        );
+        assert!(!message.as_concat_text().contains("\"arguments\""));
+    }
+
+    #[tokio::test]
     async fn prepare_tools_returns_sorted_tools_including_frontend() -> anyhow::Result<()> {
         let data_dir = tempfile::tempdir()?;
         let data_path = data_dir.path().to_path_buf();
@@ -1033,7 +1242,7 @@ mod tests {
         sorted.sort();
         assert_eq!(names, sorted);
 
-        let (active_tools, _, active_system_prompt, _) = agent
+        let (active_tools, inline_json_recovery_tools, active_system_prompt, _) = agent
             .prepare_tools_and_prompt_with_coding(
                 &session.id,
                 session.working_dir.as_path(),
@@ -1051,6 +1260,10 @@ mod tests {
         assert!(active_names
             .iter()
             .all(|name| crate::coding::tools::is_reserved_name(name)));
+        assert!(inline_json_recovery_tools
+            .iter()
+            .all(|tool| tool.name.as_ref().starts_with("coding__")));
+        assert!(!inline_json_recovery_tools.is_empty());
         assert!(active_system_prompt.contains("Internal coding capabilities are active"));
         assert!(!active_system_prompt.contains("bounded semantic routing decision"));
 

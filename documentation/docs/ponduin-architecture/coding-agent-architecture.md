@@ -198,9 +198,10 @@ The existing surfaces consume this core:
   preserves its public extension tools;
 - `PromptManager` adds keyed internal model-routing guidance without
   replacing the base system prompt;
-- the selected model decides semantically whether the current turn needs
-  coding tools; there is no keyword, regular-expression, or host-side branch
-  that classifies user prompts;
+- the selected model normally decides semantically whether the current turn
+  needs coding tools. After bounded invalid routing attempts, the runtime may
+  activate coding only for an explicit workspace work request; generic
+  questions remain inactive;
 - coding capabilities require no CLI or desktop opt-in and do not change the
   provider;
 - the desktop reuses the current permission and session surfaces.
@@ -224,6 +225,13 @@ selected by the user.
 Workspace escape, path traversal, symlink escape, protected secret access, and
 hard-denied destructive commands are rejected even in `auto`. This is a denial,
 not a confirmation request.
+
+For an active native coding turn, ponduin also accepts a complete textual JSON
+tool directive when the provider did not transport a native tool call. The
+runtime buffers the streamed response, resolves only tools exposed in the
+current workflow state, and sends a recovered call through the normal argument,
+permission, and workflow validation path. Unknown planned commands are never
+executed.
 
 Small tasks may edit directly when they remain below the configured file and
 risk thresholds. Larger tasks produce a plan with:
@@ -367,6 +375,21 @@ error count stop automatic repair and report the block. Before repairing a
 second occurrence of the same diagnostic, the agent must record a distinct
 repair approach and a fingerprint of its hypothesis; it cannot silently retry
 the same tactic. Hypothesis text is not retained in workflow memory.
+
+Workflow state is scoped to the agent session as well as the canonical
+workspace. Concurrent sessions in the same repository therefore retain
+independent objectives, plans, evidence, recovery decisions, and terminal
+states. Cancellation is an explicit terminal workflow state: it discards a
+pending pre-workflow task, prevents continuation or completion, and leaves a
+machine-readable stop reason for the session that was cancelled.
+
+Workflow status also contains a runtime-derived `next_action`. It is computed
+from the retained phase, change evidence, required validation, review evidence,
+and repair history; it is not a second state machine. The tool surface and
+workflow guidance consume the same value, so a repeated validation failure
+with no distinct repair strategy exposes strategy selection before another
+repair transition, and completion is exposed only after the evidence-backed
+review gate is satisfied.
 
 ## Configuration
 

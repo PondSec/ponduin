@@ -90,10 +90,36 @@ impl CodingWorkflow {
         self.phase
     }
 
+    pub fn next_action(&self) -> WorkflowNextAction {
+        match self.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching => WorkflowNextAction::Inspect,
+            WorkflowPhase::Planning => WorkflowNextAction::BeginEditing,
+            WorkflowPhase::Editing if self.can_begin_review() => WorkflowNextAction::BeginReview,
+            WorkflowPhase::Editing if !self.changed_files().is_empty() => {
+                WorkflowNextAction::BeginValidation
+            }
+            WorkflowPhase::Editing => WorkflowNextAction::Modify,
+            WorkflowPhase::Testing if self.can_begin_review() => WorkflowNextAction::BeginReview,
+            WorkflowPhase::Testing => WorkflowNextAction::Validate,
+            WorkflowPhase::Debugging if self.repair_strategy_required() => {
+                WorkflowNextAction::SetRepairStrategy
+            }
+            WorkflowPhase::Debugging => WorkflowNextAction::BeginRepair,
+            WorkflowPhase::Reviewing if self.can_complete() => WorkflowNextAction::Complete,
+            WorkflowPhase::Reviewing => WorkflowNextAction::Review,
+            WorkflowPhase::Completed => WorkflowNextAction::ReturnResult,
+            WorkflowPhase::Blocked | WorkflowPhase::Failed => WorkflowNextAction::ReportBlocked,
+            WorkflowPhase::Cancelled => WorkflowNextAction::ReportCancelled,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.phase,
-            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+            WorkflowPhase::Completed
+                | WorkflowPhase::Blocked
+                | WorkflowPhase::Failed
+                | WorkflowPhase::Cancelled
         )
     }
 
@@ -505,12 +531,7 @@ impl CodingWorkflow {
             .get(&diagnostic_fingerprint)
             .copied()
             .unwrap_or_default();
-        if repetitions >= 2
-            && !self.memory.repair_strategies.iter().any(|strategy| {
-                strategy.revision == self.revision
-                    && strategy.diagnostic_fingerprint == diagnostic_fingerprint
-            })
-        {
+        if self.repair_strategy_required_for(&diagnostic_fingerprint, repetitions) {
             return Err(WorkflowError::RepairStrategyRequired);
         }
         if self.repair_attempts >= self.limits.max_repair_attempts {
@@ -587,6 +608,14 @@ impl CodingWorkflow {
                 .is_some_and(|review| review.revision == self.revision && review.complete)
     }
 
+    pub fn cancel(&mut self) {
+        if self.is_terminal() {
+            return;
+        }
+        self.phase = WorkflowPhase::Cancelled;
+        self.stop_reason = Some(WorkflowStopReason::Cancelled);
+    }
+
     pub fn complete(
         &mut self,
         summary: String,
@@ -628,6 +657,7 @@ impl CodingWorkflow {
             objective: self.objective.clone(),
             task: self.task.clone(),
             phase: self.phase,
+            next_action: self.next_action(),
             plan: self.plan.clone(),
             iterations: self.iterations,
             max_iterations: self.limits.max_iterations,
@@ -789,6 +819,33 @@ impl CodingWorkflow {
         })
     }
 
+    fn repair_strategy_required(&self) -> bool {
+        let Some(diagnostic_fingerprint) = self
+            .current_failed_validation()
+            .map(|validation| &validation.diagnostic_fingerprint)
+        else {
+            return false;
+        };
+        let repetitions = self
+            .failure_counts
+            .get(diagnostic_fingerprint)
+            .copied()
+            .unwrap_or_default();
+        self.repair_strategy_required_for(diagnostic_fingerprint, repetitions)
+    }
+
+    fn repair_strategy_required_for(
+        &self,
+        diagnostic_fingerprint: &str,
+        repetitions: usize,
+    ) -> bool {
+        repetitions >= 2
+            && !self.memory.repair_strategies.iter().any(|strategy| {
+                strategy.revision == self.revision
+                    && strategy.diagnostic_fingerprint == diagnostic_fingerprint
+            })
+    }
+
     fn require_phase(&self, expected: &[WorkflowPhase]) -> Result<(), WorkflowError> {
         if expected.contains(&self.phase) {
             Ok(())
@@ -908,6 +965,27 @@ impl TaskIntent {
             .any(|term| request.contains(term))
         {
             Self::Create
+        } else if [
+            "modify",
+            "change",
+            "update",
+            "edit",
+            "implement",
+            "add",
+            "write",
+            "änder",
+            "aender",
+            "aktualis",
+            "anpass",
+            "bearbeit",
+            "hinzufüg",
+            "hinzufueg",
+            "schreib",
+        ]
+        .iter()
+        .any(|term| request.contains(term))
+        {
+            Self::Modify
         } else if [
             "analyse",
             "analys",
@@ -1106,6 +1184,29 @@ pub enum WorkflowPhase {
     Completed,
     Blocked,
     Failed,
+    Cancelled,
+}
+
+/// The runtime-derived next action for the workflow's retained task state.
+///
+/// This is not a second state machine: it is computed from phase, plan,
+/// requirement evidence, validation results, and recovery state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNextAction {
+    Inspect,
+    BeginEditing,
+    Modify,
+    BeginValidation,
+    Validate,
+    SetRepairStrategy,
+    BeginRepair,
+    BeginReview,
+    Review,
+    Complete,
+    ReturnResult,
+    ReportBlocked,
+    ReportCancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1114,6 +1215,7 @@ pub struct WorkflowStatus {
     pub objective: String,
     pub task: WorkflowTaskState,
     pub phase: WorkflowPhase,
+    pub next_action: WorkflowNextAction,
     pub plan: Option<WorkflowPlan>,
     pub iterations: u32,
     pub max_iterations: u32,
@@ -1464,6 +1566,7 @@ impl From<ValidationStatus> for ValidationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowStopReason {
+    Cancelled,
     ActionLimit {
         limit: u32,
     },
@@ -1858,6 +1961,95 @@ mod tests {
     }
 
     #[test]
+    fn next_action_follows_evidence_backed_lifecycle() {
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Inspect);
+        workflow.set_plan(plan()).unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginEditing
+        );
+
+        workflow.begin_editing().unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Modify);
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-1".to_string(), &preview("+new"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginValidation
+        );
+
+        workflow.begin_validation().unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Validate);
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginReview
+        );
+
+        workflow.begin_review().unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Review);
+        workflow.record_review(&review()).unwrap();
+        assert_eq!(workflow.status().next_action, WorkflowNextAction::Complete);
+
+        workflow
+            .complete("implemented safely".to_string(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::ReturnResult
+        );
+    }
+
+    #[test]
+    fn repeated_failure_requires_a_distinct_repair_strategy_before_retrying() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(false, "same error"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginRepair
+        );
+
+        workflow.begin_repair().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("retry".to_string(), &preview("retry"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(false, "same error"))
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::SetRepairStrategy
+        );
+
+        workflow
+            .set_repair_strategy(
+                RepairApproach::LocalLogic,
+                "correct the local branch".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::BeginRepair
+        );
+    }
+
+    #[test]
     fn requires_every_mandatory_planned_check_before_review() {
         let mut plan = plan();
         plan.validation.push(WorkflowCheck {
@@ -2143,6 +2335,31 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_is_terminal_and_cannot_be_completed_later() {
+        let mut workflow = planned_workflow();
+        workflow.cancel();
+
+        assert!(workflow.is_terminal());
+        assert_eq!(workflow.phase(), WorkflowPhase::Cancelled);
+        assert_eq!(
+            workflow.status().next_action,
+            WorkflowNextAction::ReportCancelled
+        );
+        assert!(matches!(
+            workflow.status().stop_reason,
+            Some(WorkflowStopReason::Cancelled)
+        ));
+        assert!(matches!(
+            workflow.begin_editing(),
+            Err(WorkflowError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            workflow.complete("must not complete".to_string(), Vec::new()),
+            Err(WorkflowError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
     fn unavailable_validation_cannot_close_a_required_validation_plan() {
         let mut workflow = planned_workflow();
         workflow.authorize_change().unwrap();
@@ -2244,6 +2461,18 @@ mod tests {
                 "Create index.html, styles.css, and script.js. Work through inspection and validation."
             ),
             TaskIntent::Create
+        );
+    }
+
+    #[test]
+    fn mutation_intent_wins_over_inspection_and_validation_steps() {
+        assert_eq!(
+            TaskIntent::detect("Analysiere den Fehler und aktualisiere die Konfiguration."),
+            TaskIntent::Modify
+        );
+        assert_eq!(
+            TaskIntent::detect("Inspect the current implementation, then edit the parser."),
+            TaskIntent::Modify
         );
     }
 

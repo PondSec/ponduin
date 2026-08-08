@@ -9,13 +9,23 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool,
 };
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+const MAX_IDLE_SESSION_TOOL_STATES: usize = 32;
 
 /// Internal coding capability owned directly by the main agent.
 #[derive(Debug, Clone)]
 pub struct CodingAgent {
     config: CodingConfig,
+    tool_state: Arc<tools::CodingToolState>,
+    session_tool_states: Arc<Mutex<VecDeque<SessionToolState>>>,
+}
+
+#[derive(Debug)]
+struct SessionToolState {
+    session_id: String,
     tool_state: Arc<tools::CodingToolState>,
 }
 
@@ -24,7 +34,41 @@ impl CodingAgent {
         Self {
             config,
             tool_state: Arc::new(tools::CodingToolState::default()),
+            session_tool_states: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    fn tool_state_for_session(&self, session_id: &str) -> Arc<tools::CodingToolState> {
+        let mut states = self
+            .session_tool_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(position) = states
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            if let Some(entry) = states.remove(position) {
+                let tool_state = Arc::clone(&entry.tool_state);
+                states.push_back(entry);
+                return tool_state;
+            }
+        }
+        let tool_state = Arc::new(tools::CodingToolState::default());
+        states.push_back(SessionToolState {
+            session_id: session_id.to_string(),
+            tool_state: Arc::clone(&tool_state),
+        });
+        while states.len() > MAX_IDLE_SESSION_TOOL_STATES {
+            let newest_state = states.len() - 1;
+            let Some(position) = states.iter().enumerate().find_map(|(position, entry)| {
+                (position != newest_state && !entry.tool_state.has_active_task_state())
+                    .then_some(position)
+            }) else {
+                break;
+            };
+            states.remove(position);
+        }
+        tool_state
     }
 
     pub fn config(&self) -> &CodingConfig {
@@ -49,6 +93,37 @@ impl CodingAgent {
         working_dir: &Path,
         model_config: &ModelConfig,
     ) -> Vec<Tool> {
+        self.tools_for_workspace_for_model_with_state(
+            &self.tool_state,
+            ponduin_mode,
+            working_dir,
+            model_config,
+        )
+    }
+
+    pub(crate) fn tools_for_workspace_for_model_for_session(
+        &self,
+        session_id: &str,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        model_config: &ModelConfig,
+    ) -> Vec<Tool> {
+        let tool_state = self.tool_state_for_session(session_id);
+        self.tools_for_workspace_for_model_with_state(
+            &tool_state,
+            ponduin_mode,
+            working_dir,
+            model_config,
+        )
+    }
+
+    fn tools_for_workspace_for_model_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        model_config: &ModelConfig,
+    ) -> Vec<Tool> {
         if !self.available(ponduin_mode) {
             return Vec::new();
         }
@@ -56,21 +131,66 @@ impl CodingAgent {
             return tools::definitions();
         };
         if uses_compact_qwen_coding_tools(model_config) {
-            self.tool_state
-                .compact_native_definitions_for_workspace(workspace.root())
+            tool_state.compact_native_definitions_for_workspace(workspace.root())
         } else {
-            self.tool_state.definitions_for_workspace(workspace.root())
+            tool_state.definitions_for_workspace(workspace.root())
         }
     }
 
     pub fn workflow_guidance(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state
-            .workflow_guidance_for_workspace(workspace.root())
+        self.workflow_guidance_for_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn workflow_guidance_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.workflow_guidance_for_state(&self.tool_state_for_session(session_id), working_dir)
+    }
+
+    fn workflow_guidance_for_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.workflow_guidance_for_workspace(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn register_task_context(
         &self,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        original_user_request: String,
+    ) {
+        self.register_task_context_with_state(
+            &self.tool_state,
+            ponduin_mode,
+            working_dir,
+            original_user_request,
+        );
+    }
+
+    pub(crate) fn register_task_context_for_session(
+        &self,
+        session_id: &str,
+        ponduin_mode: PonduinMode,
+        working_dir: &Path,
+        original_user_request: String,
+    ) {
+        self.register_task_context_with_state(
+            &self.tool_state_for_session(session_id),
+            ponduin_mode,
+            working_dir,
+            original_user_request,
+        );
+    }
+
+    fn register_task_context_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
         ponduin_mode: PonduinMode,
         working_dir: &Path,
         original_user_request: String,
@@ -83,7 +203,7 @@ impl CodingAgent {
             PonduinMode::Approve | PonduinMode::SmartApprove => TaskInteractionMode::Ask,
             PonduinMode::Auto => TaskInteractionMode::Autonomous,
         };
-        if let Err(error) = self.tool_state.register_task_context(
+        if let Err(error) = tool_state.register_task_context(
             workspace.root(),
             original_user_request,
             interaction_mode,
@@ -92,46 +212,178 @@ impl CodingAgent {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn recovery_instruction(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.recovery_instruction(workspace.root())
+        self.recovery_instruction_with_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn recovery_instruction_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.recovery_instruction_with_state(&self.tool_state_for_session(session_id), working_dir)
+    }
+
+    fn recovery_instruction_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.recovery_instruction(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn recovery_exhausted_message(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.recovery_exhausted_message(workspace.root())
+        self.recovery_exhausted_message_with_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn recovery_exhausted_message_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.recovery_exhausted_message_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn recovery_exhausted_message_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.recovery_exhausted_message(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn active_workflow_continuation(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state
-            .active_workflow_continuation(workspace.root())
+        self.active_workflow_continuation_with_state(&self.tool_state, working_dir)
     }
 
+    pub(crate) fn active_workflow_continuation_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.active_workflow_continuation_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn active_workflow_continuation_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.active_workflow_continuation(workspace.root())
+    }
+
+    #[cfg(test)]
     pub(crate) fn workflow_continuation(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.workflow_continuation(workspace.root())
+        self.workflow_continuation_with_state(&self.tool_state, working_dir)
     }
 
-    pub(crate) fn next_action_thinking_effort(&self, working_dir: &Path) -> ThinkingEffort {
+    pub(crate) fn workflow_continuation_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.workflow_continuation_with_state(&self.tool_state_for_session(session_id), working_dir)
+    }
+
+    fn workflow_continuation_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.workflow_continuation(workspace.root())
+    }
+
+    pub(crate) fn next_action_thinking_effort_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> ThinkingEffort {
+        self.next_action_thinking_effort_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn next_action_thinking_effort_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> ThinkingEffort {
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return ThinkingEffort::Off;
         };
-        self.tool_state
-            .next_action_thinking_effort(workspace.root())
+        tool_state.next_action_thinking_effort(workspace.root())
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal_workflow_message(&self, working_dir: &Path) -> Option<String> {
-        let workspace = CodingWorkspace::new(working_dir).ok()?;
-        self.tool_state.terminal_workflow_message(workspace.root())
+        self.terminal_workflow_message_with_state(&self.tool_state, working_dir)
     }
 
-    pub(crate) fn block_for_action_limit(&self, working_dir: &Path, limit: u32) {
+    pub(crate) fn terminal_workflow_message_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Option<String> {
+        self.terminal_workflow_message_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+        )
+    }
+
+    fn terminal_workflow_message_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+    ) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        tool_state.terminal_workflow_message(workspace.root())
+    }
+
+    pub(crate) fn block_for_action_limit_for_session(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+        limit: u32,
+    ) {
+        self.block_for_action_limit_with_state(
+            &self.tool_state_for_session(session_id),
+            working_dir,
+            limit,
+        );
+    }
+
+    fn block_for_action_limit_with_state(
+        &self,
+        tool_state: &tools::CodingToolState,
+        working_dir: &Path,
+        limit: u32,
+    ) {
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return;
         };
-        self.tool_state
-            .block_for_action_limit(workspace.root(), limit);
+        tool_state.block_for_action_limit(workspace.root(), limit);
+    }
+
+    pub(crate) fn cancel_active_workflow_for_session(&self, session_id: &str, working_dir: &Path) {
+        let Ok(workspace) = CodingWorkspace::new(working_dir) else {
+            return;
+        };
+        self.tool_state_for_session(session_id)
+            .cancel_active_workflow(workspace.root());
     }
 
     pub fn routing_tools(&self, ponduin_mode: PonduinMode) -> Vec<Tool> {
@@ -255,6 +507,38 @@ impl CodingAgent {
     pub async fn execute(
         &self,
         ponduin_mode: PonduinMode,
+        tool_call: CallToolRequestParams,
+        working_dir: &Path,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.execute_with_tool_state(
+            Arc::clone(&self.tool_state),
+            ponduin_mode,
+            tool_call,
+            working_dir,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_for_session(
+        &self,
+        session_id: &str,
+        ponduin_mode: PonduinMode,
+        tool_call: CallToolRequestParams,
+        working_dir: &Path,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.execute_with_tool_state(
+            self.tool_state_for_session(session_id),
+            ponduin_mode,
+            tool_call,
+            working_dir,
+        )
+        .await
+    }
+
+    async fn execute_with_tool_state(
+        &self,
+        tool_state: Arc<tools::CodingToolState>,
+        ponduin_mode: PonduinMode,
         mut tool_call: CallToolRequestParams,
         working_dir: &Path,
     ) -> Result<CallToolResult, ErrorData> {
@@ -281,9 +565,9 @@ impl CodingAgent {
         }
         let workspace = CodingWorkspace::new(working_dir)
             .map_err(|error| ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None))?;
-        self.fill_missing_workflow_objective(&mut tool_call, workspace.root());
+        self.fill_missing_workflow_objective(&tool_state, &mut tool_call, workspace.root());
         normalize_structured_tool_arguments(&mut tool_call);
-        let exposed = self.tool_state.definitions_for_workspace(workspace.root());
+        let exposed = tool_state.definitions_for_workspace(workspace.root());
         if !exposed.iter().any(|tool| tool.name == tool_call.name) {
             let next_tools = exposed
                 .iter()
@@ -291,6 +575,7 @@ impl CodingAgent {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(self.with_contract_recovery(
+                &tool_state,
                 workspace.root(),
                 tool_call.name.as_ref(),
                 ErrorData::new(
@@ -306,10 +591,10 @@ impl CodingAgent {
         }
         let tool_name = tool_call.name.to_string();
         let result = if tools::is_async_tool(&tool_call.name) {
-            tools::execute_async(&self.config, &self.tool_state, tool_call, working_dir).await
+            tools::execute_async(&self.config, &tool_state, tool_call, working_dir).await
         } else {
             let config = self.config.clone();
-            let tool_state = Arc::clone(&self.tool_state);
+            let tool_state = Arc::clone(&tool_state);
             let working_dir = PathBuf::from(working_dir);
             tokio::task::spawn_blocking(move || {
                 tools::execute_with_state(&config, &tool_state, tool_call, &working_dir)
@@ -323,11 +608,14 @@ impl CodingAgent {
                 )
             })?
         };
-        result.map_err(|error| self.with_contract_recovery(workspace.root(), &tool_name, error))
+        result.map_err(|error| {
+            self.with_contract_recovery(&tool_state, workspace.root(), &tool_name, error)
+        })
     }
 
     fn with_contract_recovery(
         &self,
+        tool_state: &tools::CodingToolState,
         workspace_root: &Path,
         tool_name: &str,
         error: ErrorData,
@@ -335,22 +623,18 @@ impl CodingAgent {
         if error.code != ErrorCode::INVALID_PARAMS {
             return error;
         }
-        let repetitions = self
-            .tool_state
+        let repetitions = tool_state
             .record_tool_contract_failure(
                 workspace_root,
                 tool_name,
                 contract_failure_class(tool_name, &error.message),
             )
             .unwrap_or(1);
-        let workflow_hint = self
-            .tool_state
+        let workflow_hint = tool_state
             .active_workflow_id(workspace_root)
             .map(|workflow_id| format!(" Current workflow ID: `{workflow_id}`."))
             .unwrap_or_default();
-        let next_step_guidance = self
-            .tool_state
-            .workflow_guidance_for_workspace(workspace_root);
+        let next_step_guidance = tool_state.workflow_guidance_for_workspace(workspace_root);
         let recovery = match repetitions {
             1 if error.message.contains("not currently allowed") => {
                 next_step_guidance.as_deref().unwrap_or(
@@ -427,6 +711,7 @@ impl CodingAgent {
 
     fn fill_missing_workflow_objective(
         &self,
+        tool_state: &tools::CodingToolState,
         tool_call: &mut CallToolRequestParams,
         workspace_root: &Path,
     ) {
@@ -442,7 +727,7 @@ impl CodingAgent {
         if has_objective {
             return;
         }
-        let Some(task) = self.tool_state.pending_task_context(workspace_root) else {
+        let Some(task) = tool_state.pending_task_context(workspace_root) else {
             return;
         };
         tool_call
@@ -647,6 +932,102 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Create index.html, styles.css, and script.js"));
+    }
+
+    #[tokio::test]
+    async fn session_scoped_workflows_do_not_share_task_or_cancellation_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let first_session = "session-first";
+        let second_session = "session-second";
+
+        agent.register_task_context_for_session(
+            first_session,
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Create first-session.txt.".to_string(),
+        );
+        agent.register_task_context_for_session(
+            second_session,
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Create second-session.txt.".to_string(),
+        );
+
+        let first = agent
+            .execute_for_session(
+                first_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let second = agent
+            .execute_for_session(
+                second_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&first.content[0].as_text().unwrap().text).unwrap();
+        let second: Value =
+            serde_json::from_str(&second.content[0].as_text().unwrap().text).unwrap();
+
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(first["objective"], "Create first-session.txt.");
+        assert_eq!(second["objective"], "Create second-session.txt.");
+
+        agent.cancel_active_workflow_for_session(first_session, temp_dir.path());
+
+        assert!(agent
+            .workflow_guidance_for_session(first_session, temp_dir.path())
+            .unwrap()
+            .contains("was cancelled"));
+        assert!(agent
+            .workflow_guidance_for_session(second_session, temp_dir.path())
+            .unwrap()
+            .contains("Analyzing"));
+        assert!(agent
+            .active_workflow_continuation_for_session(first_session, temp_dir.path())
+            .is_none());
+        assert!(agent
+            .active_workflow_continuation_for_session(second_session, temp_dir.path())
+            .is_some());
+    }
+
+    #[test]
+    fn incomplete_session_state_is_not_evicted_at_capacity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+
+        for index in 0..=MAX_IDLE_SESSION_TOOL_STATES {
+            agent.register_task_context_for_session(
+                &format!("session-{index}"),
+                PonduinMode::Auto,
+                temp_dir.path(),
+                format!("Create fixture-{index}.txt."),
+            );
+        }
+
+        let states = agent
+            .session_tool_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(states.len(), MAX_IDLE_SESSION_TOOL_STATES + 1);
+        let first = states
+            .iter()
+            .find(|entry| entry.session_id == "session-0")
+            .unwrap();
+        assert!(first
+            .tool_state
+            .pending_task_context(workspace.root())
+            .is_some());
     }
 
     #[tokio::test]

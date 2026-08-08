@@ -21,8 +21,8 @@ use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
     CodingWorkflow, RepairApproach, RequirementPriority, RequirementSource,
     RequirementVerification, WorkflowCheck, WorkflowCommand, WorkflowId, WorkflowLimits,
-    WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowRequirement, WorkflowStatus,
-    WorkflowTaskState,
+    WorkflowNextAction, WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowRequirement,
+    WorkflowStatus, WorkflowTaskState,
 };
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use ponduin_providers::thinking::ThinkingEffort;
@@ -131,11 +131,26 @@ struct WorkspaceTaskContext {
 #[derive(Debug, Clone)]
 struct WorkflowToolContext {
     status: WorkflowStatus,
-    review_ready: bool,
-    completion_ready: bool,
 }
 
 impl CodingToolState {
+    pub(crate) fn has_active_task_state(&self) -> bool {
+        if self
+            .workflows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|entry| !entry.workflow.is_terminal())
+        {
+            return true;
+        }
+        !self
+            .task_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     pub(crate) fn next_action_thinking_effort(&self, workspace_root: &Path) -> ThinkingEffort {
         match self.workflow_status(workspace_root, None) {
             Ok(status)
@@ -167,41 +182,41 @@ impl CodingToolState {
     pub(crate) fn workflow_guidance_for_workspace(&self, workspace_root: &Path) -> Option<String> {
         let context = self.workflow_tool_context(workspace_root)?;
         let status = &context.status;
-        let guidance = match status.phase {
-            WorkflowPhase::Analyzing | WorkflowPhase::Searching => {
+        let guidance = match status.next_action {
+            WorkflowNextAction::Inspect => {
                 "Inspect only the repository context needed for the objective, then call \
                  coding__workflow_set_plan. Editing and execution tools remain withheld until \
                  the plan is accepted."
                     .to_string()
             }
-            WorkflowPhase::Planning => {
+            WorkflowNextAction::BeginEditing => {
                 "The plan is accepted. Call coding__workflow_transition exactly once with \
                  begin_editing; do not repeat a completed transition."
                     .to_string()
             }
-            WorkflowPhase::Editing if status.repair_pending => repair_pending_guidance(),
-            WorkflowPhase::Editing if status.changed_files.is_empty() => {
+            WorkflowNextAction::Modify if status.repair_pending => repair_pending_guidance(),
+            WorkflowNextAction::Modify => {
                 "The workflow is in Editing with no retained change. Use the currently exposed \
                  mutation tool now. Phase-transition tools are intentionally withheld \
                  until a real change exists."
                     .to_string()
             }
-            WorkflowPhase::Editing if context.review_ready => {
+            WorkflowNextAction::BeginReview if status.phase == WorkflowPhase::Editing => {
                 "The planned change is retained and the plan requires no validation. Call \
                  coding__workflow_transition with begin_review."
                     .to_string()
             }
-            WorkflowPhase::Editing => {
+            WorkflowNextAction::BeginValidation => {
                 "The planned change is retained. Call coding__workflow_transition with \
                  begin_validation before executing checks."
                     .to_string()
             }
-            WorkflowPhase::Testing if context.review_ready => {
+            WorkflowNextAction::BeginReview => {
                 "Current-revision validation evidence is acceptable. Call \
                  coding__workflow_transition with begin_review."
                     .to_string()
             }
-            WorkflowPhase::Testing => {
+            WorkflowNextAction::Validate => {
                 "Run an actual check now. Use coding__run_validation only with an exact command \
                  id returned by coding__project_capabilities; a file path or command text is not \
                  a command id. If no matching discovered command exists, call \
@@ -210,7 +225,13 @@ impl CodingToolState {
                  evidence exists."
                     .to_string()
             }
-            WorkflowPhase::Debugging => {
+            WorkflowNextAction::SetRepairStrategy => {
+                "A repeated validation failure is recorded. Inspect its evidence and record a \
+                 distinct hypothesis and repair approach with \
+                 coding__workflow_set_repair_strategy before attempting another repair."
+                    .to_string()
+            }
+            WorkflowNextAction::BeginRepair => {
                 "A validation failure is recorded. Inspect its evidence. For a repeated failure, \
                  record a distinct hypothesis and repair approach with \
                  coding__workflow_set_repair_strategy, then call \
@@ -218,31 +239,35 @@ impl CodingToolState {
                  corrective change."
                     .to_string()
             }
-            WorkflowPhase::Reviewing => {
-                if context.completion_ready {
-                    "A complete review of the retained change is recorded. Call \
-                     coding__workflow_complete with an evidence-backed summary and remaining risks."
-                        .to_string()
-                } else {
-                    "Run coding__review_changes now. Completion remains withheld until a complete \
-                     review of the current revision is recorded."
-                        .to_string()
-                }
+            WorkflowNextAction::Review => {
+                "Run coding__review_changes now. Completion remains withheld until a complete \
+                 review of the current revision is recorded."
+                    .to_string()
             }
-            WorkflowPhase::Completed => {
+            WorkflowNextAction::Complete => {
+                "A complete review of the retained change is recorded. Call \
+                 coding__workflow_complete with an evidence-backed summary and remaining risks."
+                    .to_string()
+            }
+            WorkflowNextAction::ReturnResult => {
                 "The workflow is complete. Return its evidence-backed result to the user without \
                  starting another workflow."
                     .to_string()
             }
-            WorkflowPhase::Blocked | WorkflowPhase::Failed => {
+            WorkflowNextAction::ReportBlocked => {
                 "The workflow reached a terminal stop condition. Report the machine-detected \
                  stop reason and do not claim completion."
                     .to_string()
             }
+            WorkflowNextAction::ReportCancelled => {
+                "The workflow was cancelled. Do not resume it or claim completion; wait for a \
+                 new user request."
+                    .to_string()
+            }
         };
         Some(format!(
-            "Current internal workflow phase: {:?}. {guidance}",
-            status.phase
+            "Current internal workflow phase: {:?}; next action: {:?}. {guidance}",
+            status.phase, status.next_action
         ))
     }
 
@@ -255,8 +280,6 @@ impl CodingToolState {
             .find(|entry| entry.workspace_root == workspace_root)
             .map(|entry| WorkflowToolContext {
                 status: entry.workflow.status(),
-                review_ready: entry.workflow.can_begin_review(),
-                completion_ready: entry.workflow.can_complete(),
             })
     }
 
@@ -602,7 +625,10 @@ impl CodingToolState {
         };
         if matches!(
             status.phase,
-            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+            WorkflowPhase::Completed
+                | WorkflowPhase::Blocked
+                | WorkflowPhase::Failed
+                | WorkflowPhase::Cancelled
         ) {
             return None;
         }
@@ -629,7 +655,10 @@ impl CodingToolState {
         let status = self.workflow_status(workspace_root, None).ok()?;
         if matches!(
             status.phase,
-            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+            WorkflowPhase::Completed
+                | WorkflowPhase::Blocked
+                | WorkflowPhase::Failed
+                | WorkflowPhase::Cancelled
         ) {
             return None;
         }
@@ -658,7 +687,10 @@ impl CodingToolState {
 
     pub(crate) fn terminal_workflow_message(&self, workspace_root: &Path) -> Option<String> {
         let status = self.workflow_status(workspace_root, None).ok()?;
-        if !matches!(status.phase, WorkflowPhase::Blocked | WorkflowPhase::Failed) {
+        if !matches!(
+            status.phase,
+            WorkflowPhase::Blocked | WorkflowPhase::Failed | WorkflowPhase::Cancelled
+        ) {
             return None;
         }
         Some(format!(
@@ -683,7 +715,10 @@ impl CodingToolState {
         };
         if matches!(
             status.phase,
-            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+            WorkflowPhase::Completed
+                | WorkflowPhase::Blocked
+                | WorkflowPhase::Failed
+                | WorkflowPhase::Cancelled
         ) {
             return None;
         }
@@ -943,6 +978,18 @@ impl CodingToolState {
         self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow.block_for_action_limit(limit);
         });
+    }
+
+    pub(crate) fn cancel_active_workflow(&self, workspace_root: &Path) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, CodingWorkflow::cancel);
+        self.task_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| entry.workspace_root != workspace_root);
     }
 
     fn mutation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -1312,7 +1359,10 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
     let status = &context.status;
     if matches!(
         status.phase,
-        WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+        WorkflowPhase::Completed
+            | WorkflowPhase::Blocked
+            | WorkflowPhase::Failed
+            | WorkflowPhase::Cancelled
     ) {
         return definitions()
             .into_iter()
@@ -1426,7 +1476,10 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
                 | WORKFLOW_UPDATE_MEMORY_TOOL_NAME
                 | WORKFLOW_STATUS_TOOL_NAME
         ),
-        WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed => false,
+        WorkflowPhase::Completed
+        | WorkflowPhase::Blocked
+        | WorkflowPhase::Failed
+        | WorkflowPhase::Cancelled => false,
     };
 
     let mut tools = definitions()
@@ -1438,27 +1491,27 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
         })
         .collect::<Vec<_>>();
 
-    let next_transition = match status.phase {
-        WorkflowPhase::Planning => Some((
+    let next_transition = match status.next_action {
+        WorkflowNextAction::BeginEditing => Some((
             "begin_editing",
             "The accepted plan makes begin_editing the only valid next workflow transition.",
         )),
-        WorkflowPhase::Editing if context.review_ready => Some((
+        WorkflowNextAction::BeginReview if status.phase == WorkflowPhase::Editing => Some((
             "begin_review",
             "The retained change requires no validation, so begin_review is the only valid next \
              workflow transition.",
         )),
-        WorkflowPhase::Editing if !status.changed_files.is_empty() => Some((
+        WorkflowNextAction::BeginValidation => Some((
             "begin_validation",
             "A retained change exists, so begin_validation is the only valid next workflow \
              transition.",
         )),
-        WorkflowPhase::Testing if context.review_ready => Some((
+        WorkflowNextAction::BeginReview => Some((
             "begin_review",
             "Current-revision validation evidence is acceptable, so begin_review is the only \
              valid next workflow transition.",
         )),
-        WorkflowPhase::Debugging => Some((
+        WorkflowNextAction::BeginRepair => Some((
             "begin_repair",
             "Recorded failure evidence makes begin_repair the only valid next workflow transition.",
         )),
@@ -1467,7 +1520,7 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
     if let Some((transition, description)) = next_transition {
         tools.push(workflow_transition_tool_for(transition, description));
     }
-    if status.phase == WorkflowPhase::Reviewing && context.completion_ready {
+    if status.next_action == WorkflowNextAction::Complete {
         tools.push(workflow_complete_tool());
     }
     tools
@@ -5070,6 +5123,7 @@ mod tests {
         let started: Value = serde_json::from_str(&result_text(started)).unwrap();
         let workflow_id = started["id"].as_str().unwrap().to_string();
         assert_eq!(started["phase"], "analyzing");
+        assert_eq!(started["next_action"], "inspect");
         let analyzing_tools = exposed_tool_names(&state, temp_dir.path());
         assert!(analyzing_tools.contains(WORKFLOW_SET_PLAN_TOOL_NAME));
         assert!(analyzing_tools.contains(PREPARE_CONTEXT_TOOL_NAME));
@@ -5145,6 +5199,7 @@ mod tests {
         let planned = execute_with_state(&config, &state, plan, temp_dir.path()).unwrap();
         let planned: Value = serde_json::from_str(&result_text(planned)).unwrap();
         assert_eq!(planned["phase"], "planning");
+        assert_eq!(planned["next_action"], "begin_editing");
         assert_eq!(
             exposed_transition_values(&state, temp_dir.path()),
             ["begin_editing"]
@@ -5178,6 +5233,13 @@ mod tests {
         }));
         execute_with_state(&config, &state, apply, temp_dir.path()).unwrap();
         assert_eq!(
+            state
+                .workflow_status(&canonical_root, None)
+                .unwrap()
+                .next_action,
+            WorkflowNextAction::BeginValidation
+        );
+        assert_eq!(
             exposed_transition_values(&state, temp_dir.path()),
             ["begin_validation"]
         );
@@ -5206,6 +5268,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
+            state
+                .workflow_status(&canonical_root, None)
+                .unwrap()
+                .next_action,
+            WorkflowNextAction::BeginReview
+        );
+        assert_eq!(
             exposed_transition_values(&state, temp_dir.path()),
             ["begin_review"]
         );
@@ -5228,6 +5297,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            state
+                .workflow_status(&canonical_root, None)
+                .unwrap()
+                .next_action,
+            WorkflowNextAction::Complete
+        );
         assert!(exposed_tool_names(&state, temp_dir.path()).contains(WORKFLOW_COMPLETE_TOOL_NAME));
         let completed = execute_with_state(
             &config,

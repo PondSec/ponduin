@@ -172,6 +172,108 @@ fn coding_routing_messages(conversation: &Conversation) -> Result<Vec<Message>> 
     ))])
 }
 
+fn has_explicit_coding_request(request: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    let requests_mutation = [
+        "create",
+        "implement",
+        "modify",
+        "change",
+        "update",
+        "edit",
+        "add",
+        "write",
+        "fix",
+        "repair",
+        "erstelle",
+        "implementiere",
+        "ändere",
+        "aendere",
+        "aktualisiere",
+        "bearbeite",
+        "füge",
+        "fuege",
+        "schreibe",
+        "behebe",
+        "repariere",
+    ]
+    .iter()
+    .any(|term| request.contains(term));
+    let requests_workspace_inspection = [
+        "analyze",
+        "analyse",
+        "untersuche",
+        "inspect",
+        "prüfe",
+        "pruefe",
+        "teste",
+        "test",
+        "verify",
+        "compile",
+        "build",
+    ]
+    .iter()
+    .any(|term| request.contains(term));
+    let names_a_workspace = [
+        "repo",
+        "repository",
+        "projekt",
+        "project",
+        "workspace",
+        "aktuellen",
+        "current",
+        "hier",
+        "here",
+    ]
+    .iter()
+    .any(|term| request.contains(term));
+    let names_an_implementation_target = [
+        "file",
+        "datei",
+        "directory",
+        "verzeichnis",
+        "folder",
+        "ordner",
+        "function",
+        "funktion",
+        "test",
+        "git",
+        "terminal",
+        "shell",
+        ".rs",
+        ".py",
+        ".ts",
+        ".js",
+        ".toml",
+        ".md",
+    ]
+    .iter()
+    .any(|term| request.contains(term));
+
+    (requests_mutation && (names_a_workspace || names_an_implementation_target))
+        || (requests_workspace_inspection && names_a_workspace)
+}
+
+fn fallback_coding_tool_exposure(
+    conversation: &Conversation,
+) -> super::reply_parts::CodingToolExposure {
+    let latest_user_request = conversation
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == rmcp::model::Role::User && message.is_agent_visible())
+        .map(Message::as_concat_text);
+
+    if latest_user_request
+        .as_deref()
+        .is_some_and(has_explicit_coding_request)
+    {
+        super::reply_parts::CodingToolExposure::Active
+    } else {
+        super::reply_parts::CodingToolExposure::Inactive
+    }
+}
+
 fn compact_native_coding_history(messages: &[Message]) -> Vec<Message> {
     if messages.len() <= COMPACT_NATIVE_CODING_HISTORY_TAIL_MESSAGES {
         return messages.to_vec();
@@ -1305,7 +1407,8 @@ impl Agent {
         if crate::coding::tools::is_reserved_name(&tool_call.name) {
             let result = self
                 .coding_agent
-                .execute(
+                .execute_for_session(
+                    &session.id,
                     session.ponduin_mode,
                     tool_call.clone(),
                     &session.working_dir,
@@ -2128,10 +2231,12 @@ impl Agent {
             }
         }
 
-        Err(anyhow!(
-            "The selected model did not return exactly one valid semantic coding-routing \
-             decision after {CODING_ROUTER_MAX_ATTEMPTS} bounded attempts."
-        ))
+        let fallback = fallback_coding_tool_exposure(conversation);
+        warn!(
+            ?fallback,
+            "model did not return a valid coding routing decision; applying the bounded deterministic fallback"
+        );
+        Ok(fallback)
     }
 
     async fn reply_internal(
@@ -2167,11 +2272,14 @@ impl Agent {
             .await?;
         if coding_exposure == super::reply_parts::CodingToolExposure::Active {
             model_config = model_config.with_thinking_effort(
-                self.coding_agent
-                    .next_action_thinking_effort(&session.working_dir),
+                self.coding_agent.next_action_thinking_effort_for_session(
+                    &session_config.id,
+                    &session.working_dir,
+                ),
             );
             if let Some(original_user_request) = latest_user_request(&conversation) {
-                self.coding_agent.register_task_context(
+                self.coding_agent.register_task_context_for_session(
+                    &session_config.id,
                     ponduin_mode,
                     &session.working_dir,
                     original_user_request,
@@ -2270,10 +2378,19 @@ impl Agent {
                 if coding_tools_active {
                     model_config = model_config.with_thinking_effort(
                         self.coding_agent
-                            .next_action_thinking_effort(&session.working_dir),
+                            .next_action_thinking_effort_for_session(
+                                &session_config.id,
+                                &session.working_dir,
+                            ),
                     );
                 }
                 if is_token_cancelled(&cancel_token) {
+                    if coding_tools_active {
+                        self.coding_agent.cancel_active_workflow_for_session(
+                            &session_config.id,
+                            &session.working_dir,
+                        );
+                    }
                     break;
                 }
 
@@ -2348,18 +2465,28 @@ impl Agent {
                     last_assistant_text = if coding_tools_active && ponduin_mode == PonduinMode::Auto {
                         if self
                             .coding_agent
-                            .active_workflow_continuation(&session.working_dir)
+                            .active_workflow_continuation_for_session(
+                                &session_config.id,
+                                &session.working_dir,
+                            )
                             .is_some()
                         {
                             self.coding_agent
-                                .block_for_action_limit(&session.working_dir, max_turns);
+                                .block_for_action_limit_for_session(
+                                    &session_config.id,
+                                    &session.working_dir,
+                                    max_turns,
+                                );
                             "The active coding workflow reached its configured action limit and stopped \
                              safely. The original request and workflow evidence were retained; no user \
                              resubmission is required."
                                 .to_string()
                         } else if let Some(message) = self
                             .coding_agent
-                            .terminal_workflow_message(&session.working_dir)
+                            .terminal_workflow_message_for_session(
+                                &session_config.id,
+                                &session.working_dir,
+                            )
                         {
                             message
                         } else {
@@ -2537,7 +2664,10 @@ impl Agent {
                                 let suppress_user_visible_response = coding_tools_active
                                     && self
                                         .coding_agent
-                                        .workflow_continuation(&session.working_dir)
+                                        .workflow_continuation_for_session(
+                                            &session_config.id,
+                                            &session.working_dir,
+                                        )
                                         .is_some();
 
                                 if let Some(live_response) = message_for_live_update(&filtered_response) {
@@ -3161,7 +3291,10 @@ impl Agent {
                         None if coding_tools_active => {
                             if let Some(continuation) = self
                                 .coding_agent
-                                .workflow_continuation(&session.working_dir)
+                                .workflow_continuation_for_session(
+                                    &session_config.id,
+                                    &session.working_dir,
+                                )
                             {
                                 messages_to_add.push(
                                     Message::user()
@@ -3239,7 +3372,10 @@ impl Agent {
                                         retrying_after_unproductive_turn = true;
                                         let continuation = if coding_tools_active {
                                             self.coding_agent
-                                                .recovery_instruction(&session.working_dir)
+                                                .recovery_instruction_for_session(
+                                                    &session_config.id,
+                                                    &session.working_dir,
+                                                )
                                                 .unwrap_or_else(|| {
                                                     UNPRODUCTIVE_TURN_CONTINUATION.to_string()
                                                 })
@@ -3264,7 +3400,10 @@ impl Agent {
                                     } else {
                                         let fallback = if coding_tools_active {
                                             self.coding_agent
-                                                .recovery_exhausted_message(&session.working_dir)
+                                                .recovery_exhausted_message_for_session(
+                                                    &session_config.id,
+                                                    &session.working_dir,
+                                                )
                                                 .unwrap_or_else(|| {
                                                     if reasoning_only_response {
                                                         REASONING_ONLY_TURN_MESSAGE.to_string()
@@ -3321,6 +3460,14 @@ impl Agent {
                 }
 
                 if is_token_cancelled(&cancel_token) {
+                    if coding_tools_active {
+                        self.coding_agent.cancel_active_workflow_for_session(
+                            &session_config.id,
+                            &session.working_dir,
+                        );
+                    }
+                    pending_final_output = None;
+                    exit_chat = true;
                     if let Some(ref task) = tool_pair_summarization_task {
                         task.abort();
                     }
@@ -4376,6 +4523,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         snapshots: std::sync::Mutex<Vec<CodingDisclosureSnapshot>>,
     }
 
+    struct InvalidRoutingProvider {
+        routing_calls: AtomicUsize,
+        active_calls: AtomicUsize,
+    }
+
     struct ContinueWithoutCodingRoutingProvider {
         inner: Arc<dyn crate::providers::base::Provider>,
     }
@@ -4423,6 +4575,37 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                 route_count: AtomicUsize::new(0),
                 snapshots: std::sync::Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for InvalidRoutingProvider {
+        async fn stream(
+            &self,
+            _model_config: &ponduin_providers::model::ModelConfig,
+            _system_prompt: &str,
+            _messages: &[Message],
+            tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let routing_request = tools
+                .iter()
+                .any(|tool| tool.name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+                && tools.iter().any(|tool| {
+                    tool.name == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME
+                });
+            let message = if routing_request {
+                self.routing_calls.fetch_add(1, Ordering::SeqCst);
+                Message::assistant().with_text("invalid routing response")
+            } else {
+                self.active_calls.fetch_add(1, Ordering::SeqCst);
+                Message::assistant().with_text("coding fallback response")
+            };
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            Ok(stream_from_single_message(message, usage))
+        }
+
+        fn get_name(&self) -> &str {
+            "invalid-routing"
         }
     }
 
@@ -4556,6 +4739,25 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             Ok(CallToolRequestParams::new("unknown__route").with_arguments(serde_json::Map::new())),
         );
         assert!(collect_coding_route_decisions(&unknown, &mut decisions));
+    }
+
+    #[test]
+    fn coding_router_fallback_requires_an_explicit_workspace_request() {
+        assert!(has_explicit_coding_request(
+            "Erstelle progress_check.py im aktuellen Projekt und teste die Funktion."
+        ));
+        assert!(has_explicit_coding_request(
+            "Inspect the repository and explain the failing Rust test."
+        ));
+        assert!(!has_explicit_coding_request(
+            "Erkläre mir die Geschichte der Programmiersprache Rust."
+        ));
+        assert!(!has_explicit_coding_request(
+            "Write a short poem about the ocean."
+        ));
+        assert!(!has_explicit_coding_request(
+            "Explain how Python tests work."
+        ));
     }
 
     #[test]
@@ -4726,6 +4928,37 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .iter()
             .all(|name| !crate::coding::tools::is_reserved_name(name)));
         assert_eq!(inactive.thinking_effort.as_deref(), Some("high"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_coding_request_uses_fallback_after_invalid_routing() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let provider = Arc::new(InvalidRoutingProvider {
+            routing_calls: AtomicUsize::new(0),
+            active_calls: AtomicUsize::new(0),
+        });
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
+        let (agent, session_id) = create_test_agent_inner(
+            temp_dir.path().join("data"),
+            hook_manager,
+            provider.clone(),
+            false,
+        )
+        .await?;
+
+        let messages = run_stop_hook_test_turn(
+            &agent,
+            &session_id,
+            "Create hello.py in the current project and test the function.",
+        )
+        .await?;
+
+        assert_eq!(provider.routing_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.active_calls.load(Ordering::SeqCst), 1);
+        assert!(visible_texts(&messages)
+            .iter()
+            .any(|text| text == "coding fallback response"));
         Ok(())
     }
 
