@@ -377,6 +377,39 @@ is exposed, and stops policy-blocked, cancelled, or internal failures. The
 workflow's existing phase, attempt history, and `next_action` provide that
 context; this does not introduce another state machine.
 
+### Action and strategy history
+
+Each active workflow also retains a bounded, task-local action history. An
+`ActionAttempt` records only the action category, runtime strategy, capability,
+target fingerprint, workflow revision, structured `ActionResult`, and compact
+progress signal. It does not retain source bodies, model reasoning, tool JSON,
+or process output. Capability feedback records task-local successes, failures,
+and capabilities proven unavailable; it is discarded with the workflow and is
+never used as a global model or provider ranking. An alternative with prior
+failures and no task-local success is not preferred merely because it is still
+technically exposed.
+
+`ActionStrategy` gives a stable identity to materially different attempts,
+including direct work, refresh-before-mutation, diagnostic inspection,
+argument correction, alternative capability use, narrower validation, and the
+existing bounded repair approaches. Before dispatching a coding tool, the
+runtime combines action history, task state, recovery outcome, current tool
+exposure, the current session/model tool surface, capability feedback, and
+evidence to select the permitted strategy. A compact local-model contract can
+therefore never be directed to an alternative that was not exposed to it.
+It treats a failed action with the same target, semantic failure, strategy, and
+unchanged state as equivalent even when model wording or irrelevant tool JSON
+differs. A later state-changing action, refreshed resource, changed diagnostic,
+or distinct repair approach remains a meaningful alternative.
+
+For example, a stale mutation requires a read before a
+`refresh_then_mutate` retry; a repeated failed validation requires diagnostic
+inspection and then a distinct repair approach; an unavailable mutation tool
+offers its currently exposed single-file alternative and stops once that
+alternative is also unsuitable. The runtime decides these boundaries and retry
+eligibility. The model supplies diagnostics interpretation and implementation
+content only within the selected safe strategy.
+
 ## Coding loop and progress detection
 
 The coding strategy uses the current agent loop:

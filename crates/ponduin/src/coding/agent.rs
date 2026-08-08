@@ -134,11 +134,13 @@ impl CodingAgent {
         let Ok(workspace) = CodingWorkspace::new(working_dir) else {
             return tools::definitions();
         };
-        if uses_compact_qwen_coding_tools(model_config) {
+        let tools = if uses_compact_qwen_coding_tools(model_config) {
             tool_state.compact_native_definitions_for_workspace(workspace.root())
         } else {
             tool_state.definitions_for_workspace(workspace.root())
-        }
+        };
+        tool_state.remember_model_tool_surface(workspace.root(), &tools);
+        tools
     }
 
     pub fn workflow_guidance(&self, working_dir: &Path) -> Option<String> {
@@ -571,6 +573,7 @@ impl CodingAgent {
             .map_err(|error| ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None))?;
         self.fill_missing_workflow_objective(&tool_state, &mut tool_call, workspace.root());
         normalize_structured_tool_arguments(&mut tool_call);
+        let action_arguments = tool_call.arguments.clone();
         let exposed = tool_state.definitions_for_workspace(workspace.root());
         if !exposed.iter().any(|tool| tool.name == tool_call.name) {
             let next_tools = exposed
@@ -582,6 +585,8 @@ impl CodingAgent {
                 &tool_state,
                 workspace.root(),
                 tool_call.name.as_ref(),
+                action_arguments.as_ref(),
+                false,
                 error_with_action(
                     ErrorCode::INVALID_PARAMS,
                     format!(
@@ -592,6 +597,30 @@ impl CodingAgent {
                     ActionResult::failed(ActionFailureKind::WorkflowStateViolation, false),
                 ),
             ));
+        }
+        let selection = tool_state.action_selection_for(
+            workspace.root(),
+            tool_call.name.as_ref(),
+            action_arguments.as_ref(),
+        );
+        if let Some(selection) = &selection {
+            if !selection.allowed {
+                let failure_kind = selection
+                    .blocked_by
+                    .unwrap_or(ActionFailureKind::RepeatedFailure);
+                return Err(self.with_recovery_decision(
+                    &tool_state,
+                    workspace.root(),
+                    tool_call.name.as_ref(),
+                    action_arguments.as_ref(),
+                    false,
+                    error_with_action(
+                        ErrorCode::INVALID_PARAMS,
+                        "the runtime action history requires a distinct selected strategy before this action can run",
+                        ActionResult::failed(failure_kind, false),
+                    ),
+                ));
+            }
         }
         let tool_name = tool_call.name.to_string();
         let result = if tools::is_async_tool(&tool_call.name) {
@@ -612,9 +641,27 @@ impl CodingAgent {
                 )
             })?
         };
-        result.map_err(|error| {
-            self.with_recovery_decision(&tool_state, workspace.root(), &tool_name, error)
-        })
+        match result {
+            Ok(result) => {
+                if let Some(selection) = &selection {
+                    tool_state.record_successful_action(
+                        workspace.root(),
+                        &tool_name,
+                        action_arguments.as_ref(),
+                        selection,
+                    );
+                }
+                Ok(result)
+            }
+            Err(error) => Err(self.with_recovery_decision(
+                &tool_state,
+                workspace.root(),
+                &tool_name,
+                action_arguments.as_ref(),
+                true,
+                error,
+            )),
+        }
     }
 
     fn with_recovery_decision(
@@ -622,15 +669,21 @@ impl CodingAgent {
         tool_state: &tools::CodingToolState,
         workspace_root: &Path,
         tool_name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+        action_was_dispatched: bool,
         error: ErrorData,
     ) -> ErrorData {
         let mut action = action_result_from_error(&error);
         let Some(failure_kind) = action.failure_kind else {
             return error;
         };
+        if action_was_dispatched {
+            tool_state.record_failed_action(workspace_root, tool_name, arguments, action.clone());
+        }
         let repetitions = tool_state
             .record_action_failure(workspace_root, tool_name, failure_kind)
             .unwrap_or(1);
+        let selection = tool_state.action_selection_for(workspace_root, tool_name, arguments);
         let workflow_hint = tool_state
             .active_workflow_id(workspace_root)
             .map(|workflow_id| format!(" Current workflow ID: `{workflow_id}`."))
@@ -646,6 +699,7 @@ impl CodingAgent {
             Some(serde_json::json!({
                 "action": action,
                 "recovery_decision": decision,
+                "action_selection": selection,
             })),
         )
     }
@@ -966,6 +1020,185 @@ mod tests {
             .is_some());
     }
 
+    #[tokio::test]
+    async fn session_scoped_workflows_do_not_share_action_history() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("fixture.txt"), "fixture\n").unwrap();
+        let agent = enabled_agent();
+        let first_session = "history-first";
+        let second_session = "history-second";
+
+        for session_id in [first_session, second_session] {
+            agent
+                .execute_for_session(
+                    session_id,
+                    PonduinMode::Auto,
+                    CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                        .with_arguments(object!({"objective": "inspect fixture.txt"})),
+                    temp_dir.path(),
+                )
+                .await
+                .unwrap();
+        }
+        agent
+            .execute_for_session(
+                first_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::READ_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": "fixture.txt"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let first_status = agent
+            .execute_for_session(
+                first_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let second_status = agent
+            .execute_for_session(
+                second_session,
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let first_status: Value =
+            serde_json::from_str(&first_status.content[0].as_text().unwrap().text).unwrap();
+        let second_status: Value =
+            serde_json::from_str(&second_status.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(
+            first_status["memory"]["action_attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(second_status["memory"]["action_attempts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_mutation_history_requires_a_read_before_the_runtime_allows_a_retry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("lib.rs");
+        fs::write(&path, "pub fn label() {}\n").unwrap();
+        let agent = enabled_agent();
+        begin_editing_workflow(
+            &agent,
+            temp_dir.path(),
+            "repair lib.rs",
+            vec!["lib.rs".to_string()],
+        )
+        .await;
+        let snapshot = read_snapshot(&agent, temp_dir.path(), "lib.rs").await;
+        fs::write(&path, "pub fn label() { println!(\"changed\"); }\n").unwrap();
+        let stale_write = CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME)
+            .with_arguments(object!({
+                "changes": [{
+                    "operation": "write",
+                    "path": "lib.rs",
+                    "expected_digest": snapshot["digest"],
+                    "content": "pub fn label() { println!(\"fixed\"); }\n"
+                }]
+            }));
+
+        let stale = agent
+            .execute(PonduinMode::Auto, stale_write.clone(), temp_dir.path())
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&stale), ActionFailureKind::StaleState);
+        assert_eq!(recovery_decision(&stale), RecoveryDecision::RefreshState);
+        let after_stale = execute_json(
+            &agent,
+            temp_dir.path(),
+            CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                .with_arguments(object!({})),
+        )
+        .await;
+        let stale_mutation_attempts = after_stale["memory"]["action_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|attempt| attempt["capability"] == tools::APPLY_CHANGES_TOOL_NAME)
+            .count();
+
+        let blocked = agent
+            .execute(PonduinMode::Auto, stale_write, temp_dir.path())
+            .await
+            .unwrap_err();
+        let selection = blocked
+            .data
+            .as_ref()
+            .and_then(|data| data.get("action_selection"))
+            .expect("strategy selection is returned with the blocked action");
+        assert_eq!(selection["action"], "inspect");
+        assert_eq!(selection["strategy"], "refresh_then_mutate");
+        assert_eq!(selection["allowed"], false);
+        let after_blocked = execute_json(
+            &agent,
+            temp_dir.path(),
+            CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                .with_arguments(object!({})),
+        )
+        .await;
+        assert_eq!(
+            after_blocked["memory"]["action_attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|attempt| attempt["capability"] == tools::APPLY_CHANGES_TOOL_NAME)
+                .count(),
+            stale_mutation_attempts
+        );
+
+        let refreshed = read_snapshot(&agent, temp_dir.path(), "lib.rs").await;
+        let repaired = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(
+                    object!({
+                        "changes": [{
+                            "operation": "write",
+                            "path": "lib.rs",
+                            "expected_digest": refreshed["digest"],
+                            "content": "pub fn label() { println!(\"fixed\"); }\n"
+                        }]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert!(!repaired.is_error.unwrap_or(false));
+        let status = execute_json(
+            &agent,
+            temp_dir.path(),
+            CallToolRequestParams::new(tools::WORKFLOW_STATUS_TOOL_NAME)
+                .with_arguments(object!({})),
+        )
+        .await;
+        assert!(status["memory"]["action_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| {
+                attempt["capability"] == tools::APPLY_CHANGES_TOOL_NAME
+                    && attempt["strategy"] == serde_json::json!("refresh_then_mutate")
+                    && attempt["result"]["outcome"] == serde_json::json!("succeeded")
+            }));
+    }
+
     #[test]
     fn incomplete_session_state_is_not_evicted_at_capacity() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1095,13 +1328,16 @@ mod tests {
             .await
             .unwrap();
 
+        let write =
+            CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME).with_arguments(object!({
+                "changes": [{
+                    "operation": "create",
+                    "path": "lib.rs",
+                    "content": "pub fn label() {}\n"
+                }]
+            }));
         let error = agent
-            .execute(
-                PonduinMode::Auto,
-                CallToolRequestParams::new(tools::APPLY_CHANGES_TOOL_NAME)
-                    .with_arguments(object!({"changes": []})),
-                temp_dir.path(),
-            )
+            .execute(PonduinMode::Auto, write.clone(), temp_dir.path())
             .await
             .unwrap_err();
 
@@ -1110,6 +1346,25 @@ mod tests {
             ActionFailureKind::WorkflowStateViolation
         );
         assert_eq!(recovery_decision(&error), RecoveryDecision::Replan);
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_TRANSITION_TOOL_NAME).with_arguments(
+                    object!({
+                        "workflow_id": started["id"].as_str().unwrap(),
+                        "transition": "begin_editing"
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let applied = agent
+            .execute(PonduinMode::Auto, write, temp_dir.path())
+            .await
+            .unwrap();
+        assert!(!applied.is_error.unwrap_or(false));
     }
 
     #[tokio::test]

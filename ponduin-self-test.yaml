@@ -217,8 +217,11 @@ prompt: |
   4. Preview a three-file change with `coding__preview_changes`.
   5. Modify one source file outside the prepared batch, then verify
      `coding__apply_changes` rejects the entire stale batch and changes no
-     destination.
-  6. Read fresh versions, preview again, apply the complete batch, and verify
+     destination. Retry the stale mutation without a fresh read and verify the
+     structured action selection requires `inspect` with
+     `refresh_then_mutate`, rather than dispatching the duplicate mutation.
+  6. Read fresh versions, verify the recorded action history contains the
+     refresh strategy, preview again, apply the complete batch, and verify
      all three files changed.
   7. Use `coding__rollback_changes` and verify all three files return to their
      prior contents.

@@ -2,8 +2,8 @@ use crate::coding::config::CodingConfig;
 use crate::coding::context::{ContextLimits, ContextPlanner};
 use crate::coding::embedding::hybrid_context_candidates;
 use crate::coding::file::{
-    FileReadError, FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
-    MIN_READ_LIMIT,
+    content_digest, FileReadError, FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT,
+    MAX_READ_LIMIT, MIN_READ_LIMIT,
 };
 use crate::coding::git::{
     GitDiff, GitDiffRequest, GitError, GitLimits, GitOwnedPath, GitRepository,
@@ -13,8 +13,8 @@ use crate::coding::lsp::{
     LanguageServerClient, LanguageServerOperation, LanguageServerPosition, LanguageServerQuery,
 };
 use crate::coding::outcome::{
-    error_with_action, ActionFailureKind, ActionResult, RecoveryContext, RecoveryDecision,
-    RecoveryPhase,
+    error_with_action, ActionFailureKind, ActionOutcome, ActionResult, RecoveryContext,
+    RecoveryDecision, RecoveryPhase,
 };
 use crate::coding::patch::{
     MutationBatch, MutationPreview, MutationResult, PatchEngine, PatchError, PatchLimits,
@@ -28,10 +28,10 @@ use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
-    CodingWorkflow, RepairApproach, RequirementPriority, RequirementSource,
-    RequirementVerification, WorkflowCheck, WorkflowCommand, WorkflowError, WorkflowId,
-    WorkflowLimits, WorkflowNextAction, WorkflowPhase, WorkflowPlan, WorkflowReport,
-    WorkflowRequirement, WorkflowStatus, WorkflowTaskState,
+    ActionAttempt, ActionProgress, ActionSelection, CodingWorkflow, RepairApproach,
+    RequirementPriority, RequirementSource, RequirementVerification, WorkflowAction, WorkflowCheck,
+    WorkflowCommand, WorkflowError, WorkflowId, WorkflowLimits, WorkflowNextAction, WorkflowPhase,
+    WorkflowPlan, WorkflowReport, WorkflowRequirement, WorkflowStatus, WorkflowTaskState,
 };
 use crate::coding::workspace::WorkspaceError;
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
@@ -102,6 +102,7 @@ pub(crate) struct CodingToolState {
     intelligence_cache: Mutex<VecDeque<IntelligenceCacheEntry>>,
     workflows: Mutex<VecDeque<WorkspaceWorkflow>>,
     task_contexts: Mutex<VecDeque<WorkspaceTaskContext>>,
+    model_tool_surfaces: Mutex<VecDeque<WorkspaceToolSurface>>,
     mutation_lock: Mutex<()>,
 }
 
@@ -136,6 +137,12 @@ struct WorkspaceWorkflow {
 struct WorkspaceTaskContext {
     workspace_root: PathBuf,
     task: WorkflowTaskState,
+}
+
+#[derive(Debug)]
+struct WorkspaceToolSurface {
+    workspace_root: PathBuf,
+    capabilities: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +214,107 @@ impl CodingToolState {
         })
     }
 
+    pub(crate) fn action_selection_for(
+        &self,
+        workspace_root: &Path,
+        tool_name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+    ) -> Option<ActionSelection> {
+        let action = workflow_action(tool_name)?;
+        let target_fingerprint = tool_target_fingerprint(tool_name, arguments);
+        let available_capabilities = self.available_action_capabilities(workspace_root);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.select_action(
+                action,
+                tool_name,
+                &target_fingerprint,
+                &available_capabilities,
+            )
+        })
+    }
+
+    pub(crate) fn record_successful_action(
+        &self,
+        workspace_root: &Path,
+        tool_name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+        selection: &ActionSelection,
+    ) {
+        let Some(action) = workflow_action(tool_name) else {
+            return;
+        };
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            if matches!(action, WorkflowAction::Process | WorkflowAction::Validate)
+                || tool_name == WORKFLOW_STATUS_TOOL_NAME
+            {
+                return;
+            }
+            let state_changed = action == WorkflowAction::Mutate
+                || matches!(
+                    tool_name,
+                    WORKFLOW_SET_PLAN_TOOL_NAME
+                        | WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
+                        | WORKFLOW_TRANSITION_TOOL_NAME
+                );
+            workflow.record_action_attempt(ActionAttempt {
+                revision: workflow.status().revision,
+                action,
+                strategy: selection.strategy,
+                capability: tool_name.to_string(),
+                target_fingerprint: tool_target_fingerprint(tool_name, arguments),
+                result: ActionResult::succeeded(state_changed, action != WorkflowAction::Workflow),
+                progress: if state_changed {
+                    ActionProgress::State
+                } else {
+                    action_success_progress(action)
+                },
+            });
+        });
+    }
+
+    pub(crate) fn record_failed_action(
+        &self,
+        workspace_root: &Path,
+        tool_name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+        result: ActionResult,
+    ) -> Option<ActionSelection> {
+        let action = workflow_action(tool_name)?;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available_capabilities = self.available_action_capabilities(workspace_root);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            let target_fingerprint = tool_target_fingerprint(tool_name, arguments);
+            let selection = workflow.select_action(
+                action,
+                tool_name,
+                &target_fingerprint,
+                &available_capabilities,
+            );
+            workflow.record_action_attempt(ActionAttempt {
+                revision: workflow.status().revision,
+                action,
+                strategy: selection.strategy,
+                capability: tool_name.to_string(),
+                target_fingerprint: target_fingerprint.clone(),
+                progress: action_progress_for_result(action, &result),
+                result,
+            });
+            workflow.select_action(
+                action,
+                tool_name,
+                &target_fingerprint,
+                &available_capabilities,
+            )
+        })
+    }
+
     pub(crate) fn next_action_thinking_effort(&self, workspace_root: &Path) -> ThinkingEffort {
         match self.workflow_status(workspace_root, None) {
             Ok(status)
@@ -233,6 +341,48 @@ impl CodingToolState {
         // tool call. Keep the small contract stable; execute still derives authority from the
         // workflow state through definitions_for_workspace before every call.
         compact_native_definitions(definitions())
+    }
+
+    fn available_action_capabilities(&self, workspace_root: &Path) -> Vec<String> {
+        let exposed = self
+            .definitions_for_workspace(workspace_root)
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<BTreeSet<_>>();
+        let surfaces = self
+            .model_tool_surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(surface) = surfaces
+            .iter()
+            .rev()
+            .find(|surface| surface.workspace_root == workspace_root)
+        else {
+            return exposed.into_iter().collect();
+        };
+        exposed
+            .into_iter()
+            .filter(|capability| surface.capabilities.contains(capability))
+            .collect()
+    }
+
+    pub(crate) fn remember_model_tool_surface(&self, workspace_root: &Path, tools: &[Tool]) {
+        let capabilities = tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<BTreeSet<_>>();
+        let mut surfaces = self
+            .model_tool_surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        surfaces.retain(|surface| surface.workspace_root != workspace_root);
+        surfaces.push_back(WorkspaceToolSurface {
+            workspace_root: workspace_root.to_path_buf(),
+            capabilities,
+        });
+        while surfaces.len() > MAX_WORKSPACE_WORKFLOWS {
+            surfaces.pop_front();
+        }
     }
 
     pub(crate) fn workflow_guidance_for_workspace(&self, workspace_root: &Path) -> Option<String> {
@@ -967,13 +1117,32 @@ impl CodingToolState {
         workspace_root: &Path,
         program: &str,
         args: &[String],
+        cwd: &Path,
         output: &ProcessOutput,
     ) -> Result<(), ErrorData> {
         let _mutation = self
             .mutation_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available_capabilities = self.available_action_capabilities(workspace_root);
         if let Some(result) = self.with_current_workflow_mut(workspace_root, |workflow| {
+            let target_fingerprint = process_target_fingerprint(program, args, cwd);
+            let selection = workflow.select_action(
+                WorkflowAction::Process,
+                RUN_PROCESS_TOOL_NAME,
+                &target_fingerprint,
+                &available_capabilities,
+            );
+            let action = output.action_result();
+            workflow.record_action_attempt(ActionAttempt {
+                revision: workflow.status().revision,
+                action: WorkflowAction::Process,
+                strategy: selection.strategy,
+                capability: RUN_PROCESS_TOOL_NAME.to_string(),
+                target_fingerprint,
+                progress: action_progress_for_result(WorkflowAction::Process, &action),
+                result: action,
+            });
             workflow
                 .record_process(program, args, output)
                 .map_err(workflow_error)
@@ -986,13 +1155,31 @@ impl CodingToolState {
     fn record_validation_execution(
         &self,
         workspace_root: &Path,
+        command_id: &str,
         execution: &ValidationExecution,
     ) -> Result<(), ErrorData> {
         let _mutation = self
             .mutation_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available_capabilities = self.available_action_capabilities(workspace_root);
         if let Some(result) = self.with_current_workflow_mut(workspace_root, |workflow| {
+            let target_fingerprint = validation_target_fingerprint(command_id);
+            let selection = workflow.select_action(
+                WorkflowAction::Validate,
+                RUN_VALIDATION_TOOL_NAME,
+                &target_fingerprint,
+                &available_capabilities,
+            );
+            workflow.record_action_attempt(ActionAttempt {
+                revision: workflow.status().revision,
+                action: WorkflowAction::Validate,
+                strategy: selection.strategy,
+                capability: RUN_VALIDATION_TOOL_NAME.to_string(),
+                target_fingerprint,
+                progress: action_progress_for_result(WorkflowAction::Validate, &execution.action),
+                result: execution.action.clone(),
+            });
             workflow
                 .record_validation_execution(execution)
                 .map_err(workflow_error)
@@ -1622,6 +1809,141 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with(CODING_TOOL_PREFIX)
 }
 
+fn workflow_action(tool_name: &str) -> Option<WorkflowAction> {
+    match tool_name {
+        READ_FILE_TOOL_NAME
+        | FIND_FILES_TOOL_NAME
+        | SEARCH_TEXT_TOOL_NAME
+        | REPOSITORY_PROFILE_TOOL_NAME
+        | REPOSITORY_INSTRUCTIONS_TOOL_NAME
+        | REPOSITORY_MAP_TOOL_NAME
+        | SEARCH_SYMBOLS_TOOL_NAME
+        | FIND_REFERENCES_TOOL_NAME
+        | SELECT_CONTEXT_TOOL_NAME
+        | PREPARE_CONTEXT_TOOL_NAME
+        | PROJECT_CAPABILITIES_TOOL_NAME => Some(WorkflowAction::Inspect),
+        PREVIEW_CHANGES_TOOL_NAME => Some(WorkflowAction::Inspect),
+        APPLY_CHANGES_TOOL_NAME | WRITE_FILE_TOOL_NAME | ROLLBACK_CHANGES_TOOL_NAME => {
+            Some(WorkflowAction::Mutate)
+        }
+        RUN_VALIDATION_TOOL_NAME => Some(WorkflowAction::Validate),
+        RUN_PROCESS_TOOL_NAME => Some(WorkflowAction::Process),
+        REVIEW_CHANGES_TOOL_NAME => Some(WorkflowAction::Review),
+        WORKFLOW_SET_PLAN_TOOL_NAME
+        | WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
+        | WORKFLOW_TRANSITION_TOOL_NAME
+        | WORKFLOW_COMPLETE_TOOL_NAME => Some(WorkflowAction::Workflow),
+        _ => None,
+    }
+}
+
+fn action_success_progress(action: WorkflowAction) -> ActionProgress {
+    match action {
+        WorkflowAction::Inspect | WorkflowAction::Validate | WorkflowAction::Process => {
+            ActionProgress::Evidence
+        }
+        WorkflowAction::Mutate => ActionProgress::State,
+        WorkflowAction::Review => ActionProgress::Evidence,
+        WorkflowAction::Workflow => ActionProgress::NoProgress,
+    }
+}
+
+fn action_progress_for_result(action: WorkflowAction, result: &ActionResult) -> ActionProgress {
+    if result.outcome == ActionOutcome::Succeeded {
+        action_success_progress(action)
+    } else if result.evidence_recorded {
+        ActionProgress::Evidence
+    } else {
+        ActionProgress::NoProgress
+    }
+}
+
+fn tool_target_fingerprint(
+    tool_name: &str,
+    arguments: Option<&serde_json::Map<String, Value>>,
+) -> String {
+    let Some(arguments) = arguments else {
+        return content_digest(b"workspace");
+    };
+    match tool_name {
+        RUN_PROCESS_TOOL_NAME => {
+            let Some(program) = arguments.get("program").and_then(Value::as_str) else {
+                return action_target_fingerprint(Some(arguments));
+            };
+            let args = arguments
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let cwd = arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .unwrap_or_else(|| Path::new("."));
+            process_target_fingerprint(program, &args, cwd)
+        }
+        RUN_VALIDATION_TOOL_NAME => arguments
+            .get("command_id")
+            .and_then(Value::as_str)
+            .map(validation_target_fingerprint)
+            .unwrap_or_else(|| action_target_fingerprint(Some(arguments))),
+        _ => action_target_fingerprint(Some(arguments)),
+    }
+}
+
+fn action_target_fingerprint(arguments: Option<&serde_json::Map<String, Value>>) -> String {
+    let mut targets = Vec::new();
+    let Some(arguments) = arguments else {
+        return content_digest(b"workspace");
+    };
+    for field in ["path", "scope", "cwd", "command_id", "program"] {
+        if let Some(Value::String(value)) = arguments.get(field) {
+            targets.push(format!("{field}\0{value}"));
+        }
+    }
+    if let Some(Value::Array(arguments)) = arguments.get("args") {
+        for argument in arguments.iter().filter_map(Value::as_str) {
+            targets.push(format!("argument\0{argument}"));
+        }
+    }
+    if let Some(Value::Array(changes)) = arguments.get("changes") {
+        for change in changes {
+            if let Some(path) = change.get("path").and_then(Value::as_str) {
+                targets.push(format!("path\0{path}"));
+            }
+        }
+    }
+    target_fingerprint(targets)
+}
+
+fn process_target_fingerprint(program: &str, args: &[String], cwd: &Path) -> String {
+    let mut target = vec![
+        format!("program\0{program}"),
+        format!("cwd\0{}", cwd.display()),
+    ];
+    target.extend(args.iter().map(|argument| format!("argument\0{argument}")));
+    target_fingerprint(target)
+}
+
+fn validation_target_fingerprint(command_id: &str) -> String {
+    target_fingerprint(vec![format!("command_id\0{command_id}")])
+}
+
+fn target_fingerprint(mut targets: Vec<String>) -> String {
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        content_digest(b"workspace")
+    } else {
+        content_digest(targets.join("\n").as_bytes())
+    }
+}
+
 pub(crate) fn canonical_native_tool_name(name: &str) -> Option<&'static str> {
     match name {
         "repository_profile" => Some(REPOSITORY_PROFILE_TOOL_NAME),
@@ -1715,6 +2037,7 @@ pub(crate) async fn execute_async(
             validate_process_invocation(&params.program, &params.args)?;
             let evidence_program = params.program.clone();
             let evidence_args = params.args.clone();
+            let evidence_cwd = params.cwd.clone();
             let timeout = params
                 .timeout_seconds
                 .map(Duration::from_secs)
@@ -1742,7 +2065,13 @@ pub(crate) async fn execute_async(
             .await
             .map_err(process_error)?;
             state.invalidate_intelligence(workspace.root());
-            state.record_process(workspace.root(), &evidence_program, &evidence_args, &output)?;
+            state.record_process(
+                workspace.root(),
+                &evidence_program,
+                &evidence_args,
+                &evidence_cwd,
+                &output,
+            )?;
             bounded_process_result(output, config.output_limit)
         }
         GIT_STATUS_TOOL_NAME => {
@@ -1893,7 +2222,7 @@ pub(crate) async fn execute_async(
             )
             .await;
             state.invalidate_intelligence(workspace.root());
-            state.record_validation_execution(workspace.root(), &execution)?;
+            state.record_validation_execution(workspace.root(), &params.command_id, &execution)?;
             execution.action.recovery_decision =
                 state.recovery_decision_for(workspace.root(), &execution.action);
             bounded_validation_result(execution, config.output_limit)
@@ -4678,6 +5007,15 @@ mod tests {
         .await
         .unwrap();
 
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let recorded = state.workflow_status(workspace.root(), None).unwrap();
+        assert!(recorded.memory.action_attempts.iter().any(|attempt| {
+            attempt.action == WorkflowAction::Process
+                && attempt.capability == RUN_PROCESS_TOOL_NAME
+                && attempt.result.failure_kind == Some(ActionFailureKind::ProcessFailed)
+                && attempt.progress == ActionProgress::Evidence
+        }));
+
         assert!(exposed_tool_names(&state, temp_dir.path())
             .contains(WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME));
         let status = execute_with_state(
@@ -4791,6 +5129,113 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
             "<h1>America</h1>\n"
+        );
+    }
+
+    #[test]
+    fn a_new_workflow_does_not_inherit_terminal_task_action_history() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["lib.rs"]);
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let arguments = object!({
+            "changes": [{"operation": "write", "path": "lib.rs"}]
+        });
+        state.record_failed_action(
+            workspace.root(),
+            APPLY_CHANGES_TOOL_NAME,
+            Some(&arguments),
+            ActionResult::failed(ActionFailureKind::StaleState, true),
+        );
+        assert_eq!(
+            state
+                .workflow_status(workspace.root(), None)
+                .unwrap()
+                .memory
+                .action_attempts
+                .len(),
+            1
+        );
+
+        state.cancel_active_workflow(workspace.root());
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME)
+                .with_arguments(object!({"objective": "create a new independent task"})),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let reset = state.workflow_status(workspace.root(), None).unwrap();
+        assert_eq!(reset.phase, WorkflowPhase::Analyzing);
+        assert!(reset.memory.action_attempts.is_empty());
+        assert!(reset.memory.capability_feedback.is_empty());
+    }
+
+    #[test]
+    fn compact_model_surface_only_selects_exposed_mutation_fallbacks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["lib.rs"]);
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let compact_tools = state.compact_native_definitions_for_workspace(workspace.root());
+        state.remember_model_tool_surface(workspace.root(), &compact_tools);
+        let arguments = object!({
+            "changes": [{"operation": "write", "path": "lib.rs"}]
+        });
+
+        state.record_failed_action(
+            workspace.root(),
+            APPLY_CHANGES_TOOL_NAME,
+            Some(&arguments),
+            ActionResult::failed(ActionFailureKind::CapabilityUnavailable, false),
+        );
+        let apply_selection = state
+            .action_selection_for(workspace.root(), APPLY_CHANGES_TOOL_NAME, Some(&arguments))
+            .unwrap();
+        assert_eq!(
+            apply_selection.alternative_capability.as_deref(),
+            Some(WRITE_FILE_TOOL_NAME)
+        );
+
+        state.record_failed_action(
+            workspace.root(),
+            WRITE_FILE_TOOL_NAME,
+            Some(&object!({"path": "lib.rs"})),
+            ActionResult::failed(ActionFailureKind::CapabilityUnavailable, false),
+        );
+        let write_selection = state
+            .action_selection_for(
+                workspace.root(),
+                WRITE_FILE_TOOL_NAME,
+                Some(&object!({"path": "lib.rs"})),
+            )
+            .unwrap();
+        assert_eq!(write_selection.alternative_capability, None);
+    }
+
+    #[test]
+    fn process_and_validation_attempts_reuse_dispatch_target_fingerprints() {
+        let process = object!({
+            "program": "cargo",
+            "args": ["test", "-p", "ponduin"]
+        });
+        assert_eq!(
+            tool_target_fingerprint(RUN_PROCESS_TOOL_NAME, Some(&process)),
+            process_target_fingerprint(
+                "cargo",
+                &["test".to_string(), "-p".to_string(), "ponduin".to_string()],
+                Path::new(".")
+            )
+        );
+
+        let validation = object!({"command_id": "focused-test"});
+        assert_eq!(
+            tool_target_fingerprint(RUN_VALIDATION_TOOL_NAME, Some(&validation)),
+            validation_target_fingerprint("focused-test")
         );
     }
 
