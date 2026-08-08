@@ -363,6 +363,18 @@ mod tests {
             .unwrap();
         provider.finish_recording().unwrap();
 
+        let mut saved_records = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            &fs::read_to_string(&temp_file).unwrap(),
+        )
+        .unwrap();
+        let recorded_response = saved_records.values().next().cloned().unwrap();
+        saved_records.clear();
+        saved_records.insert(
+            "legacy-message-identity-hash".to_string(),
+            recorded_response,
+        );
+        fs::write(&temp_file, serde_json::to_string(&saved_records).unwrap()).unwrap();
+
         let mut replayed_message = Message::new(
             Role::User,
             2,
