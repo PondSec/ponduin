@@ -221,6 +221,7 @@ impl CodingWorkflow {
             self.memory.tool_contract_errors.remove(0);
         }
         if repetitions >= LOOP_THRESHOLD {
+            self.record_capability_state(tool_name, TaskCapabilityState::Unsuitable);
             self.block(WorkflowStopReason::RepeatedToolContract {
                 tool_name: tool_name.to_string(),
                 repetitions,
@@ -800,14 +801,15 @@ impl CodingWorkflow {
                 TaskCapabilityState::TemporarilyFailed
             }
         };
+        self.record_capability_state(validation.program.as_deref().unwrap_or("validation"), state);
+    }
+
+    fn record_capability_state(&mut self, capability: &str, state: TaskCapabilityState) {
         self.memory
             .capability_feedback
             .push(CapabilityFeedbackEvidence {
-                revision: validation.revision,
-                capability: validation
-                    .program
-                    .clone()
-                    .unwrap_or_else(|| "validation".to_string()),
+                revision: self.revision,
+                capability: capability.to_string(),
                 state,
             });
         if self.memory.capability_feedback.len() > MAX_EVIDENCE_RECORDS {
@@ -3005,6 +3007,10 @@ mod tests {
         let status = workflow.status();
         assert_eq!(status.phase, WorkflowPhase::Blocked);
         assert_eq!(status.memory.tool_contract_errors.len(), 3);
+        assert!(status.memory.capability_feedback.iter().any(|feedback| {
+            feedback.capability == "coding__apply_changes"
+                && feedback.state == TaskCapabilityState::Unsuitable
+        }));
         assert!(matches!(
             status.stop_reason,
             Some(WorkflowStopReason::RepeatedToolContract {
