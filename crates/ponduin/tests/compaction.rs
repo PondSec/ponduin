@@ -13,7 +13,7 @@ use ponduin::session::Session;
 use ponduin_providers::conversation::token_usage::{ProviderUsage, Usage};
 use ponduin_providers::errors::ProviderError;
 use ponduin_providers::model::ModelConfig;
-use rmcp::model::Tool;
+use rmcp::model::{CallToolRequestParams, Tool};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -103,7 +103,7 @@ impl Provider for MockCompactionProvider {
         _model_config: &ModelConfig,
         system_prompt: &str,
         messages: &[Message],
-        _tools: &[Tool],
+        tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         // Check if this is a compaction call (message contains "summarize")
         let is_compaction = messages.iter().any(|msg| {
@@ -137,8 +137,17 @@ impl Provider for MockCompactionProvider {
             self.has_compacted.store(true, Ordering::SeqCst);
         }
 
-        // Generate response
-        let message = if is_compaction {
+        let is_routing = !tools.is_empty();
+
+        let message = if is_routing {
+            Message::assistant().with_tool_request(
+                "compaction-routing",
+                Ok(CallToolRequestParams::new(
+                    ponduin::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME,
+                )
+                .with_arguments(serde_json::Map::new())),
+            )
+        } else if is_compaction {
             Message::assistant().with_text("<mock summary of conversation>")
         } else {
             let response_text = if messages.iter().any(|msg| {
@@ -157,14 +166,18 @@ impl Provider for MockCompactionProvider {
             Message::assistant().with_text(response_text)
         };
 
-        let usage = ProviderUsage::new(
-            "mock-model".to_string(),
-            Usage::new(
-                Some(input_tokens),
-                Some(output_tokens),
-                Some(input_tokens + output_tokens),
-            ),
-        );
+        let usage = if is_routing {
+            ProviderUsage::new("mock-model".to_string(), Usage::default())
+        } else {
+            ProviderUsage::new(
+                "mock-model".to_string(),
+                Usage::new(
+                    Some(input_tokens),
+                    Some(output_tokens),
+                    Some(input_tokens + output_tokens),
+                ),
+            )
+        };
 
         Ok(stream_from_single_message(message, usage))
     }
