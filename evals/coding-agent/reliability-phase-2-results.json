@@ -87,6 +87,11 @@
   "verification": {
     "format": "source bin/activate-hermit && cargo fmt --all -- --check",
     "lint": "source bin/activate-hermit && cargo clippy -p ponduin --lib -- -D warnings",
+    "workspace_tests": {
+      "command": "source bin/activate-hermit && cargo test --workspace --all-targets",
+      "result": "blocked_before_test_execution",
+      "blocker": "The existing tracked example file crates/ponduin-sdk/examples/acp_client 2.rs has a space in its crate name, which Cargo rejects."
+    },
     "ci": {
       "workflow": "Unused Dependencies",
       "commit": "ea2efc21c2c1dd0b7346e051af547d735d0be287",
@@ -95,7 +100,7 @@
   },
   "release_ready": false,
   "release_blockers": [
-    "The full workspace test target is currently disrupted by existing untracked duplicate files whose names contain spaces.",
+    "The full workspace test target is blocked by the existing tracked example file crates/ponduin-sdk/examples/acp_client 2.rs, whose space in the crate name Cargo rejects.",
     "The local desktop and documentation type checks are still waiting on the synchronized workspace file system.",
     "No controlled live-provider repair evaluation has verified an autonomous repair success."
   ]
