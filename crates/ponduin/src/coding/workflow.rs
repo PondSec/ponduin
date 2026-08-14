@@ -29,6 +29,7 @@ pub struct CodingWorkflow {
     revision: u32,
     changes: Vec<ChangeEvidence>,
     validations: Vec<ValidationEvidence>,
+    repair_episodes: Vec<RepairEpisode>,
     invocation_history: VecDeque<InvocationEvidence>,
     failure_counts: BTreeMap<String, usize>,
     non_improving_failures: usize,
@@ -71,6 +72,7 @@ impl CodingWorkflow {
             revision: 0,
             changes: Vec::new(),
             validations: Vec::new(),
+            repair_episodes: Vec::new(),
             invocation_history: VecDeque::new(),
             failure_counts: BTreeMap::new(),
             non_improving_failures: 0,
@@ -219,10 +221,11 @@ impl CodingWorkflow {
         self.require_phase(&[WorkflowPhase::Debugging])?;
         validate_text("repair hypothesis", &hypothesis, false)?;
         validate_paths(&target_files)?;
-        let diagnostic_fingerprint = self
+        let failure = self
             .current_failed_validation()
-            .map(|validation| validation.diagnostic_fingerprint.clone())
+            .cloned()
             .ok_or(WorkflowError::RepairStrategyWithoutFailure)?;
+        let diagnostic_fingerprint = failure.diagnostic_fingerprint.clone();
         if self.memory.repair_strategies.iter().any(|strategy| {
             strategy.diagnostic_fingerprint == diagnostic_fingerprint
                 && strategy.approach == approach
@@ -231,13 +234,38 @@ impl CodingWorkflow {
         }
         self.memory.repair_strategies.push(RepairStrategyEvidence {
             revision: self.revision,
-            diagnostic_fingerprint,
+            diagnostic_fingerprint: diagnostic_fingerprint.clone(),
             approach,
             hypothesis_fingerprint: content_digest(hypothesis.as_bytes()),
-            target_files,
+            target_files: target_files.clone(),
         });
         if self.memory.repair_strategies.len() > MAX_EVIDENCE_RECORDS {
             self.memory.repair_strategies.remove(0);
+        }
+        for episode in &mut self.repair_episodes {
+            if episode.diagnostic.fingerprint == diagnostic_fingerprint
+                && episode.outcome == RepairOutcome::Planned
+            {
+                episode.outcome = RepairOutcome::Superseded;
+            }
+        }
+        self.repair_episodes.push(RepairEpisode {
+            id: RepairEpisodeId::new(),
+            workflow_id: self.id.clone(),
+            diagnostic: DiagnosticEvidence::from_validation(&failure),
+            hypothesis: RepairHypothesis {
+                fingerprint: content_digest(hypothesis.as_bytes()),
+            },
+            approach,
+            target_files,
+            expected_validation: ValidationBinding::expected(&failure),
+            mutations: Vec::new(),
+            validations: Vec::new(),
+            progress: RepairProgress::Unknown,
+            outcome: RepairOutcome::Planned,
+        });
+        if self.repair_episodes.len() > MAX_EVIDENCE_RECORDS {
+            self.repair_episodes.remove(0);
         }
         Ok(())
     }
@@ -290,13 +318,35 @@ impl CodingWorkflow {
             + 1;
         self.iterations += 1;
         self.revision += 1;
+        let file_digests = preview
+            .files
+            .iter()
+            .map(MutationFileEvidence::from_preview)
+            .collect::<Vec<_>>();
         self.changes.push(ChangeEvidence {
-            change_id,
+            change_id: change_id.clone(),
             revision: self.revision,
             files: preview.files.iter().map(|file| file.path.clone()).collect(),
-            diff_fingerprint,
+            diff_fingerprint: diff_fingerprint.clone(),
             rolled_back: false,
+            invalidated_at: None,
+            file_digests: file_digests.clone(),
         });
+        if self.repair_pending {
+            let episode = self
+                .repair_episodes
+                .iter_mut()
+                .rev()
+                .find(|episode| episode.outcome == RepairOutcome::InProgress)
+                .ok_or(WorkflowError::RepairMutationWithoutEpisode)?;
+            episode.mutations.push(MutationEvidence {
+                change_id,
+                revision: self.revision,
+                diff_fingerprint,
+                files: file_digests,
+                rolled_back: false,
+            });
+        }
         self.last_error_count = None;
         self.non_improving_failures = 0;
         self.repair_pending = false;
@@ -316,6 +366,17 @@ impl CodingWorkflow {
             .ok_or_else(|| WorkflowError::UnknownChange(change_id.to_string()))?;
         change.rolled_back = true;
         self.revision += 1;
+        change.invalidated_at = Some(self.revision);
+        for episode in &mut self.repair_episodes {
+            for mutation in &mut episode.mutations {
+                if mutation.change_id == change_id {
+                    mutation.rolled_back = true;
+                    if episode.outcome == RepairOutcome::InProgress {
+                        episode.outcome = RepairOutcome::Inconclusive;
+                    }
+                }
+            }
+        }
         if !self.is_terminal() {
             self.phase = WorkflowPhase::Editing;
         }
@@ -371,13 +432,14 @@ impl CodingWorkflow {
         }
 
         let planned_check_ids = self.matching_check_ids(program, args, &output.cwd);
-        let validation = ValidationEvidence::from_process(
+        let mut validation = ValidationEvidence::from_process(
             self.revision,
             program,
             args,
             output,
             planned_check_ids,
         );
+        self.bind_validation_scope(&mut validation);
         self.accept_validation(validation)
     }
 
@@ -394,11 +456,10 @@ impl CodingWorkflow {
         let planned_check_ids = execution.command.as_ref().map_or_else(Vec::new, |command| {
             self.matching_check_ids(&command.program, &command.args, &command.cwd)
         });
-        self.accept_validation(ValidationEvidence::from_execution(
-            self.revision,
-            execution,
-            planned_check_ids,
-        ))
+        let mut validation =
+            ValidationEvidence::from_execution(self.revision, execution, planned_check_ids);
+        self.bind_validation_scope(&mut validation);
+        self.accept_validation(validation)
     }
 
     pub fn record_review(&mut self, review: &ReviewReport) -> Result<(), WorkflowError> {
@@ -431,6 +492,7 @@ impl CodingWorkflow {
     }
 
     fn accept_validation(&mut self, validation: ValidationEvidence) -> Result<(), WorkflowError> {
+        self.bind_repair_validation(&validation);
         let outcome = validation.outcome;
         let failed = outcome.requires_repair();
         let diagnostic_fingerprint = validation.diagnostic_fingerprint.clone();
@@ -500,19 +562,21 @@ impl CodingWorkflow {
             .current_failed_validation()
             .map(|validation| validation.diagnostic_fingerprint.clone())
             .ok_or(WorkflowError::RepairStrategyWithoutFailure)?;
-        let repetitions = self
-            .failure_counts
-            .get(&diagnostic_fingerprint)
-            .copied()
-            .unwrap_or_default();
-        if repetitions >= 2
-            && !self.memory.repair_strategies.iter().any(|strategy| {
-                strategy.revision == self.revision
-                    && strategy.diagnostic_fingerprint == diagnostic_fingerprint
-            })
-        {
+        if !self.memory.repair_strategies.iter().any(|strategy| {
+            strategy.revision == self.revision
+                && strategy.diagnostic_fingerprint == diagnostic_fingerprint
+        }) {
             return Err(WorkflowError::RepairStrategyRequired);
         }
+        let episode = self
+            .repair_episodes
+            .iter_mut()
+            .rev()
+            .find(|episode| {
+                episode.diagnostic.fingerprint == diagnostic_fingerprint
+                    && episode.outcome == RepairOutcome::Planned
+            })
+            .ok_or(WorkflowError::RepairStrategyRequired)?;
         if self.repair_attempts >= self.limits.max_repair_attempts {
             self.block(WorkflowStopReason::RepairLimit {
                 limit: self.limits.max_repair_attempts,
@@ -521,6 +585,7 @@ impl CodingWorkflow {
         }
         self.repair_attempts += 1;
         self.repair_pending = true;
+        episode.outcome = RepairOutcome::InProgress;
         self.phase = WorkflowPhase::Editing;
         Ok(())
     }
@@ -539,11 +604,7 @@ impl CodingWorkflow {
             .unwrap_or_default();
         match self.phase {
             WorkflowPhase::Testing => {
-                let current = self
-                    .validations
-                    .iter()
-                    .filter(|validation| validation.revision == self.revision)
-                    .collect::<Vec<_>>();
+                let current = self.current_validation_evidence();
                 if current.iter().any(|validation| {
                     validation
                         .planned_check_ids
@@ -638,15 +699,15 @@ impl CodingWorkflow {
             changed_files: self.changed_files(),
             validation_count: self.validations.len(),
             stop_reason: self.stop_reason.clone(),
+            repair_episodes: self.repair_episodes.clone(),
             memory: self.memory.clone(),
         }
     }
 
     pub fn report(&self) -> WorkflowReport {
         let current_validations = self
-            .validations
-            .iter()
-            .filter(|validation| validation.revision == self.revision)
+            .current_validation_evidence()
+            .into_iter()
             .cloned()
             .collect::<Vec<_>>();
         let requirements = self
@@ -681,6 +742,7 @@ impl CodingWorkflow {
             requirements,
             review: self.review.clone(),
             stop_reason: self.stop_reason.clone(),
+            repair_episodes: self.repair_episodes.clone(),
             memory: self.memory.clone(),
         }
     }
@@ -707,11 +769,7 @@ impl CodingWorkflow {
             return Vec::new();
         };
         let changed_files = self.changed_files().into_iter().collect::<BTreeSet<_>>();
-        let current_validations = self
-            .validations
-            .iter()
-            .filter(|validation| validation.revision == self.revision)
-            .collect::<Vec<_>>();
+        let current_validations = self.current_validation_evidence();
         plan.requirements
             .iter()
             .map(|requirement| {
@@ -781,6 +839,134 @@ impl CodingWorkflow {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn bind_validation_scope(&self, validation: &mut ValidationEvidence) {
+        let mut covered_files = self
+            .plan
+            .as_ref()
+            .into_iter()
+            .flat_map(|plan| plan.requirements.iter())
+            .filter(|requirement| {
+                requirement.verification.check_ids.iter().any(|check_id| {
+                    validation
+                        .planned_check_ids
+                        .iter()
+                        .any(|planned_id| planned_id == check_id)
+                })
+            })
+            .flat_map(|requirement| requirement.verification.expected_files.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if covered_files.is_empty() {
+            covered_files.extend(self.changed_files());
+        }
+        validation.covered_files = covered_files.into_iter().collect();
+        validation.observed_change_ids = self
+            .changes
+            .iter()
+            .filter(|change| !change.rolled_back)
+            .map(|change| change.change_id.clone())
+            .collect();
+        validation.revision_fingerprint = self.active_revision_fingerprint();
+    }
+
+    fn bind_repair_validation(&mut self, validation: &ValidationEvidence) {
+        let Some(episode) = self.repair_episodes.iter_mut().rev().find(|episode| {
+            episode
+                .mutations
+                .iter()
+                .any(|mutation| mutation.revision == validation.revision && !mutation.rolled_back)
+        }) else {
+            return;
+        };
+        let binding = ValidationBinding::from_validation(validation);
+        let matches_expected = episode.expected_validation.matches(validation);
+        episode.validations.push(binding);
+        if episode.validations.len() > MAX_EVIDENCE_RECORDS {
+            episode.validations.remove(0);
+        }
+        if !matches_expected {
+            episode.progress = RepairProgress::Unknown;
+            episode.outcome = RepairOutcome::Inconclusive;
+            return;
+        }
+        let diagnostic_changed =
+            validation.diagnostic_fingerprint != episode.diagnostic.fingerprint;
+        match validation.outcome {
+            ValidationOutcome::Passed => {
+                episode.progress = RepairProgress::Meaningful;
+                episode.outcome = RepairOutcome::Verified;
+            }
+            ValidationOutcome::Failed
+                if validation.error_count < episode.diagnostic.error_count =>
+            {
+                episode.progress = RepairProgress::Partial;
+                episode.outcome = RepairOutcome::Improved;
+            }
+            ValidationOutcome::Failed
+                if validation.error_count > episode.diagnostic.error_count
+                    || (diagnostic_changed
+                        && validation.error_count >= episode.diagnostic.error_count) =>
+            {
+                episode.progress = RepairProgress::Regression;
+                episode.outcome = RepairOutcome::Failed;
+            }
+            ValidationOutcome::Failed => {
+                episode.progress = RepairProgress::None;
+                episode.outcome = RepairOutcome::Failed;
+            }
+            _ => {
+                episode.progress = RepairProgress::Unknown;
+                episode.outcome = RepairOutcome::Inconclusive;
+            }
+        }
+    }
+
+    fn current_validation_evidence(&self) -> Vec<&ValidationEvidence> {
+        self.validations
+            .iter()
+            .filter(|validation| self.evidence_is_current(validation))
+            .collect()
+    }
+
+    fn evidence_is_current(&self, validation: &ValidationEvidence) -> bool {
+        if validation.revision > self.revision {
+            return false;
+        }
+        if validation.revision == self.revision {
+            return true;
+        }
+        if validation.revision_fingerprint.is_empty() {
+            return false;
+        }
+        self.changes.iter().all(|change| {
+            let changed_after_validation = change.revision > validation.revision
+                || change
+                    .invalidated_at
+                    .is_some_and(|revision| revision > validation.revision);
+            !changed_after_validation
+                || !change
+                    .files
+                    .iter()
+                    .any(|path| validation.covered_files.contains(path))
+        })
+    }
+
+    fn active_revision_fingerprint(&self) -> String {
+        let mut bytes = Vec::new();
+        for change in self.changes.iter().filter(|change| !change.rolled_back) {
+            bytes.extend_from_slice(change.change_id.as_bytes());
+            bytes.push(0);
+            for file in &change.file_digests {
+                bytes.extend_from_slice(file.path.to_string_lossy().as_bytes());
+                bytes.push(0);
+                if let Some(digest) = &file.new_digest {
+                    bytes.extend_from_slice(digest.as_bytes());
+                }
+                bytes.push(0);
+            }
+        }
+        content_digest(&bytes)
     }
 
     fn current_failed_validation(&self) -> Option<&ValidationEvidence> {
@@ -1125,6 +1311,8 @@ pub struct WorkflowStatus {
     pub validation_count: usize,
     pub stop_reason: Option<WorkflowStopReason>,
     #[serde(default)]
+    pub repair_episodes: Vec<RepairEpisode>,
+    #[serde(default)]
     pub memory: WorkflowMemory,
 }
 
@@ -1144,6 +1332,8 @@ pub struct WorkflowReport {
     pub requirements: Vec<RequirementEvidence>,
     pub review: Option<ReviewEvidence>,
     pub stop_reason: Option<WorkflowStopReason>,
+    #[serde(default)]
+    pub repair_episodes: Vec<RepairEpisode>,
     #[serde(default)]
     pub memory: WorkflowMemory,
 }
@@ -1205,6 +1395,161 @@ pub struct RepairStrategyEvidence {
     pub approach: RepairApproach,
     pub hypothesis_fingerprint: String,
     pub target_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RepairEpisodeId(String);
+
+impl RepairEpisodeId {
+    fn new() -> Self {
+        Self(format!("repair_{}", Uuid::now_v7()))
+    }
+}
+
+impl<'de> Deserialize<'de> for RepairEpisodeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let Some(uuid) = value.strip_prefix("repair_") else {
+            return Err(D::Error::custom(
+                "repair episode IDs must start with `repair_`",
+            ));
+        };
+        Uuid::parse_str(uuid)
+            .map_err(|_| D::Error::custom("repair episode IDs must contain a valid UUID"))?;
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairEpisode {
+    pub id: RepairEpisodeId,
+    pub workflow_id: WorkflowId,
+    pub diagnostic: DiagnosticEvidence,
+    pub hypothesis: RepairHypothesis,
+    pub approach: RepairApproach,
+    pub target_files: Vec<PathBuf>,
+    pub expected_validation: ValidationBinding,
+    pub mutations: Vec<MutationEvidence>,
+    pub validations: Vec<ValidationBinding>,
+    pub progress: RepairProgress,
+    pub outcome: RepairOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticEvidence {
+    pub revision: u32,
+    pub fingerprint: String,
+    pub error_count: usize,
+    pub validation_fingerprint: String,
+}
+
+impl DiagnosticEvidence {
+    fn from_validation(validation: &ValidationEvidence) -> Self {
+        Self {
+            revision: validation.revision,
+            fingerprint: validation.diagnostic_fingerprint.clone(),
+            error_count: validation.error_count,
+            validation_fingerprint: validation.command_fingerprint(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairHypothesis {
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationEvidence {
+    pub change_id: String,
+    pub revision: u32,
+    pub diff_fingerprint: String,
+    pub files: Vec<MutationFileEvidence>,
+    pub rolled_back: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationFileEvidence {
+    pub path: PathBuf,
+    pub original_digest: Option<String>,
+    pub new_digest: Option<String>,
+}
+
+impl MutationFileEvidence {
+    fn from_preview(file: &crate::coding::patch::FileMutationPreview) -> Self {
+        Self {
+            path: file.path.clone(),
+            original_digest: file.original_digest.clone(),
+            new_digest: file.new_digest.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationBinding {
+    pub revision: u32,
+    pub command_fingerprint: String,
+    pub planned_check_ids: Vec<String>,
+    pub diagnostic_fingerprint: String,
+    pub outcome: ValidationOutcome,
+    pub error_count: usize,
+    pub covered_files: Vec<PathBuf>,
+    pub revision_fingerprint: String,
+}
+
+impl ValidationBinding {
+    fn expected(validation: &ValidationEvidence) -> Self {
+        Self {
+            revision: validation.revision,
+            command_fingerprint: validation.command_fingerprint(),
+            planned_check_ids: validation.planned_check_ids.clone(),
+            diagnostic_fingerprint: validation.diagnostic_fingerprint.clone(),
+            outcome: validation.outcome,
+            error_count: validation.error_count,
+            covered_files: validation.covered_files.clone(),
+            revision_fingerprint: validation.revision_fingerprint.clone(),
+        }
+    }
+
+    fn from_validation(validation: &ValidationEvidence) -> Self {
+        Self::expected(validation)
+    }
+
+    fn matches(&self, validation: &ValidationEvidence) -> bool {
+        self.command_fingerprint == validation.command_fingerprint()
+            || self.planned_check_ids.iter().any(|check_id| {
+                validation
+                    .planned_check_ids
+                    .iter()
+                    .any(|validation_id| validation_id == check_id)
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairProgress {
+    Meaningful,
+    Partial,
+    None,
+    Regression,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairOutcome {
+    Planned,
+    InProgress,
+    Verified,
+    Improved,
+    Failed,
+    Inconclusive,
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1304,6 +1649,10 @@ pub struct ChangeEvidence {
     pub files: Vec<PathBuf>,
     pub diff_fingerprint: String,
     pub rolled_back: bool,
+    #[serde(default)]
+    pub invalidated_at: Option<u32>,
+    #[serde(default)]
+    pub file_digests: Vec<MutationFileEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1321,6 +1670,12 @@ pub struct ValidationEvidence {
     pub diagnostic_fingerprint: String,
     #[serde(default)]
     pub planned_check_ids: Vec<String>,
+    #[serde(default)]
+    pub observed_change_ids: Vec<String>,
+    #[serde(default)]
+    pub covered_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub revision_fingerprint: String,
 }
 
 impl ValidationEvidence {
@@ -1368,6 +1723,9 @@ impl ValidationEvidence {
             error_count,
             diagnostic_fingerprint,
             planned_check_ids,
+            observed_change_ids: Vec::new(),
+            covered_files: Vec::new(),
+            revision_fingerprint: String::new(),
         }
     }
 
@@ -1419,7 +1777,26 @@ impl ValidationEvidence {
             error_count: 0,
             diagnostic_fingerprint: content_digest(diagnostics.as_bytes()),
             planned_check_ids,
+            observed_change_ids: Vec::new(),
+            covered_files: Vec::new(),
+            revision_fingerprint: String::new(),
         }
+    }
+
+    fn command_fingerprint(&self) -> String {
+        let mut bytes = Vec::new();
+        if let Some(program) = &self.program {
+            bytes.extend_from_slice(program.as_bytes());
+        }
+        bytes.push(0);
+        if let Some(cwd) = &self.cwd {
+            bytes.extend_from_slice(cwd.to_string_lossy().as_bytes());
+        }
+        bytes.push(0);
+        if let Some(arguments) = &self.argument_fingerprint {
+            bytes.extend_from_slice(arguments.as_bytes());
+        }
+        content_digest(&bytes)
     }
 }
 
@@ -1724,6 +2101,8 @@ pub enum WorkflowError {
     RepairStrategyRequired,
     #[error("repair strategy `{0:?}` was already used for the current diagnostic")]
     RepeatedRepairStrategy(RepairApproach),
+    #[error("a repair mutation requires an active repair episode")]
+    RepairMutationWithoutEpisode,
     #[error("unknown or already rolled back workflow change: {0}")]
     UnknownChange(String),
     #[error("could not encode workflow evidence: {0}")]
@@ -2005,6 +2384,15 @@ mod tests {
                     &output(false, "error 123: same failure"),
                 )
                 .unwrap();
+            if revision == 0 {
+                workflow
+                    .set_repair_strategy(
+                        RepairApproach::LocalLogic,
+                        "inspect the failing local logic".to_string(),
+                        vec![PathBuf::from("src/lib.rs")],
+                    )
+                    .unwrap();
+            }
             if revision == 1 {
                 assert!(matches!(
                     workflow.begin_repair(),
@@ -2039,7 +2427,7 @@ mod tests {
             Some(WorkflowStopReason::RepeatedFailure { repetitions: 3 })
         ));
         assert_eq!(
-            workflow.status().memory.repair_strategies[0].approach,
+            workflow.status().memory.repair_strategies[1].approach,
             RepairApproach::DependencyBoundary
         );
     }
@@ -2054,6 +2442,13 @@ mod tests {
         workflow.begin_validation().unwrap();
         workflow
             .record_process("cargo", &["test".to_string()], &output(false, "error"))
+            .unwrap();
+        workflow
+            .set_repair_strategy(
+                RepairApproach::LocalLogic,
+                "correct the failing branch".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
             .unwrap();
         workflow.begin_repair().unwrap();
 
@@ -2080,6 +2475,13 @@ mod tests {
             .unwrap();
         assert_eq!(workflow.failure_counts.len(), 1);
 
+        workflow
+            .set_repair_strategy(
+                RepairApproach::LocalLogic,
+                "correct the failing branch".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
         workflow.begin_repair().unwrap();
         workflow.authorize_change().unwrap();
         workflow
@@ -2091,6 +2493,74 @@ mod tests {
             .unwrap();
 
         assert!(workflow.failure_counts.is_empty());
+    }
+
+    #[test]
+    fn binds_a_repair_episode_to_the_failure_mutation_and_validation() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process(
+                "cargo",
+                &["test".to_string()],
+                &output(false, "error: parser rejects this result"),
+            )
+            .unwrap();
+        workflow
+            .set_repair_strategy(
+                RepairApproach::LocalLogic,
+                "align the returned result with the branch type".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
+        workflow.begin_repair().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("repair".to_string(), &preview("repair"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+
+        let episode = workflow.status().repair_episodes.pop().unwrap();
+        assert_eq!(episode.workflow_id, workflow.id().clone());
+        assert_eq!(episode.mutations.len(), 1);
+        assert_eq!(episode.mutations[0].change_id, "repair");
+        assert_eq!(episode.validations.len(), 1);
+        assert_eq!(episode.progress, RepairProgress::Meaningful);
+        assert_eq!(episode.outcome, RepairOutcome::Verified);
+    }
+
+    #[test]
+    fn overlapping_mutation_invalidates_prior_validation_evidence() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+        assert_eq!(workflow.report().validations.len(), 1);
+
+        workflow.phase = WorkflowPhase::Editing;
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("follow-up".to_string(), &preview("follow-up"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+
+        assert!(workflow.report().validations.is_empty());
+        assert!(matches!(
+            workflow.begin_review(),
+            Err(WorkflowError::ValidationRequired)
+        ));
     }
 
     #[test]
