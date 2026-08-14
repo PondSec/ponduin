@@ -21,9 +21,9 @@ use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
     CodingWorkflow, RepairApproach, RequirementPriority, RequirementSource,
-    RequirementVerification, WorkflowCheck, WorkflowCommand, WorkflowId, WorkflowLimits,
-    WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowRequirement, WorkflowStatus,
-    WorkflowTaskState,
+    RequirementVerification, TaskCapabilityState, WorkflowCheck, WorkflowCommand, WorkflowId,
+    WorkflowLimits, WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowRequirement,
+    WorkflowStatus, WorkflowTaskState,
 };
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use ponduin_providers::thinking::ThinkingEffort;
@@ -201,6 +201,15 @@ impl CodingToolState {
                 "Current-revision validation evidence is acceptable. Call \
                  coding__workflow_transition with begin_review."
                     .to_string()
+            }
+            WorkflowPhase::Testing
+                if status
+                    .memory
+                    .capability_feedback
+                    .last()
+                    .is_some_and(|feedback| feedback.state != TaskCapabilityState::Available) =>
+            {
+                capability_recovery_guidance(status)
             }
             WorkflowPhase::Testing => {
                 "Run an actual check now. Use coding__run_validation only with an exact command \
@@ -1091,6 +1100,40 @@ impl CodingToolState {
             .rev()
             .find(|entry| entry.workspace_root == workspace_root)
             .map(|entry| operation(&mut entry.workflow))
+    }
+}
+
+fn capability_recovery_guidance(status: &WorkflowStatus) -> String {
+    let Some(feedback) = status.memory.capability_feedback.last() else {
+        return String::new();
+    };
+    match feedback.state {
+        TaskCapabilityState::Unavailable => format!(
+            "The last validation capability `{}` is unavailable. Do not retry that exact command; \
+             inspect current project capabilities for a supported alternative or report a clear blocker.",
+            feedback.capability
+        ),
+        TaskCapabilityState::NotExecutable => format!(
+            "The last validation capability `{}` was discovered but cannot execute. Do not claim \
+             validation; select an available narrower check or report the missing runtime.",
+            feedback.capability
+        ),
+        TaskCapabilityState::PolicyBlocked => format!(
+            "The last validation capability `{}` is policy-blocked. Do not attempt a cosmetic \
+             bypass; choose a permitted check or report the policy blocker.",
+            feedback.capability
+        ),
+        TaskCapabilityState::TemporarilyFailed => format!(
+            "The last validation capability `{}` did not produce complete evidence. Refresh the \
+             state and choose a narrower or otherwise distinct validation before retrying.",
+            feedback.capability
+        ),
+        TaskCapabilityState::Unsuitable => format!(
+            "The last validation capability `{}` is unsuitable for this task. Use a distinct \
+             capability or report a blocker instead of repeating it.",
+            feedback.capability
+        ),
+        TaskCapabilityState::Available => String::new(),
     }
 }
 

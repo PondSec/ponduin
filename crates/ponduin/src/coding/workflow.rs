@@ -516,6 +516,7 @@ impl CodingWorkflow {
 
     fn accept_validation(&mut self, validation: ValidationEvidence) -> Result<(), WorkflowError> {
         self.bind_repair_validation(&validation);
+        self.record_capability_feedback(&validation);
         let outcome = validation.outcome;
         let failed = outcome.requires_repair();
         let diagnostic_fingerprint = validation.diagnostic_fingerprint.clone();
@@ -784,6 +785,33 @@ impl CodingWorkflow {
         self.memory.executed_commands.push(command);
         if self.memory.executed_commands.len() > MAX_EVIDENCE_RECORDS {
             self.memory.executed_commands.remove(0);
+        }
+    }
+
+    fn record_capability_feedback(&mut self, validation: &ValidationEvidence) {
+        let state = match validation.outcome {
+            ValidationOutcome::Passed | ValidationOutcome::Failed => TaskCapabilityState::Available,
+            ValidationOutcome::NotPresent | ValidationOutcome::Skipped => {
+                TaskCapabilityState::Unavailable
+            }
+            ValidationOutcome::NotExecutable => TaskCapabilityState::NotExecutable,
+            ValidationOutcome::Blocked => TaskCapabilityState::PolicyBlocked,
+            ValidationOutcome::TimedOut | ValidationOutcome::IncompleteOutput => {
+                TaskCapabilityState::TemporarilyFailed
+            }
+        };
+        self.memory
+            .capability_feedback
+            .push(CapabilityFeedbackEvidence {
+                revision: validation.revision,
+                capability: validation
+                    .program
+                    .clone()
+                    .unwrap_or_else(|| "validation".to_string()),
+                state,
+            });
+        if self.memory.capability_feedback.len() > MAX_EVIDENCE_RECORDS {
+            self.memory.capability_feedback.remove(0);
         }
     }
 
@@ -1400,7 +1428,26 @@ pub struct WorkflowMemory {
     pub known_errors: Vec<KnownErrorEvidence>,
     pub tool_contract_errors: Vec<ToolContractErrorEvidence>,
     pub repair_strategies: Vec<RepairStrategyEvidence>,
+    pub capability_feedback: Vec<CapabilityFeedbackEvidence>,
     pub open_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFeedbackEvidence {
+    pub revision: u32,
+    pub capability: String,
+    pub state: TaskCapabilityState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCapabilityState {
+    Available,
+    Unavailable,
+    NotExecutable,
+    PolicyBlocked,
+    TemporarilyFailed,
+    Unsuitable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2603,6 +2650,34 @@ mod tests {
             )]),
             Err(WorkflowError::StaleMutationEvidence(path)) if path == PathBuf::from("src/lib.rs")
         ));
+    }
+
+    #[test]
+    fn keeps_capability_feedback_local_to_the_workflow() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_validation_execution(&ValidationExecution {
+                command: None,
+                status: ValidationStatus::NotPresent,
+                reason: Some("formatter unavailable".to_string()),
+                output: None,
+            })
+            .unwrap();
+
+        let feedback = &workflow.status().memory.capability_feedback;
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0].capability, "validation");
+        assert_eq!(feedback[0].state, TaskCapabilityState::Unavailable);
+        assert!(planned_workflow()
+            .status()
+            .memory
+            .capability_feedback
+            .is_empty());
     }
 
     #[test]
