@@ -93,6 +93,12 @@
       "command": "source bin/activate-hermit && cargo build --workspace",
       "result": "passed"
     },
+    "release_build": {
+      "command": "source bin/activate-hermit && cargo build --release",
+      "result": "passed",
+      "smoke_command": "target/release/ponduin --version",
+      "version": "1.44.0"
+    },
     "lint": {
       "command": "source bin/activate-hermit && cargo clippy -p ponduin --lib -- -D warnings",
       "result": "passed"
