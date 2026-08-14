@@ -2681,6 +2681,157 @@ mod tests {
     }
 
     #[test]
+    fn classifies_partial_progress_and_regression_from_error_deltas() {
+        struct RepairCase {
+            name: &'static str,
+            repaired_diagnostic: &'static str,
+            progress: RepairProgress,
+            outcome: RepairOutcome,
+        }
+
+        for case in [
+            RepairCase {
+                name: "partial progress",
+                repaired_diagnostic: "error: only one remaining failure",
+                progress: RepairProgress::Partial,
+                outcome: RepairOutcome::Improved,
+            },
+            RepairCase {
+                name: "regression",
+                repaired_diagnostic: "error: new one\nerror: new two\nerror: new three",
+                progress: RepairProgress::Regression,
+                outcome: RepairOutcome::Failed,
+            },
+        ] {
+            let mut workflow = planned_workflow();
+            workflow.authorize_change().unwrap();
+            workflow
+                .record_change("initial".to_string(), &preview("initial"))
+                .unwrap();
+            workflow.begin_validation().unwrap();
+            workflow
+                .record_process(
+                    "cargo",
+                    &["test".to_string()],
+                    &output(false, "error: original one\nerror: original two"),
+                )
+                .unwrap();
+            workflow
+                .set_repair_strategy(
+                    RepairApproach::LocalLogic,
+                    format!("{} correction", case.name),
+                    vec![PathBuf::from("src/lib.rs")],
+                )
+                .unwrap();
+            workflow.begin_repair().unwrap();
+            workflow.authorize_change().unwrap();
+            workflow
+                .record_change("repair".to_string(), &preview(case.name))
+                .unwrap();
+            workflow.begin_validation().unwrap();
+            workflow
+                .record_process(
+                    "cargo",
+                    &["test".to_string()],
+                    &output(false, case.repaired_diagnostic),
+                )
+                .unwrap();
+
+            let episode = workflow.status().repair_episodes.pop().unwrap();
+            assert_eq!(episode.progress, case.progress, "{}", case.name);
+            assert_eq!(episode.outcome, case.outcome, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn requires_an_alternative_strategy_after_a_non_improving_repair() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process(
+                "cargo",
+                &["test".to_string()],
+                &output(false, "error: mismatch"),
+            )
+            .unwrap();
+        workflow
+            .set_repair_strategy(
+                RepairApproach::LocalLogic,
+                "fix the local branch".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
+        workflow.begin_repair().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("first-repair".to_string(), &preview("first-repair"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process(
+                "cargo",
+                &["test".to_string()],
+                &output(false, "error: mismatch"),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            workflow.set_repair_strategy(
+                RepairApproach::LocalLogic,
+                "same repair in different words".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            ),
+            Err(WorkflowError::RepeatedRepairStrategy(
+                RepairApproach::LocalLogic
+            ))
+        ));
+        workflow
+            .set_repair_strategy(
+                RepairApproach::DependencyBoundary,
+                "inspect the boundary that supplies the value".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
+        workflow.begin_repair().unwrap();
+
+        assert!(workflow.status().repair_pending);
+        assert_eq!(workflow.status().repair_episodes.len(), 2);
+    }
+
+    #[test]
+    fn timeout_evidence_remains_inconclusive_and_never_enables_completion() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_validation_execution(&ValidationExecution {
+                command: None,
+                status: ValidationStatus::TimedOut,
+                reason: Some("validation timed out".to_string()),
+                output: None,
+            })
+            .unwrap();
+
+        let status = workflow.status();
+        assert_eq!(status.phase, WorkflowPhase::Testing);
+        assert_eq!(
+            status.memory.capability_feedback[0].state,
+            TaskCapabilityState::TemporarilyFailed
+        );
+        assert!(matches!(
+            workflow.begin_review(),
+            Err(WorkflowError::ValidationRequired)
+        ));
+    }
+
+    #[test]
     fn enforces_iteration_and_validation_gates() {
         let mut workflow = CodingWorkflow::new(
             "bounded".to_string(),
