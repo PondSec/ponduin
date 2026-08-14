@@ -105,6 +105,29 @@ impl CodingWorkflow {
             .any(|change| change.change_id == change_id && !change.rolled_back)
     }
 
+    pub(crate) fn active_mutation_digests(&self) -> Vec<(PathBuf, Option<String>)> {
+        let mut digests = BTreeMap::new();
+        for change in self.changes.iter().filter(|change| !change.rolled_back) {
+            for file in &change.file_digests {
+                digests.insert(file.path.clone(), file.new_digest.clone());
+            }
+        }
+        digests.into_iter().collect()
+    }
+
+    pub(crate) fn verify_active_mutation_digests(
+        &self,
+        observed: &[(PathBuf, Option<String>)],
+    ) -> Result<(), WorkflowError> {
+        let observed = observed.iter().cloned().collect::<BTreeMap<_, _>>();
+        for (path, expected_digest) in self.active_mutation_digests() {
+            if observed.get(&path) != Some(&expected_digest) {
+                return Err(WorkflowError::StaleMutationEvidence(path));
+            }
+        }
+        Ok(())
+    }
+
     pub fn note_repository_activity(&mut self) {
         if self.phase == WorkflowPhase::Analyzing {
             self.phase = WorkflowPhase::Searching;
@@ -2103,6 +2126,8 @@ pub enum WorkflowError {
     RepeatedRepairStrategy(RepairApproach),
     #[error("a repair mutation requires an active repair episode")]
     RepairMutationWithoutEpisode,
+    #[error("recorded mutation evidence is stale for {0}")]
+    StaleMutationEvidence(PathBuf),
     #[error("unknown or already rolled back workflow change: {0}")]
     UnknownChange(String),
     #[error("could not encode workflow evidence: {0}")]
@@ -2560,6 +2585,23 @@ mod tests {
         assert!(matches!(
             workflow.begin_review(),
             Err(WorkflowError::ValidationRequired)
+        ));
+    }
+
+    #[test]
+    fn rejects_completion_evidence_when_a_mutated_file_digest_changed() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("initial".to_string(), &preview("initial"))
+            .unwrap();
+
+        assert!(matches!(
+            workflow.verify_active_mutation_digests(&[(
+                PathBuf::from("src/lib.rs"),
+                Some("blake3:external".to_string())
+            )]),
+            Err(WorkflowError::StaleMutationEvidence(path)) if path == PathBuf::from("src/lib.rs")
         ));
     }
 

@@ -2,7 +2,8 @@ use crate::coding::config::CodingConfig;
 use crate::coding::context::{ContextLimits, ContextPlanner};
 use crate::coding::embedding::hybrid_context_candidates;
 use crate::coding::file::{
-    FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT, MIN_READ_LIMIT,
+    content_digest, FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
+    MIN_READ_LIMIT,
 };
 use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitOwnedPath, GitRepository};
 use crate::coding::intelligence::{IntelligenceLimits, RepositoryIndex, RepositoryIntelligence};
@@ -807,9 +808,50 @@ impl CodingToolState {
         })
     }
 
+    fn ensure_current_mutation_evidence(
+        &self,
+        workspace: &CodingWorkspace,
+        workflow_id: &WorkflowId,
+    ) -> Result<(), ErrorData> {
+        let expected = self
+            .workflows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.workspace_root == workspace.root() && entry.workflow.id() == workflow_id
+            })
+            .map(|entry| entry.workflow.active_mutation_digests())
+            .ok_or_else(|| invalid_arguments("no matching coding workflow exists"))?;
+        let observed = expected
+            .iter()
+            .map(|(path, _)| {
+                let path = workspace
+                    .resolve_for_write(path)
+                    .map_err(|error| invalid_arguments(error.to_string()))?;
+                let digest = match std::fs::read(&path) {
+                    Ok(content) => Some(content_digest(&content)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(invalid_arguments(error.to_string())),
+                };
+                let relative = path
+                    .strip_prefix(workspace.root())
+                    .map(Path::to_path_buf)
+                    .map_err(|_| invalid_arguments("mutation path escaped the workspace"))?;
+                Ok((relative, digest))
+            })
+            .collect::<Result<Vec<_>, ErrorData>>()?;
+        self.with_workflow_mut(workspace.root(), workflow_id, |workflow| {
+            workflow
+                .verify_active_mutation_digests(&observed)
+                .map_err(|error| invalid_arguments(error.to_string()))
+        })
+    }
+
     fn transition_workflow(
         &self,
-        workspace_root: &Path,
+        workspace: &CodingWorkspace,
         workflow_id: &WorkflowId,
         transition: WorkflowTransition,
     ) -> Result<WorkflowStatus, ErrorData> {
@@ -817,7 +859,10 @@ impl CodingToolState {
             .mutation_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
+        if matches!(transition, WorkflowTransition::Review) {
+            self.ensure_current_mutation_evidence(workspace, workflow_id)?;
+        }
+        self.with_workflow_mut(workspace.root(), workflow_id, |workflow| {
             match transition {
                 WorkflowTransition::Editing => workflow.begin_editing(),
                 WorkflowTransition::Validation => workflow.begin_validation(),
@@ -849,7 +894,7 @@ impl CodingToolState {
 
     fn complete_workflow(
         &self,
-        workspace_root: &Path,
+        workspace: &CodingWorkspace,
         workflow_id: &WorkflowId,
         summary: String,
         remaining_risks: Vec<String>,
@@ -858,7 +903,8 @@ impl CodingToolState {
             .mutation_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.with_workflow_mut(workspace_root, workflow_id, |workflow| {
+        self.ensure_current_mutation_evidence(workspace, workflow_id)?;
+        self.with_workflow_mut(workspace.root(), workflow_id, |workflow| {
             workflow
                 .complete(summary, remaining_risks)
                 .map_err(|error| invalid_arguments(error.to_string()))
@@ -2167,11 +2213,8 @@ pub(crate) fn execute_with_state(
         }
         WORKFLOW_TRANSITION_TOOL_NAME => {
             let params: WorkflowTransitionParams = parse_arguments(&tool_call)?;
-            let status = state.transition_workflow(
-                workspace.root(),
-                &params.workflow_id,
-                params.transition,
-            )?;
+            let status =
+                state.transition_workflow(&workspace, &params.workflow_id, params.transition)?;
             json_result(&status, config.output_limit)
         }
         WORKFLOW_STATUS_TOOL_NAME => {
@@ -2182,7 +2225,7 @@ pub(crate) fn execute_with_state(
         WORKFLOW_COMPLETE_TOOL_NAME => {
             let params: WorkflowCompleteParams = parse_arguments(&tool_call)?;
             let report = state.complete_workflow(
-                workspace.root(),
+                &workspace,
                 &params.workflow_id,
                 params.summary,
                 params.remaining_risks,
@@ -4631,6 +4674,39 @@ mod tests {
             fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
             "<h1>America</h1>\n"
         );
+    }
+
+    #[test]
+    fn rejects_review_when_a_retained_mutation_was_changed_externally() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let workflow_id = begin_editing_workflow(&config, &state, temp_dir.path(), &["index.html"]);
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "index.html",
+                "content": "<h1>original</h1>\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("index.html"), "<h1>external</h1>\n").unwrap();
+
+        let error = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_TRANSITION_TOOL_NAME).with_arguments(object!({
+                "workflow_id": workflow_id,
+                "transition": "begin_review"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("mutation evidence is stale"));
     }
 
     #[test]
