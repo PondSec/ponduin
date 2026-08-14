@@ -504,6 +504,9 @@ mod tests {
 
     #[test]
     fn test_token_cache() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_root = temp_dir.path().display().to_string();
+        let _guard = env_lock::lock_env([("PONDUIN_PATH_ROOT", Some(temp_root.as_str()))]);
         let cache = TokenCache::new(
             "https://example.com",
             "test-client",
