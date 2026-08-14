@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-14",
+  "source_revision": "303e2278ac711f24ef5601fa5dfdac4c34a35bd6",
+  "workspace": {
+    "strategy": "clean local clone with independent Git metadata",
+    "path": "/private/tmp/ponduin-phase3",
+    "reason": "The synchronized source checkout could block file access during build and test work."
+  },
+  "phase_2_gates": {
+    "cli_replay": {
+      "result": "passed",
+      "command": "source bin/activate-hermit && PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin-cli scenario_tests::scenarios -- --nocapture",
+      "tests": 3,
+      "repair": "Replay now normalizes transport identifiers and host metadata, accepts a unique semantic fallback only when system guidance and the tool surface are unchanged, and deterministically handles the host-generated coding-routing probe."
+    },
+    "icloud": {
+      "result": "mitigated",
+      "evidence": "Focused Rust tests, a workspace build, and documentation typecheck/tests ran from the local clone rather than the synchronized checkout."
+    },
+    "live_provider_repair": {
+      "result": "not_run",
+      "reason": "No already-configured provider was established for a controlled autonomous repair run without inspecting or exposing credentials."
+    }
+  },
+  "baseline": {
+    "format": {
+      "result": "passed",
+      "command": "source bin/activate-hermit && cargo fmt --all -- --check"
+    },
+    "workspace_build": {
+      "result": "passed",
+      "command": "source bin/activate-hermit && CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo build --workspace"
+    },
+    "changed_package_clippy": {
+      "result": "passed",
+      "command": "source bin/activate-hermit && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo clippy -p ponduin --all-targets -- -D warnings"
+    }
+  },
+  "scenarios": {
+    "runtime_unit_invariants": {
+      "result": "passed",
+      "command": "source bin/activate-hermit && PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin task:: --lib -- --nocapture",
+      "tests": 12,
+      "covers": [
+        "goal graph and dependency gating",
+        "controlled replanning",
+        "evidence-bound completion",
+        "repeat-failure and duration budgets",
+        "progressive disclosure and capability absence",
+        "scoped filesystem policy",
+        "system inspection",
+        "user input",
+        "checkpoint, stale evidence, pause, and resume"
+      ]
+    },
+    "generalist_task_evaluation": {
+      "result": "passed",
+      "command": "cargo test -p ponduin --test task_runtime_evaluation -- --nocapture",
+      "runs": 3,
+      "tests_per_run": 3,
+      "families": [
+        "11-action repository repair with diagnosis, replan, targeted and broad validation, and completion evidence",
+        "scoped filesystem move with verified end state, sensitive-file denial, and workspace-escape denial",
+        "checkpoint/resume, capability discovery, progressive disclosure, and structured user input"
+      ]
+    },
+    "provider_replay": {
+      "result": "passed",
+      "command": "source bin/activate-hermit && PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin providers::testprovider::tests --lib -- --nocapture",
+      "tests": 5
+    },
+    "documentation": {
+      "typecheck": "passed",
+      "script_tests": {
+        "result": "passed",
+        "tests": 9
+      },
+      "production_build": {
+        "result": "stopped_after_no_progress",
+        "detail": "Docusaurus remained at 0% CPU in its optimized-build stage for more than three minutes after generated assets completed."
+      }
+    }
+  },
+  "reliability": {
+    "task_success_rate": 1.0,
+    "pass_power_3": 1.0,
+    "false_success_count": 0,
+    "incorrect_terminal_state": 0,
+    "replan_count": 1,
+    "recovery_success_rate": 1.0,
+    "average_actions_in_long_horizon_scenario": 11,
+    "duplicate_action_blocks": 0
+  },
+  "security": {
+    "policy_violations": 0,
+    "verified_controls": [
+      "completion requires valid runtime evidence",
+      "resume requires resource refresh and invalidates stale evidence",
+      "filesystem writes require explicit policy",
+      "sensitive-file mutations are denied",
+      "workspace traversal is denied",
+      "progressive disclosure does not reveal write or unrelated tools"
+    ]
+  },
+  "release_gate": {
+    "result": "not_ready",
+    "workspace_test_all_targets": "not_run_after_workspace_build_due_host_storage_limit",
+    "workspace_clippy_all_targets": "blocked_after_unrelated_optional runtime build artifacts exhausted the remaining volume capacity",
+    "desktop_checks": "not_run: the local clone has neither installed desktop dependencies nor a lockfile to reproduce them",
+    "documentation_build": "stopped_after_no_progress",
+    "release_build": "not_run: the full gate is incomplete",
+    "ci": "not_run: no commit was pushed",
+    "local_installation": "not_run: no release artifact was produced"
+  },
+  "known_limitations": [
+    "The general task runtime is a tested core foundation; adapter work is still needed to persist and render its generic states through the existing CLI, ACP, and desktop surfaces.",
+    "No live-provider autonomous repair was run without a confirmed preconfigured provider.",
+    "The host volume cannot hold the complete all-target lint/test artifact set alongside the repository dependencies.",
+    "The production documentation build stalled after its generated assets completed."
+  ]
+}

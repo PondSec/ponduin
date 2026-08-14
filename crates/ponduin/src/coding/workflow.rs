@@ -2650,7 +2650,7 @@ mod tests {
                 PathBuf::from("src/lib.rs"),
                 Some("blake3:external".to_string())
             )]),
-            Err(WorkflowError::StaleMutationEvidence(path)) if path == PathBuf::from("src/lib.rs")
+            Err(WorkflowError::StaleMutationEvidence(path)) if path == Path::new("src/lib.rs")
         ));
     }
 
