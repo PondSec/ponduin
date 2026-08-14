@@ -106,7 +106,7 @@
     "workspace_tests": {
       "command": "source bin/activate-hermit && cargo test --workspace --all-targets",
       "result": "blocked_before_test_execution",
-      "blocker": "The existing tracked example file crates/ponduin-sdk/examples/acp_client 2.rs has a space in its crate name, which Cargo rejects."
+      "blocker": "The local untracked duplicate crates/ponduin-sdk/examples/acp_client 2.rs has a space in its crate name, which Cargo discovers as an example and rejects."
     },
     "frontend_checks": {
       "commands": [
@@ -124,7 +124,7 @@
   },
   "release_ready": false,
   "release_blockers": [
-    "The full workspace test target is blocked by the existing tracked example file crates/ponduin-sdk/examples/acp_client 2.rs, whose space in the crate name Cargo rejects.",
+    "The full workspace test target is blocked by the local untracked duplicate crates/ponduin-sdk/examples/acp_client 2.rs, whose space in the crate name Cargo rejects.",
     "The local desktop and documentation type checks are blocked by long-running file reads in the synchronized workspace and produced no result.",
     "No controlled live-provider repair evaluation has verified an autonomous repair success."
   ]
