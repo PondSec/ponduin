@@ -102,6 +102,14 @@
       "result": "blocked_before_test_execution",
       "blocker": "The existing tracked example file crates/ponduin-sdk/examples/acp_client 2.rs has a space in its crate name, which Cargo rejects."
     },
+    "frontend_checks": {
+      "commands": [
+        "cd ui/desktop && pnpm run typecheck && pnpm run lint:check && pnpm run test:run",
+        "cd documentation && pnpm run typecheck && pnpm test"
+      ],
+      "result": "stopped_after_filesystem_wait",
+      "blocker": "Both TypeScript compiler processes remained blocked in file reads in the synchronized workspace for more than ten minutes and were terminated without a result."
+    },
     "ci": {
       "workflow": "Unused Dependencies",
       "commit": "ea2efc21c2c1dd0b7346e051af547d735d0be287",
@@ -111,7 +119,7 @@
   "release_ready": false,
   "release_blockers": [
     "The full workspace test target is blocked by the existing tracked example file crates/ponduin-sdk/examples/acp_client 2.rs, whose space in the crate name Cargo rejects.",
-    "The local desktop and documentation type checks are still waiting on the synchronized workspace file system.",
+    "The local desktop and documentation type checks are blocked by long-running file reads in the synchronized workspace and produced no result.",
     "No controlled live-provider repair evaluation has verified an autonomous repair success."
   ]
 }
