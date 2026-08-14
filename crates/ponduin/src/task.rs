@@ -3,6 +3,8 @@
 //! The runtime records facts produced by tools and hosts. Models may propose a
 //! plan, but cannot mark goals, capabilities, or verification as complete.
 
+pub mod durable;
+
 use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,10 @@ impl TaskId {
     fn new() -> Self {
         Self(format!("task_{}", Uuid::now_v7()))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -34,6 +40,10 @@ pub struct GoalId(String);
 impl GoalId {
     fn new() -> Self {
         Self(format!("goal_{}", Uuid::now_v7()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -169,6 +179,31 @@ pub struct ToolDescriptor {
     pub network: NetworkRequirement,
     pub workspace: WorkspaceRequirement,
     pub retry: RetrySemantics,
+    #[serde(default)]
+    pub execution: ToolExecutionSemantics,
+}
+
+/// Properties that determine whether a tool call can be safely repeated after
+/// an interruption. `ToolDescriptor` keeps policy metadata while this type
+/// describes the execution contract enforced by the durable runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionSemantics {
+    pub idempotent: bool,
+    pub retry_safe: bool,
+    pub recoverable: bool,
+    pub resumable: bool,
+    pub required_scope: Vec<PathBuf>,
+    pub expected_artifacts: Vec<PathBuf>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl ToolDescriptor {
+    pub fn can_retry_after_interruption(&self) -> bool {
+        self.execution.idempotent
+            && self.execution.retry_safe
+            && self.execution.recoverable
+            && !matches!(self.retry, RetrySemantics::Never)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +546,15 @@ fn tool(
         network: properties.network,
         workspace: properties.workspace,
         retry: properties.retry,
+        execution: ToolExecutionSemantics {
+            idempotent: access == AccessMode::Read,
+            retry_safe: !matches!(properties.retry, RetrySemantics::Never),
+            recoverable: access == AccessMode::Read,
+            resumable: access == AccessMode::Read,
+            required_scope: Vec::new(),
+            expected_artifacts: Vec::new(),
+            timeout_ms: None,
+        },
     }
 }
 
@@ -735,6 +779,8 @@ pub struct ActionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskMemory {
     pub original_goal: String,
+    #[serde(default)]
+    pub normalized_constraints: Vec<String>,
     pub assumptions: Vec<String>,
     pub open_questions: Vec<String>,
     pub completed_goals: Vec<GoalId>,
@@ -748,6 +794,7 @@ impl TaskMemory {
     fn new(original_goal: String) -> Self {
         Self {
             original_goal,
+            normalized_constraints: Vec::new(),
             assumptions: Vec::new(),
             open_questions: Vec::new(),
             completed_goals: Vec::new(),
@@ -762,6 +809,7 @@ impl TaskMemory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TaskEventKind {
+    TaskCreated,
     TaskStarted,
     GoalAdded {
         goal: GoalId,
@@ -773,11 +821,42 @@ pub enum TaskEventKind {
         goal: GoalId,
         outcome: ActionOutcome,
     },
+    BudgetConsumed {
+        goal: GoalId,
+        actions: u32,
+        total_process_time_ms: u64,
+    },
+    ToolRequested {
+        tool_call: String,
+        goal: GoalId,
+        tool: String,
+    },
+    ToolStarted {
+        tool_call: String,
+        goal: GoalId,
+        tool: String,
+        attempt: u32,
+    },
+    ToolSucceeded {
+        tool_call: String,
+        goal: GoalId,
+        tool: String,
+    },
+    ToolFailed {
+        tool_call: String,
+        goal: GoalId,
+        tool: String,
+        reason: String,
+    },
     EvidenceAdded {
         goal: GoalId,
         evidence: String,
     },
     EvidenceInvalidated {
+        resource: PathBuf,
+    },
+    ArtifactChanged {
+        tool_call: String,
         resource: PathBuf,
     },
     Replanned {
@@ -790,8 +869,30 @@ pub enum TaskEventKind {
     },
     TaskPaused,
     TaskResumed,
+    CheckpointCreated {
+        label: String,
+    },
+    RecoveryStarted {
+        tool_call: String,
+    },
+    RecoverySucceeded {
+        tool_call: String,
+        action: String,
+    },
+    RecoveryFailed {
+        tool_call: String,
+        reason: String,
+    },
+    ReviewStarted,
     WaitingForUserInput {
         goal: GoalId,
+    },
+    UserInputProvided {
+        goal: GoalId,
+    },
+    UserSteering {
+        summary: String,
+        affected_goals: Vec<GoalId>,
     },
     TaskBlocked {
         reason: String,
@@ -887,6 +988,7 @@ impl TaskRuntime {
             next_event_sequence: 0,
             refreshed_since_pause: false,
         };
+        runtime.push_event(TaskEventKind::TaskCreated);
         runtime.push_event(TaskEventKind::TaskStarted);
         Ok(runtime)
     }
@@ -1066,6 +1168,11 @@ impl TaskRuntime {
             goal: goal.clone(),
             outcome: action.outcome,
         });
+        self.push_event(TaskEventKind::BudgetConsumed {
+            goal: goal.clone(),
+            actions: self.actions,
+            total_process_time_ms: self.total_process_time_ms,
+        });
         Ok(())
     }
 
@@ -1149,7 +1256,9 @@ impl TaskRuntime {
             .get(obsolete_goal)
             .cloned()
             .ok_or_else(|| TaskRuntimeError::UnknownGoal(obsolete_goal.clone()))?;
-        if previous.status.is_terminal() {
+        let stale_completed_goal = previous.status == GoalStatus::Completed
+            && previous.evidence.iter().any(|evidence| !evidence.valid);
+        if previous.status.is_terminal() && !stale_completed_goal {
             return Err(TaskRuntimeError::CannotReplanTerminalGoal(
                 obsolete_goal.clone(),
             ));
@@ -1165,6 +1274,9 @@ impl TaskRuntime {
         let previous_goal = self.goal_mut(obsolete_goal)?;
         previous_goal.status = GoalStatus::Obsolete;
         previous_goal.blocked_reason = Some(reason.clone());
+        self.memory
+            .completed_goals
+            .retain(|goal| goal != obsolete_goal);
         self.replans += 1;
         self.revision += 1;
         self.push_event(TaskEventKind::Replanned {
@@ -1226,6 +1338,9 @@ impl TaskRuntime {
         self.status = TaskStatus::Running;
         push_unique_bounded(&mut self.memory.assumptions, answer_summary);
         self.push_event(TaskEventKind::TaskResumed);
+        self.push_event(TaskEventKind::UserInputProvided {
+            goal: request.blocked_goal,
+        });
         Ok(())
     }
 
@@ -1255,15 +1370,20 @@ impl TaskRuntime {
                 let changed = evidence.resources.iter().any(|resource| {
                     observed
                         .get(&resource.resource)
-                        .is_some_and(|fingerprint| fingerprint != &resource.fingerprint)
+                        .is_none_or(|fingerprint| fingerprint != &resource.fingerprint)
                 });
                 if evidence.valid && changed {
-                    changed_resources.extend(evidence.resources.iter().filter_map(|resource| {
-                        observed
-                            .get(&resource.resource)
-                            .filter(|fingerprint| *fingerprint != &resource.fingerprint)
-                            .map(|_| resource.resource.clone())
-                    }));
+                    changed_resources.extend(
+                        evidence
+                            .resources
+                            .iter()
+                            .filter(|resource| {
+                                observed
+                                    .get(&resource.resource)
+                                    .is_none_or(|fingerprint| fingerprint != &resource.fingerprint)
+                            })
+                            .map(|resource| resource.resource.clone()),
+                    );
                     evidence.valid = false;
                     invalidated += 1;
                 }
@@ -1346,6 +1466,160 @@ impl TaskRuntime {
         }
     }
 
+    pub fn record_tool_requested(
+        &mut self,
+        tool_call: impl Into<String>,
+        goal: &GoalId,
+        tool: impl Into<String>,
+    ) -> Result<(), TaskRuntimeError> {
+        self.ensure_active()?;
+        self.ensure_running_goal(goal)?;
+        let tool_call = tool_call.into();
+        let tool = tool.into();
+        validate_text("tool call id", &tool_call)?;
+        validate_text("tool", &tool)?;
+        self.push_event(TaskEventKind::ToolRequested {
+            tool_call,
+            goal: goal.clone(),
+            tool,
+        });
+        Ok(())
+    }
+
+    pub fn record_tool_started(
+        &mut self,
+        tool_call: impl Into<String>,
+        goal: &GoalId,
+        tool: impl Into<String>,
+        attempt: u32,
+    ) -> Result<(), TaskRuntimeError> {
+        self.ensure_active()?;
+        self.ensure_running_goal(goal)?;
+        let tool_call = tool_call.into();
+        let tool = tool.into();
+        validate_text("tool call id", &tool_call)?;
+        validate_text("tool", &tool)?;
+        self.push_event(TaskEventKind::ToolStarted {
+            tool_call,
+            goal: goal.clone(),
+            tool,
+            attempt,
+        });
+        Ok(())
+    }
+
+    pub fn record_tool_succeeded(
+        &mut self,
+        tool_call: impl Into<String>,
+        goal: &GoalId,
+        tool: impl Into<String>,
+    ) -> Result<(), TaskRuntimeError> {
+        self.ensure_active()?;
+        self.ensure_running_goal(goal)?;
+        let tool_call = tool_call.into();
+        let tool = tool.into();
+        validate_text("tool call id", &tool_call)?;
+        validate_text("tool", &tool)?;
+        self.push_event(TaskEventKind::ToolSucceeded {
+            tool_call,
+            goal: goal.clone(),
+            tool,
+        });
+        Ok(())
+    }
+
+    pub fn record_tool_failed(
+        &mut self,
+        tool_call: impl Into<String>,
+        goal: &GoalId,
+        tool: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<(), TaskRuntimeError> {
+        self.ensure_active()?;
+        self.ensure_running_goal(goal)?;
+        let tool_call = tool_call.into();
+        let tool = tool.into();
+        let reason = reason.into();
+        validate_text("tool call id", &tool_call)?;
+        validate_text("tool", &tool)?;
+        validate_text("tool failure reason", &reason)?;
+        self.push_event(TaskEventKind::ToolFailed {
+            tool_call,
+            goal: goal.clone(),
+            tool,
+            reason,
+        });
+        Ok(())
+    }
+
+    pub fn record_artifact_changed(
+        &mut self,
+        tool_call: impl Into<String>,
+        resource: PathBuf,
+    ) -> Result<(), TaskRuntimeError> {
+        self.ensure_active()?;
+        if resource.as_os_str().is_empty() {
+            return Err(TaskRuntimeError::InvalidResource(resource));
+        }
+        let tool_call = tool_call.into();
+        validate_text("tool call id", &tool_call)?;
+        self.push_event(TaskEventKind::ArtifactChanged {
+            tool_call,
+            resource,
+        });
+        Ok(())
+    }
+
+    pub fn record_checkpoint_created(
+        &mut self,
+        label: impl Into<String>,
+    ) -> Result<(), TaskRuntimeError> {
+        let label = label.into();
+        validate_text("checkpoint label", &label)?;
+        self.push_event(TaskEventKind::CheckpointCreated { label });
+        Ok(())
+    }
+
+    pub fn record_review_started(&mut self) {
+        self.push_event(TaskEventKind::ReviewStarted);
+    }
+
+    pub fn record_recovery_started(
+        &mut self,
+        tool_call: impl Into<String>,
+    ) -> Result<(), TaskRuntimeError> {
+        let tool_call = tool_call.into();
+        validate_text("tool call id", &tool_call)?;
+        self.push_event(TaskEventKind::RecoveryStarted { tool_call });
+        Ok(())
+    }
+
+    pub fn record_recovery_succeeded(
+        &mut self,
+        tool_call: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Result<(), TaskRuntimeError> {
+        let tool_call = tool_call.into();
+        let action = action.into();
+        validate_text("tool call id", &tool_call)?;
+        validate_text("recovery action", &action)?;
+        self.push_event(TaskEventKind::RecoverySucceeded { tool_call, action });
+        Ok(())
+    }
+
+    pub fn record_recovery_failed(
+        &mut self,
+        tool_call: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<(), TaskRuntimeError> {
+        let tool_call = tool_call.into();
+        let reason = reason.into();
+        validate_text("tool call id", &tool_call)?;
+        validate_text("recovery failure reason", &reason)?;
+        self.push_event(TaskEventKind::RecoveryFailed { tool_call, reason });
+        Ok(())
+    }
+
     pub fn restore(checkpoint: TaskCheckpoint) -> Result<Self, TaskRuntimeError> {
         if checkpoint.schema_version != 1 {
             return Err(TaskRuntimeError::UnsupportedCheckpoint(
@@ -1412,6 +1686,42 @@ impl TaskRuntime {
         Ok(())
     }
 
+    pub fn apply_user_steering(
+        &mut self,
+        summary: impl Into<String>,
+        affected_goals: &[GoalId],
+    ) -> Result<(), TaskRuntimeError> {
+        self.ensure_active()?;
+        let summary = summary.into();
+        validate_text("user steering summary", &summary)?;
+        for goal in affected_goals {
+            if !self.goals.contains_key(goal) {
+                return Err(TaskRuntimeError::UnknownGoal(goal.clone()));
+            }
+        }
+        push_unique_bounded(&mut self.memory.normalized_constraints, summary.clone());
+        self.push_event(TaskEventKind::UserSteering {
+            summary,
+            affected_goals: affected_goals.to_vec(),
+        });
+        Ok(())
+    }
+
+    pub fn invalidate_goal_evidence_for_steering(
+        &mut self,
+        goal: &GoalId,
+    ) -> Result<(), TaskRuntimeError> {
+        self.ensure_active()?;
+        let goal_state = self.goal_mut(goal)?;
+        for evidence in &mut goal_state.evidence {
+            evidence.valid = false;
+        }
+        self.push_event(TaskEventKind::EvidenceInvalidated {
+            resource: PathBuf::from(format!("user-steering:{}", goal.as_str())),
+        });
+        Ok(())
+    }
+
     fn ensure_active(&self) -> Result<(), TaskRuntimeError> {
         if self.status == TaskStatus::Running {
             Ok(())
@@ -1424,6 +1734,18 @@ impl TaskRuntime {
         self.goals
             .get_mut(goal)
             .ok_or_else(|| TaskRuntimeError::UnknownGoal(goal.clone()))
+    }
+
+    fn ensure_running_goal(&self, goal: &GoalId) -> Result<(), TaskRuntimeError> {
+        let goal_state = self
+            .goals
+            .get(goal)
+            .ok_or_else(|| TaskRuntimeError::UnknownGoal(goal.clone()))?;
+        if goal_state.status == GoalStatus::Running {
+            Ok(())
+        } else {
+            Err(TaskRuntimeError::GoalNotRunning(goal.clone()))
+        }
     }
 
     fn push_event(&mut self, event: TaskEventKind) {

@@ -19,6 +19,7 @@ use crate::commands::info::handle_info;
 use crate::commands::plugin::{handle_plugin_install, handle_plugin_update};
 use crate::commands::project::{handle_project_default, handle_projects_interactive};
 use crate::commands::recipe::{handle_deeplink, handle_list, handle_open, handle_validate};
+use crate::commands::task::{handle_task_command, TaskCommand};
 use crate::commands::term::{
     handle_term_info, handle_term_init, handle_term_log, handle_term_run, Shell,
 };
@@ -973,6 +974,13 @@ enum Command {
         model_opts: ModelOptions,
     },
 
+    /// Create, inspect, and resume durable local tasks
+    #[command(about = "Manage durable local task runtime state")]
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+
     /// Recipe utilities for validation and deeplinking
     #[command(about = "Recipe utilities for validation and deeplinking")]
     Recipe {
@@ -1347,6 +1355,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Project {}) => "project",
         Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
+        Some(Command::Task { .. }) => "task",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Schedule { .. }) => "schedule",
         #[cfg(feature = "update")]
@@ -2306,6 +2315,7 @@ pub async fn cli() -> anyhow::Result<()> {
             )
             .await
         }
+        Some(Command::Task { command }) => handle_task_command(command),
         Some(Command::Gateway { command }) => handle_gateway_command(command).await,
         Some(Command::Schedule { command }) => handle_schedule_command(command).await,
         #[cfg(feature = "update")]

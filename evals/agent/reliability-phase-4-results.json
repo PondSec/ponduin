@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-14",
+  "base_commit": "553b1ea feat: add general task runtime foundation",
+  "branch": "dev",
+  "implementation_status": "partial_surface_integration",
+  "implemented_capabilities": {
+    "durable_state": "implemented and unit-tested: versioned JSON snapshots, v0-to-v1 migration, atomic temporary-file write, file and directory sync, and malformed-state rejection",
+    "execution_journal": "implemented and unit-tested: append-only JSONL journal with stable Runtime event sequences and snapshot-to-journal reconciliation",
+    "tool_execution": "implemented and unit-tested: persisted requested/running/succeeded/failed/unknown-outcome calls, scoped artifact validation, timeout failure, bounded safe retry, and recovery by execution contract",
+    "workspace_refresh": "implemented and end-to-end tested: BLAKE3 digests, deleted-resource detection, selective evidence invalidation, and targeted replanning",
+    "human_steering": "implemented and unit-tested: persisted normalized constraint, explicit affected-goal selection, and controlled replacement planning",
+    "runtime_api": "implemented: TaskStore and DurableTask provide create, load/inspect, list, request/execute tool, resume/recover, cancel, events, input, and steering operations",
+    "cli": "implemented and process-end-to-end tested: task run, list, inspect, resume, input, steer, cancel, and events use TaskStore directly"
+  },
+  "tests": {
+    "format": {
+      "status": "passed",
+      "command": "source bin/activate-hermit && cargo fmt --all -- --check"
+    },
+    "core_clippy": {
+      "status": "passed",
+      "command": "source bin/activate-hermit && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo clippy -p ponduin --lib -- -D warnings"
+    },
+    "durable_runtime_unit_and_evaluations": {
+      "status": "passed",
+      "command": "source bin/activate-hermit && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin task::durable::tests --lib -- --nocapture",
+      "tests": 8,
+      "coverage": [
+        "multi-step coding repair with real file writes, failed validation, replan, repair, verification, completion, journal replay",
+        "restart after confirmed mutation without duplicate execution",
+        "external mutation preserves unrelated evidence and selectively replans",
+        "unsafe interruption after ToolStarted requires persisted user input",
+        "truncated checkpoint rejection",
+        "bounded timeout retry for a read-only tool",
+        "v0 state migration",
+        "persisted user steering"
+      ]
+    },
+    "cli_process_boundary_e2e": {
+      "status": "passed",
+      "command": "source bin/activate-hermit && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin-cli --no-default-features --features rustls-tls --test durable_task_cli_e2e -- --nocapture",
+      "tests": 1,
+      "coverage": [
+        "separate CLI processes create, list, inspect, reload, resume, and read the journal from the same store"
+      ]
+    },
+    "phase_3_runtime_evaluations": {
+      "status": "passed",
+      "command": "source bin/activate-hermit && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin --test task_runtime_evaluation -- --nocapture",
+      "tests": 3,
+      "note": "Focused regression evaluation; it is not a workspace-wide gate."
+    },
+    "phase_2_cli_replays": {
+      "status": "passed",
+      "command": "source bin/activate-hermit && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin-cli --no-default-features --features rustls-tls scenario_tests::scenarios -- --nocapture",
+      "tests": 3,
+      "note": "Focused replay regression gate with the reproducible TLS feature set."
+    },
+    "provider_replay": {
+      "status": "passed",
+      "command": "source bin/activate-hermit && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/ponduin-phase3-target PONDUIN_DISABLE_KEYRING=1 cargo test -p ponduin providers::testprovider::tests --lib -- --nocapture",
+      "tests": 5
+    }
+  },
+  "resume_evaluations": {
+    "normal_resume": "passed: successful mutation persists before runtime drop and remains single-execution after load and resume",
+    "tool_started_crash": "passed: a non-retry-safe mutation becomes unknown_outcome and waiting-for-user-input",
+    "checkpoint_interruption": "passed: a deliberately truncated checkpoint is rejected",
+    "external_mutation": "passed: only evidence tied to the changed resource is invalidated and only its completed goal is replaced"
+  },
+  "failure_injection": {
+    "provider_timeout": "not_tested: provider/session calls do not yet forward into the durable task journal",
+    "provider_error": "not_tested: provider/session calls do not yet forward into the durable task journal",
+    "tool_timeout": "passed: late read-only execution records failure and takes one bounded safe retry",
+    "tool_error": "passed: the coding E2E records a failed validation before replanning",
+    "process_abort_after_tool_started": "passed: non-retry-safe tool requires persisted user input",
+    "process_abort_after_file_write": "passed for the post-success checkpoint boundary; partial snapshot rejection is separately tested",
+    "corrupt_checkpoint": "passed",
+    "external_repository_mutation": "passed",
+    "budget_exhaustion": "passed in the rerun Phase 3 runtime evaluation suite",
+    "missing_capability": "passed in the rerun Phase 3 runtime evaluation suite",
+    "user_interruption": "passed through persisted unknown-outcome user-input state and steering test",
+    "multiple_runtime_instances": "passed through restart and reload scenarios"
+  },
+  "replay": {
+    "status": "passed",
+    "checks": [
+      "contiguous causal event sequence",
+      "tool success has a unique preceding start",
+      "non-retry-safe mutating tool is not started twice",
+      "completed task cannot retain invalid evidence"
+    ]
+  },
+  "surface_integration": {
+    "cli": "implemented and process-end-to-end tested",
+    "acp": "blocked/not integrated: ACP retains its existing session lifecycle and has no TaskId mapping or durable tool-loop forwarding",
+    "desktop": "blocked/not integrated: desktop remains session-oriented; no local desktop dependency installation or lockfile was available for a reproducible boundary test"
+  },
+  "known_limitations": [
+    "The durable runtime has no live provider-to-journal adapter, so provider timeout and provider error failure injection are not tested.",
+    "CLI task lifecycle persistence is real, but the existing provider-backed session agent has not yet been switched to drive DurableTask tool execution for arbitrary user goals.",
+    "ACP and desktop do not yet expose or control durable tasks.",
+    "The local volume reached less than 1 GB free while building focused CLI E2E artifacts; workspace-wide test and clippy gates are not complete.",
+    "The production Docusaurus build previously stalled after generated assets; it was not rerun in this disk-constrained pass."
+  ],
+  "release_gate": {
+    "status": "not_ready",
+    "reason": "ACP, desktop, provider forwarding, and final workspace-wide regression gates remain incomplete."
+  }
+}
