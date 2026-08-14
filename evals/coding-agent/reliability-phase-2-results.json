@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-14",
+  "scope": "Causal repair evidence, current-state validation, and task-local capability feedback",
+  "baseline": {
+    "source": "evals/coding-agent/reliability-phase-1-results.json",
+    "command": "source bin/activate-hermit && cargo test -p ponduin --lib coding::",
+    "result": {
+      "passed": 171,
+      "failed": 0,
+      "ignored": 5
+    }
+  },
+  "after": {
+    "command": "source bin/activate-hermit && cargo test -p ponduin --lib coding::",
+    "result": {
+      "passed": 197,
+      "failed": 0,
+      "ignored": 5
+    },
+    "deterministic_regressions": [
+      {
+        "scenario": "repair episode is causally bound",
+        "test": "coding::workflow::tests::binds_a_repair_episode_to_the_failure_mutation_and_validation",
+        "result": "passed",
+        "assertions": [
+          "The episode retains diagnostic, hypothesis, strategy, mutation, and validation bindings.",
+          "A passed validation marks the episode as verified rather than inferring success from a mutation."
+        ]
+      },
+      {
+        "scenario": "overlapping external state invalidates validation evidence",
+        "test": "coding::workflow::tests::overlapping_mutation_invalidates_prior_validation_evidence",
+        "result": "passed",
+        "assertions": [
+          "Only validation evidence that covers an overlapping changed file becomes stale.",
+          "Evidence for unaffected files remains usable."
+        ]
+      },
+      {
+        "scenario": "retained mutation changed outside the workflow",
+        "test": "coding::tools::tests::rejects_review_when_a_retained_mutation_was_changed_externally",
+        "result": "passed",
+        "assertions": [
+          "Review is blocked when the on-disk digest differs from the retained mutation digest.",
+          "Completion cannot use stale mutation evidence."
+        ]
+      },
+      {
+        "scenario": "repair produces partial progress or a regression",
+        "test": "coding::workflow::tests::classifies_partial_progress_and_regression_from_error_deltas",
+        "result": "passed",
+        "assertions": [
+          "A reduced error count is recorded as partial progress.",
+          "A larger error count is recorded as a regression and does not count as success."
+        ]
+      },
+      {
+        "scenario": "non-improving repair requires a different approach",
+        "test": "coding::workflow::tests::requires_an_alternative_strategy_after_a_non_improving_repair",
+        "result": "passed",
+        "assertions": [
+          "The same approach cannot be retried with only different wording.",
+          "A distinct approach remains available for recovery."
+        ]
+      },
+      {
+        "scenario": "timeout evidence stays inconclusive",
+        "test": "coding::workflow::tests::timeout_evidence_remains_inconclusive_and_never_enables_completion",
+        "result": "passed",
+        "assertions": [
+          "A timeout is not represented as a successful validation.",
+          "The workflow cannot complete from timeout evidence."
+        ]
+      },
+      {
+        "scenario": "unavailable and unsuitable capabilities guide recovery",
+        "test": "coding::workflow::tests::keeps_capability_feedback_local_to_the_workflow; coding::workflow::tests::blocks_repeated_tool_contract_failures_with_retained_evidence",
+        "result": "passed",
+        "assertions": [
+          "Capability feedback is isolated to the active workflow.",
+          "Repeated tool-contract errors mark the tool unsuitable for the task."
+        ]
+      }
+    ]
+  },
+  "verification": {
+    "format": "source bin/activate-hermit && cargo fmt --all -- --check",
+    "lint": "source bin/activate-hermit && cargo clippy -p ponduin --lib -- -D warnings",
+    "ci": {
+      "workflow": "Unused Dependencies",
+      "commit": "ea2efc21c2c1dd0b7346e051af547d735d0be287",
+      "result": "success"
+    }
+  },
+  "release_ready": false,
+  "release_blockers": [
+    "The full workspace test target is currently disrupted by existing untracked duplicate files whose names contain spaces.",
+    "The local desktop and documentation type checks are still waiting on the synchronized workspace file system.",
+    "No controlled live-provider repair evaluation has verified an autonomous repair success."
+  ]
+}
