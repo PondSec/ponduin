@@ -341,9 +341,12 @@ Each validation produces one of:
 - `timed_out`
 - `incomplete_output`
 
-The record contains the command, working directory, exit code, duration,
-bounded stdout and stderr, and reason. Completion reports are generated from
-these records, so an unexecuted check cannot be presented as passed.
+The record contains a command fingerprint, working directory, exit code,
+duration, normalized diagnostic fingerprint, error count, planned check IDs,
+and an evidence scope. Source output is bounded for the current tool response,
+but the workflow retains metadata rather than source or diagnostic bodies.
+Completion reports are generated from these records, so an unexecuted check
+cannot be presented as passed.
 
 ## Coding loop and progress detection
 
@@ -363,10 +366,39 @@ The coding strategy uses the current agent loop:
 Repair attempts are limited by configuration. A progress fingerprint includes
 the normalized error, changed-file digests, diff digest, validation command,
 and tool-call signature. Repeated fingerprints, unchanged diffs, or a growing
-error count stop automatic repair and report the block. Before repairing a
-second occurrence of the same diagnostic, the agent must record a distinct
-repair approach and a fingerprint of its hypothesis; it cannot silently retry
-the same tactic. Hypothesis text is not retained in workflow memory.
+error count stop automatic repair and report the block. Every repair attempt
+requires a recorded approach and a fingerprint of its hypothesis; it cannot
+silently retry the same tactic. Hypothesis text is not retained in workflow
+memory.
+
+## Causal repair evidence
+
+A failed validation can start one `RepairEpisode`. The episode links a stable
+episode ID and workflow ID to the original diagnostic fingerprint and error
+count, a hypothesis fingerprint, repair approach, target files, planned
+validation binding, applied mutation IDs and file digests, and subsequent
+validation bindings. It has an explicit outcome (`verified`, `improved`,
+`failed`, `inconclusive`, or lifecycle states) and a progress classification:
+meaningful progress, partial progress, no progress, regression, or unknown.
+
+A passed validation is verified only when it matches the repair's intended
+validation command or planned check. A smaller error count is partial progress;
+a different diagnostic with an equal or greater error count is a regression,
+not success. The next repair must select a different deterministic approach
+after a non-improving attempt.
+
+Validation evidence records the active mutation IDs, a revision fingerprint,
+and the files it covers. A later mutation invalidates only evidence whose
+declared coverage overlaps that mutation; unrelated scoped evidence remains
+available. Before review and completion, the tool runtime recalculates every
+retained mutation's file digest. An external change causes a stale-evidence
+error and prevents review or completion.
+
+Capability feedback is also task-local. Successful and failed checks establish
+that a command ran, while missing, non-executable, policy-blocked, timed-out,
+and incomplete checks retain distinct feedback. Guidance then selects a
+permitted alternative or reports a blocker instead of repeatedly invoking the
+same unsuitable command. This feedback never becomes global provider state.
 
 ## Configuration
 
@@ -449,6 +481,17 @@ are in the [Internal Coding Agent guide](/docs/guides/internal-coding-agent).
 - Added updater provenance, workflow, CLI, desktop, documentation, and
   full-workspace regression coverage.
 
+### Phase 7: causal repair reliability
+
+- Added repair episodes that bind diagnostic, hypothesis and approach
+  fingerprints to concrete mutations, validation evidence, progress, and
+  outcome.
+- Added scoped validation invalidation and a runtime digest check before review
+  or completion, preventing stale mutation evidence from proving success.
+- Added local capability feedback and deterministic scenarios for alternative
+  repair selection, partial progress, regression, timeout, and external file
+  changes.
+
 ## Test matrix
 
 Core fixtures stay small and deterministic:
@@ -461,6 +504,7 @@ Core fixtures stay small and deterministic:
 | Go service | `go.mod`, packages, tests, build and vet detection |
 | Mixed repository | nested instructions, multiple manifests, generated and ignored paths |
 | Security repository | traversal paths, escaping symlinks, malicious scripts, secrets, Git hooks |
+| Repair reliability | causal failure-to-repair links, stale evidence, partial progress, regression, timeout, and alternative strategy selection |
 
 Tests verify behavior rather than requiring every external tool to be installed.
 Unavailable tools produce a `not_executable` validation result.
@@ -488,6 +532,13 @@ multi-file changes, rollback, traversal and symlink escape, process timeout and
 blocking, Git reads and owned writes, validation discovery and classification,
 capability sizing, iteration limits, loop detection, review findings, factual
 reports, and compatibility behavior.
+
+The workflow reliability tests additionally verify that completion cannot reuse
+validation evidence after an overlapping mutation, an externally altered
+retained file blocks review, a repair cannot begin without its failure evidence
+and approach, equivalent failed approaches are rejected, and timeout or missing
+validation never becomes a success claim. The tests are deterministic and do
+not require a live provider.
 
 The mixed-project acceptance test discovers five ecosystems, applies and rolls
 back a three-file change atomically, runs a real successful Cargo check,
