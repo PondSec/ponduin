@@ -85,8 +85,18 @@
     ]
   },
   "verification": {
-    "format": "source bin/activate-hermit && cargo fmt --all -- --check",
-    "lint": "source bin/activate-hermit && cargo clippy -p ponduin --lib -- -D warnings",
+    "format": {
+      "command": "source bin/activate-hermit && cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    "build": {
+      "command": "source bin/activate-hermit && cargo build --workspace",
+      "result": "passed"
+    },
+    "lint": {
+      "command": "source bin/activate-hermit && cargo clippy -p ponduin --lib -- -D warnings",
+      "result": "passed"
+    },
     "workspace_tests": {
       "command": "source bin/activate-hermit && cargo test --workspace --all-targets",
       "result": "blocked_before_test_execution",
