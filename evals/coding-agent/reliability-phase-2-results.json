@@ -104,9 +104,10 @@
       "result": "passed"
     },
     "workspace_tests": {
-      "command": "source bin/activate-hermit && cargo test --workspace --all-targets",
-      "result": "blocked_before_test_execution",
-      "blocker": "The local untracked duplicate crates/ponduin-sdk/examples/acp_client 2.rs has a space in its crate name, which Cargo discovers as an example and rejects."
+      "command": "source bin/activate-hermit && PONDUIN_DISABLE_KEYRING=1 cargo test --workspace --all-targets",
+      "environment": "isolated Git worktree without local untracked duplicates",
+      "result": "failed_in_cli_scenario_recordings",
+      "blocker": "Two ponduin-cli scenario tests have no recorded response for their current input hash: test_weather_tool and test_what_is_your_name."
     },
     "frontend_checks": {
       "commands": [
@@ -124,7 +125,7 @@
   },
   "release_ready": false,
   "release_blockers": [
-    "The full workspace test target is blocked by the local untracked duplicate crates/ponduin-sdk/examples/acp_client 2.rs, whose space in the crate name Cargo rejects.",
+    "The full isolated workspace test target fails because two ponduin-cli scenario recordings do not match their current input hash.",
     "The local desktop and documentation type checks are blocked by long-running file reads in the synchronized workspace and produced no result.",
     "No controlled live-provider repair evaluation has verified an autonomous repair success."
   ]
