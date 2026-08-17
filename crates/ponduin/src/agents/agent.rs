@@ -2128,10 +2128,11 @@ impl Agent {
             }
         }
 
-        Err(anyhow!(
-            "The selected model did not return exactly one valid semantic coding-routing \
-             decision after {CODING_ROUTER_MAX_ATTEMPTS} bounded attempts."
-        ))
+        warn!(
+            attempts = CODING_ROUTER_MAX_ATTEMPTS,
+            "coding routing was inconclusive; exposing bounded coding tools for the main turn"
+        );
+        Ok(super::reply_parts::CodingToolExposure::Active)
     }
 
     async fn reply_internal(
@@ -4373,6 +4374,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     struct CodingDisclosureProvider {
         route_count: AtomicUsize,
+        always_invalid_routes: bool,
         snapshots: std::sync::Mutex<Vec<CodingDisclosureSnapshot>>,
     }
 
@@ -4421,6 +4423,15 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         fn new() -> Self {
             Self {
                 route_count: AtomicUsize::new(0),
+                always_invalid_routes: false,
+                snapshots: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_invalid_routes() -> Self {
+            Self {
+                route_count: AtomicUsize::new(0),
+                always_invalid_routes: true,
                 snapshots: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -4459,7 +4470,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                     .any(|name| name == crate::coding::tools::CONTINUE_WITHOUT_AGENT_TOOL_NAME);
             let message = if routing_request {
                 let route = self.route_count.fetch_add(1, Ordering::SeqCst);
-                if route == 0 {
+                if self.always_invalid_routes || route == 0 {
                     Message::assistant().with_text("invalid unstructured routing output")
                 } else {
                     let name = if route == 1 {
@@ -4726,6 +4737,49 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .iter()
             .all(|name| !crate::coding::tools::is_reserved_name(name)));
         assert_eq!(inactive.thinking_effort.as_deref(), Some("high"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inconclusive_coding_routing_exposes_bounded_tools_for_the_main_turn() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let provider = Arc::new(CodingDisclosureProvider::with_invalid_routes());
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
+        let (agent, session_id) = create_test_agent_inner(
+            temp_dir.path().join("data"),
+            hook_manager,
+            provider.clone(),
+            false,
+        )
+        .await?;
+
+        let messages =
+            run_stop_hook_test_turn(&agent, &session_id, "Repair the failing project test").await?;
+
+        assert!(messages.iter().all(|message| !message
+            .as_concat_text()
+            .contains("invalid unstructured routing output")));
+
+        let snapshots = provider.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 3);
+        assert!(snapshots[..2].iter().all(|snapshot| {
+            snapshot
+                .tools
+                .iter()
+                .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME)
+        }));
+        let active = &snapshots[2];
+        assert!(active
+            .system_prompt
+            .contains("Internal coding capabilities are active"));
+        assert!(active
+            .tools
+            .iter()
+            .any(|name| name == crate::coding::tools::APPLY_CHANGES_TOOL_NAME));
+        assert!(!active
+            .tools
+            .iter()
+            .any(|name| name == crate::coding::tools::ACTIVATE_AGENT_TOOL_NAME));
         Ok(())
     }
 

@@ -79,6 +79,61 @@ pub fn parse_xml_tool_calls(content: &str) -> (Option<String>, Vec<MessageConten
     (prefix, tool_calls)
 }
 
+/// Parse a JSON tool request emitted as assistant text by local Ollama models.
+///
+/// Some models emit `{ "name": "tool_name", "arguments": { ... } }` in
+/// text instead of using the OpenAI-compatible `tool_calls` response field.
+/// Only an object with both fields and object-valued arguments is accepted.
+pub fn parse_json_tool_calls(content: &str) -> (Option<String>, Vec<MessageContentBlock>) {
+    let Some(start) = content.find('{') else {
+        return (None, Vec::new());
+    };
+
+    let candidate = &content[start..];
+    let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
+    let Some(Ok(value)) = values.next() else {
+        return (None, Vec::new());
+    };
+
+    let Some(name) = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return (None, Vec::new());
+    };
+    let Some(arguments) = value.get("arguments").and_then(Value::as_object) else {
+        return (None, Vec::new());
+    };
+
+    let prefix = content
+        .get(..start)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let id = Uuid::new_v4().to_string();
+    let request = if is_valid_function_name(&name) {
+        MessageContentBlock::tool_request(
+            id,
+            Ok(CallToolRequestParams::new(name).with_arguments(arguments.clone())),
+        )
+    } else {
+        MessageContentBlock::tool_request(
+            id,
+            Err(ErrorData {
+                code: ErrorCode::INVALID_REQUEST,
+                message: Cow::from(format!(
+                    "The provided function name '{}' had invalid characters, it must match this regex [a-zA-Z0-9_-]+",
+                    name
+                )),
+                data: None,
+            }),
+        )
+    };
+
+    (prefix, vec![request])
+}
+
 /// Convert OpenAI's API response to internal Message format, with XML tool call fallback.
 ///
 /// This wraps the standard OpenAI response parsing and adds XML fallback for models
@@ -102,21 +157,23 @@ pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
 
     if let Some(original) = original {
         if let Some(text) = original.get("content").and_then(|c| c.as_str()) {
-            if text.contains("<function=") {
-                let (prefix, xml_tool_calls) = parse_xml_tool_calls(text);
-                if !xml_tool_calls.is_empty() {
-                    let mut content = Vec::new();
-                    if let Some(prefix_text) = prefix {
-                        content.push(MessageContentBlock::text(prefix_text));
-                    }
-                    content.extend(xml_tool_calls);
-
-                    return Ok(Message::new(
-                        Role::Assistant,
-                        chrono::Utc::now().timestamp(),
-                        content,
-                    ));
+            let (prefix, fallback_tool_calls) = if text.contains("<function=") {
+                parse_xml_tool_calls(text)
+            } else {
+                parse_json_tool_calls(text)
+            };
+            if !fallback_tool_calls.is_empty() {
+                let mut content = Vec::new();
+                if let Some(prefix_text) = prefix {
+                    content.push(MessageContentBlock::text(prefix_text));
                 }
+                content.extend(fallback_tool_calls);
+
+                return Ok(Message::new(
+                    Role::Assistant,
+                    chrono::Utc::now().timestamp(),
+                    content,
+                ));
             }
         }
     }
@@ -169,7 +226,7 @@ where
         let mut base_stream = std::pin::pin!(base_stream);
 
         let mut accumulated_text = String::new();
-        let mut xml_detected = false;
+        let mut tool_fallback_detected = false;
         let mut last_usage: Option<ProviderUsage> = None;
 
         while let Some(result) = base_stream.next().await {
@@ -184,11 +241,14 @@ where
                     let text = extract_text_from_message(&message);
                     accumulated_text.push_str(&text);
 
-                    if !xml_detected && accumulated_text.contains("<function=") {
-                        xml_detected = true;
+                    if !tool_fallback_detected
+                        && (accumulated_text.contains("<function=")
+                            || accumulated_text.contains("{\"name\""))
+                    {
+                        tool_fallback_detected = true;
                     }
 
-                    if xml_detected {
+                    if tool_fallback_detected {
                         continue;
                     }
                 }
@@ -199,15 +259,19 @@ where
             }
         }
 
-        if xml_detected && !accumulated_text.is_empty() {
-            let (prefix, xml_tool_calls) = parse_xml_tool_calls(&accumulated_text);
+        if tool_fallback_detected && !accumulated_text.is_empty() {
+            let (prefix, fallback_tool_calls) = if accumulated_text.contains("<function=") {
+                parse_xml_tool_calls(&accumulated_text)
+            } else {
+                parse_json_tool_calls(&accumulated_text)
+            };
 
-            if !xml_tool_calls.is_empty() {
+            if !fallback_tool_calls.is_empty() {
                 let mut contents = Vec::new();
                 if let Some(prefix_text) = prefix {
                     contents.push(MessageContentBlock::text(prefix_text));
                 }
-                contents.extend(xml_tool_calls);
+                contents.extend(fallback_tool_calls);
 
                 let msg = Message::new(
                     Role::Assistant,
@@ -373,6 +437,31 @@ hello
             assert_eq!(tool_call.name, "developer__shell");
         } else {
             panic!("Expected ToolRequest content from XML parsing");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_response_to_message_json_tool_fallback() -> anyhow::Result<()> {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"name\":\"coding__workflow_start\",\"arguments\":{\"objective\":\"repair\"}}"
+                }
+            }]
+        });
+
+        let message = response_to_message(&response)?;
+
+        assert_eq!(message.content.len(), 1);
+        if let MessageContentBlock::ToolRequest(request) = &message.content[0] {
+            let tool_call = request.tool_call.as_ref().unwrap();
+            assert_eq!(tool_call.name, "coding__workflow_start");
+            assert_eq!(tool_call.arguments.as_ref().unwrap()["objective"], "repair");
+        } else {
+            panic!("Expected ToolRequest content from JSON fallback");
         }
 
         Ok(())

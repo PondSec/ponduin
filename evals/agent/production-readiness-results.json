@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-17",
+  "commit": "303e2278a",
+  "scope": "Live desktop coding-agent evaluations with a locally available Ollama model",
+  "measurement_notes": [
+    "A task is successful only if its external verification passes.",
+    "Metrics that were not captured by the desktop trace are null rather than estimated."
+  ],
+  "summary": {
+    "tasks": 3,
+    "successful": 0,
+    "partially_successful": 0,
+    "failed": 3,
+    "success_rate": 0.0,
+    "completion_accuracy": 0.0,
+    "average_tool_calls": null,
+    "recovery_success_rate": null,
+    "repeated_identical_errors": null,
+    "average_runtime_seconds": null,
+    "build_test_success_rate": 0.0
+  },
+  "by_category": {
+    "bug_fix": {
+      "tasks": 1,
+      "successful": 0,
+      "partially_successful": 0,
+      "failed": 1
+    },
+    "failed_test": {
+      "tasks": 1,
+      "successful": 0,
+      "partially_successful": 0,
+      "failed": 1
+    }
+  },
+  "runs": [
+    {
+      "id": "python-normalize-label-router-baseline",
+      "status": "failed",
+      "failure_class": "tool_selection_failure",
+      "failure_subclass": "coding_router_contract_failure",
+      "model": "ollama/qwen2.5-coder:7b",
+      "surface": "Electron desktop GUI",
+      "fixture": "evals/coding-agent/fixtures/python-normalize-label",
+      "task": "Inspect the failing project test, repair the implementation rather than the test, and rerun the test.",
+      "initial_verification": {
+        "command": "python3 -m unittest -v",
+        "result": "failed",
+        "detail": "normalize_label did not normalize case"
+      },
+      "agent_observation": {
+        "tool_calls": 0,
+        "terminal_error": "The selected model did not return exactly one valid semantic coding-routing decision after 2 bounded attempts."
+      },
+      "final_verification": {
+        "command": "python3 -m unittest -v",
+        "result": "failed",
+        "detail": "fixture unchanged because the task stopped before tools were exposed"
+      },
+      "measured_runtime_seconds": null,
+      "patches": [],
+      "next_action": "Repeat after the router-fallback change is built into the desktop backend."
+    },
+    {
+      "id": "python-normalize-label-router-fallback",
+      "status": "failed",
+      "failure_class": "tool_execution_failure",
+      "failure_subclass": "text_form_tool_request_not_transported",
+      "model": "ollama/qwen2.5-coder:7b",
+      "surface": "Electron desktop GUI",
+      "fixture": "evals/coding-agent/fixtures/python-normalize-label",
+      "agent_observation": {
+        "tool_calls": 0,
+        "detail": "After routing succeeded, the model repeatedly rendered coding__workflow_start as assistant JSON text."
+      },
+      "final_verification": {
+        "command": "python3 -m unittest -v",
+        "result": "failed",
+        "detail": "fixture remained unchanged"
+      }
+    },
+    {
+      "id": "python-normalize-label-json-transport",
+      "status": "failed",
+      "failure_class": "loop_failure",
+      "failure_subclass": "repeated_validation_before_diagnosis",
+      "model": "ollama/qwen2.5-coder:7b",
+      "surface": "Electron desktop GUI",
+      "fixture": "evals/coding-agent/fixtures/python-normalize-label",
+      "agent_observation": {
+        "tool_calls": 1,
+        "observed_tools": ["coding__workflow_start"],
+        "detail": "The direct JSON fallback produced a real GUI tool call without PONDUIN_TOOLSHIM. The run was stopped before repair because the fixture had not changed."
+      },
+      "final_verification": {
+        "command": "python3 -m unittest -v",
+        "result": "failed",
+        "detail": "no externally verified repair"
+      }
+    }
+  ]
+}
