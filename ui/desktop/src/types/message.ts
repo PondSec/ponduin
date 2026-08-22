@@ -306,7 +306,7 @@ export function getTextAndImageContent(message: Message): {
   const imagePaths: string[] = [];
 
   for (const content of message.content) {
-    if (content.type === 'text') {
+    if (content.type === 'text' && typeof content.text === 'string') {
       textContent += content.text;
     } else if (content.type === 'image') {
       imagePaths.push(`data:${content.mimeType};base64,${content.data}`);

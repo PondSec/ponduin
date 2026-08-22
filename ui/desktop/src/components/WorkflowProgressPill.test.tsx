@@ -40,7 +40,14 @@ function workflowMessages(): Message[] {
         tool('start', 'workflow_start'),
         result('start'),
         tool('plan', 'workflow_set_plan', {
-          plan_steps: ['Normalize labels to lowercase.', 'Run the library test suite.'],
+          relevant_files: ['lib.rs'],
+          plan_steps: [
+            'Normalize labels to lowercase.',
+            'Run the library test suite.',
+            'Review the changed implementation.',
+          ],
+          validation_program: 'cargo test',
+          args: ['--lib'],
         }),
         result('plan'),
         tool('apply', 'apply_changes', {
@@ -67,7 +74,8 @@ describe('WorkflowProgressPill', () => {
       />
     );
 
-    const trigger = screen.getByRole('button', { name: 'Workflow, Schritt 5 von 5' });
+    const trigger = screen.getByRole('button', { name: 'Workflow: Review, Schritt 5 von 5' });
+    expect(trigger).toHaveTextContent('Review');
     expect(trigger).toHaveTextContent('Schritt 5/5');
     expect(trigger).toHaveTextContent('1 Datei geändert');
     expect(trigger).toHaveTextContent('+1');
@@ -76,9 +84,15 @@ describe('WorkflowProgressPill', () => {
     await user.hover(trigger);
 
     const tooltip = within(await screen.findByRole('tooltip'));
+    expect(tooltip.getByText('Workflow-Phasen')).toBeInTheDocument();
+    expect(tooltip.getByText(/1\. Analyse/)).toBeInTheDocument();
+    expect(tooltip.getByText(/5\. Review/)).toBeInTheDocument();
     expect(tooltip.getByText('Konkreter Plan')).toBeInTheDocument();
     expect(tooltip.getByText(/Normalize labels to lowercase\./)).toBeInTheDocument();
     expect(tooltip.getByText(/Run the library test suite\./)).toBeInTheDocument();
+    expect(tooltip.getByText('lib.rs')).toBeInTheDocument();
+    expect(tooltip.getByText('Validierung')).toBeInTheDocument();
+    expect(tooltip.getByText('cargo test --lib')).toBeInTheDocument();
     expect(tooltip.getByText('Running final checks')).toBeInTheDocument();
   });
 

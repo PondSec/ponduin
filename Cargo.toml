@@ -9,7 +9,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "1.44.0"
+version = "1.44.3"
 rust-version = "1.94.1"
 authors = ["PondSec"]
 license-file = "LICENSE"

@@ -40,6 +40,9 @@ impl<'workspace> GitRepository<'workspace> {
                 PathBuf::from("."),
             )
             .await?;
+        if output.exit_code != Some(0) {
+            return Err(GitError::NotRepository);
+        }
         require_success(&output, "discover repository root")?;
         let reported_root = PathBuf::from(output.stdout.trim());
         let root = workspace.resolve_existing(&reported_root)?;
@@ -1322,6 +1325,8 @@ pub enum GitError {
     RepositoryRootNotDirectory(PathBuf),
     #[error("git repository root is outside the coding workspace: {0}")]
     RepositoryOutsideWorkspace(PathBuf),
+    #[error("the coding workspace is not a Git repository")]
+    NotRepository,
     #[error("git {0} timed out")]
     TimedOut(&'static str),
     #[error("could not {operation}; exit code {exit_code:?}: {stderr}")]

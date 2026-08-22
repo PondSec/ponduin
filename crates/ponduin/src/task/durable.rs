@@ -1660,7 +1660,7 @@ mod tests {
         let replacements = task
             .steer(
                 "do not deploy to production without an explicit approval",
-                &[affected.clone()],
+                std::slice::from_ref(&affected),
             )
             .unwrap();
         assert_eq!(replacements.len(), 1);

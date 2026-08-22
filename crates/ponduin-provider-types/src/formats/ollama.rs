@@ -21,6 +21,7 @@ use regex::Regex;
 use rmcp::model::{object, CallToolRequestParams, ErrorCode, ErrorData, Role};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 pub use crate::formats::openai::{
@@ -85,53 +86,89 @@ pub fn parse_xml_tool_calls(content: &str) -> (Option<String>, Vec<MessageConten
 /// text instead of using the OpenAI-compatible `tool_calls` response field.
 /// Only an object with both fields and object-valued arguments is accepted.
 pub fn parse_json_tool_calls(content: &str) -> (Option<String>, Vec<MessageContentBlock>) {
-    let Some(start) = content.find('{') else {
-        return (None, Vec::new());
-    };
+    for (start, _) in content.match_indices('{') {
+        let Some(candidate) = content.get(start..) else {
+            continue;
+        };
+        let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
+        let Some(Ok(value)) = values.next() else {
+            continue;
+        };
 
-    let candidate = &content[start..];
-    let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
-    let Some(Ok(value)) = values.next() else {
-        return (None, Vec::new());
-    };
+        let Some(name) = value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(arguments) = value.get("arguments") else {
+            continue;
+        };
+        let arguments = if let Some(arguments) = arguments.as_object() {
+            arguments.clone()
+        } else if arguments.as_array().is_some_and(Vec::is_empty) {
+            serde_json::Map::new()
+        } else {
+            continue;
+        };
 
-    let Some(name) = value
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return (None, Vec::new());
-    };
-    let Some(arguments) = value.get("arguments").and_then(Value::as_object) else {
-        return (None, Vec::new());
-    };
+        let prefix = content
+            .get(..start)
+            .map(|prefix| {
+                let prefix = prefix.trim_end();
+                prefix
+                    .strip_suffix("```json")
+                    .or_else(|| prefix.strip_suffix("```"))
+                    .unwrap_or(prefix)
+                    .trim()
+            })
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let id = Uuid::new_v4().to_string();
+        let request = if is_valid_function_name(&name) {
+            MessageContentBlock::tool_request(
+                id,
+                Ok(CallToolRequestParams::new(name).with_arguments(arguments)),
+            )
+        } else {
+            MessageContentBlock::tool_request(
+                id,
+                Err(ErrorData {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: Cow::from(format!(
+                        "The provided function name '{}' had invalid characters, it must match this regex [a-zA-Z0-9_-]+",
+                        name
+                    )),
+                    data: None,
+                }),
+            )
+        };
 
-    let prefix = content
-        .get(..start)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string);
-    let id = Uuid::new_v4().to_string();
-    let request = if is_valid_function_name(&name) {
-        MessageContentBlock::tool_request(
-            id,
-            Ok(CallToolRequestParams::new(name).with_arguments(arguments.clone())),
-        )
-    } else {
-        MessageContentBlock::tool_request(
-            id,
-            Err(ErrorData {
-                code: ErrorCode::INVALID_REQUEST,
-                message: Cow::from(format!(
-                    "The provided function name '{}' had invalid characters, it must match this regex [a-zA-Z0-9_-]+",
-                    name
-                )),
-                data: None,
-            }),
-        )
-    };
+        return (prefix, vec![request]);
+    }
 
-    (prefix, vec![request])
+    (None, Vec::new())
+}
+
+fn contains_json_tool_call_start(content: &str) -> bool {
+    static JSON_TOOL_CALL_START: OnceLock<Regex> = OnceLock::new();
+    JSON_TOOL_CALL_START
+        .get_or_init(|| Regex::new(r#"\{\s*"name"\s*:"#).expect("valid JSON tool-call regex"))
+        .is_match(content)
+}
+
+fn contains_json_tool_call_candidate(content: &str) -> bool {
+    content.match_indices('{').any(|(start, _)| {
+        let Some(field_name) = content
+            .get(start..)
+            .and_then(|candidate| candidate.strip_prefix('{'))
+            .map(str::trim_start)
+        else {
+            return false;
+        };
+        field_name.is_empty() || "\"name\"".starts_with(field_name)
+    })
 }
 
 /// Convert OpenAI's API response to internal Message format, with XML tool call fallback.
@@ -243,7 +280,8 @@ where
 
                     if !tool_fallback_detected
                         && (accumulated_text.contains("<function=")
-                            || accumulated_text.contains("{\"name\""))
+                            || contains_json_tool_call_start(&accumulated_text)
+                            || contains_json_tool_call_candidate(&accumulated_text))
                     {
                         tool_fallback_detected = true;
                     }
@@ -296,7 +334,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use serde_json::json;
+    use tokio_stream;
 
     #[test]
     fn test_parse_xml_tool_calls_single() {
@@ -463,6 +503,161 @@ hello
         } else {
             panic!("Expected ToolRequest content from JSON fallback");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_json_tool_calls_with_formatted_json() {
+        let content = r#"{
+  "name": "coding__workflow_start",
+  "arguments": {
+    "objective": "repair"
+  }
+}"#;
+
+        assert!(contains_json_tool_call_start(content));
+        assert!(contains_json_tool_call_candidate("{\n  \"name\""));
+
+        let (prefix, tool_calls) = parse_json_tool_calls(content);
+        assert!(prefix.is_none());
+        assert_eq!(tool_calls.len(), 1);
+
+        if let MessageContentBlock::ToolRequest(request) = &tool_calls[0] {
+            let tool_call = request.tool_call.as_ref().unwrap();
+            assert_eq!(tool_call.name, "coding__workflow_start");
+            assert_eq!(tool_call.arguments.as_ref().unwrap()["objective"], "repair");
+        } else {
+            panic!("Expected ToolRequest content from formatted JSON fallback");
+        }
+    }
+
+    #[test]
+    fn test_parse_json_tool_calls_with_empty_argument_array() {
+        let content = r#"{
+  "name": "coding__git_status",
+  "arguments": []
+}"#;
+
+        let (_, tool_calls) = parse_json_tool_calls(content);
+        assert_eq!(tool_calls.len(), 1);
+
+        if let MessageContentBlock::ToolRequest(request) = &tool_calls[0] {
+            let tool_call = request.tool_call.as_ref().unwrap();
+            assert_eq!(tool_call.name, "coding__git_status");
+            assert_eq!(tool_call.arguments.as_ref().unwrap().len(), 0);
+        } else {
+            panic!("Expected ToolRequest content from empty argument array fallback");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_formatted_json_tool_fallback() -> anyhow::Result<()> {
+        let chunks = [
+            "{\n  \"name\"",
+            ": \"coding__workflow_start\",\n  \"arguments\": {\n",
+            "    \"objective\": \"repair\"\n  }\n}",
+        ];
+        let chunk_count = chunks.len();
+        let response_stream =
+            tokio_stream::iter(chunks.into_iter().enumerate().map(move |(index, content)| {
+                let finish_reason = if index + 1 == chunk_count { "stop" } else { "" };
+                Ok(format!(
+                    "data: {}",
+                    json!({
+                        "id": "chunk-1",
+                        "choices": [{
+                            "delta": {"content": content},
+                            "index": 0,
+                            "finish_reason": finish_reason,
+                        }]
+                    })
+                ))
+            }));
+        let mut messages = std::pin::pin!(response_to_streaming_message_ollama(response_stream));
+        let mut tool_requests = Vec::new();
+        let mut text = String::new();
+
+        while let Some(result) = messages.next().await {
+            let (message, _) = result?;
+            let Some(message) = message else {
+                continue;
+            };
+
+            for content in message.content {
+                match content {
+                    MessageContentBlock::ToolRequest(request) => tool_requests.push(request),
+                    MessageContentBlock::Text(content) => text.push_str(&content.text),
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(text.is_empty());
+        assert_eq!(tool_requests.len(), 1);
+        assert_eq!(
+            tool_requests[0].tool_call.as_ref().unwrap().name,
+            "coding__workflow_start"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_json_tool_fallback_after_prose_and_code_fence() -> anyhow::Result<()> {
+        let chunks = [
+            "I will inspect the repository first.\n\n```json\n{\n  \"name\"",
+            ": \"coding__git_status\",\n  \"arguments\": []\n}",
+        ];
+        let chunk_count = chunks.len();
+        let response_stream =
+            tokio_stream::iter(chunks.into_iter().enumerate().map(move |(index, content)| {
+                let finish_reason = if index + 1 == chunk_count { "stop" } else { "" };
+                Ok(format!(
+                    "data: {}",
+                    json!({
+                        "id": "chunk-1",
+                        "choices": [{
+                            "delta": {"content": content},
+                            "index": 0,
+                            "finish_reason": finish_reason,
+                        }]
+                    })
+                ))
+            }));
+        let mut messages = std::pin::pin!(response_to_streaming_message_ollama(response_stream));
+        let mut tool_requests = Vec::new();
+        let mut text = String::new();
+
+        while let Some(result) = messages.next().await {
+            let (message, _) = result?;
+            let Some(message) = message else {
+                continue;
+            };
+
+            for content in message.content {
+                match content {
+                    MessageContentBlock::ToolRequest(request) => tool_requests.push(request),
+                    MessageContentBlock::Text(content) => text.push_str(&content.text),
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(text, "I will inspect the repository first.");
+        assert_eq!(tool_requests.len(), 1);
+        assert_eq!(
+            tool_requests[0].tool_call.as_ref().unwrap().name,
+            "coding__git_status"
+        );
+        assert!(tool_requests[0]
+            .tool_call
+            .as_ref()
+            .unwrap()
+            .arguments
+            .as_ref()
+            .unwrap()
+            .is_empty());
 
         Ok(())
     }

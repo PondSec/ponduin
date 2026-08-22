@@ -81,6 +81,10 @@ describe('getWorkflowProgress', () => {
       'Run the library test suite.',
       'Review the changed implementation.',
     ]);
+    expect(progress?.plan).toMatchObject({
+      relevantFiles: [],
+      validationCommands: [],
+    });
   });
 
   it('hides progress before a concrete plan has been accepted', () => {
@@ -104,5 +108,101 @@ describe('getWorkflowProgress', () => {
     );
 
     expect(progress).toBeUndefined();
+  });
+
+  it('counts native write_file calls and exposes the fixed five workflow phases', () => {
+    const progress = getWorkflowProgress(
+      messages([
+        request('start', 'workflow_start'),
+        response('start'),
+        request('plan', 'workflow_set_plan', { plan_steps: ['Make the minimal change.'] }),
+        response('plan'),
+        request('write', 'write_file', { path: 'normalizer.py', content: 'updated' }),
+        response('write'),
+        request('validate', 'run_process'),
+        response('validate'),
+      ])
+    );
+
+    expect(progress).toMatchObject({
+      currentPhase: 'Validierung',
+      currentStep: 4,
+      changedFiles: 1,
+      phaseCount: 5,
+    });
+    expect(progress?.phases.map((phase) => phase.label)).toEqual([
+      'Analyse',
+      'Planung',
+      'Bearbeitung',
+      'Validierung',
+      'Review',
+    ]);
+  });
+
+  it('shows editing immediately after the accepted editing transition', () => {
+    const progress = getWorkflowProgress(
+      messages([
+        request('start', 'workflow_start'),
+        response('start'),
+        request('plan', 'workflow_set_plan', { plan_steps: ['Make the minimal change.'] }),
+        response('plan'),
+        request('edit', 'workflow_transition', { transition: 'begin_editing' }),
+        response('edit'),
+      ])
+    );
+
+    expect(progress).toMatchObject({ currentPhase: 'Bearbeitung', currentStep: 3 });
+  });
+
+  it('keeps the plan scope, validation command, and safeguards visible', () => {
+    const progress = getWorkflowProgress(
+      messages([
+        request('start', 'workflow_start'),
+        response('start'),
+        request('plan', 'workflow_set_plan', {
+          plan: {
+            relevant_files: ['normalizer.py'],
+            intended_changes: ['Normalize values to lowercase.'],
+            risks: ['Do not change test behavior.'],
+            rollback_strategy: 'Restore the previous implementation if validation fails.',
+            validation: [
+              {
+                command: { program: 'python3', args: ['-m', 'unittest', '-v'] },
+              },
+            ],
+          },
+        }),
+        response('plan'),
+      ])
+    );
+
+    expect(progress?.plan).toEqual({
+      relevantFiles: ['normalizer.py'],
+      risks: ['Do not change test behavior.'],
+      rollbackStrategy: 'Restore the previous implementation if validation fails.',
+      validationCommands: ['python3 -m unittest -v'],
+    });
+  });
+
+  it('expands a compact one-line plan into concrete change, validation, and review steps', () => {
+    const progress = getWorkflowProgress(
+      messages([
+        request('start', 'workflow_start'),
+        response('start'),
+        request('plan', 'workflow_set_plan', {
+          relevant_files: ['normalizer.py'],
+          intended_change: 'Normalize values to lowercase.',
+          validation_program: 'python3',
+          args: ['-m', 'unittest', '-v'],
+        }),
+        response('plan'),
+      ])
+    );
+
+    expect(progress?.steps.map((step) => step.label)).toEqual([
+      'Change: Normalize values to lowercase. (normalizer.py).',
+      'Validation: run python3 -m unittest -v and require a successful result.',
+      'Review: read normalizer.py again and inspect only the retained planned change.',
+    ]);
   });
 });

@@ -151,21 +151,12 @@ export const ConfigProvider: React.FC<ConfigProviderProps> = ({ children }) => {
   }, []);
 
   useEffect(() => {
-    // Load all configuration data and providers on mount
+    // Load configuration and extensions on mount. Provider inventory is loaded
+    // only when a provider-management surface explicitly requests it.
     (async () => {
       // Load config
       const configResponse = await acpReadAllConfig();
       setConfig(configResponse);
-
-      // Load providers
-      try {
-        const providersData = await acpListProviderDetails();
-        providersListRef.current = providersData;
-        setProvidersList(providersData);
-      } catch (error) {
-        console.error('Failed to load providers:', error);
-        setProvidersList([]);
-      }
 
       // Load extensions
       try {

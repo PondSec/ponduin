@@ -76,6 +76,8 @@ const MAX_UNPRODUCTIVE_TURN_RETRIES: u32 = 3;
 const CODING_ROUTER_MAX_TOKENS: i32 = 128;
 const CODING_ROUTER_MAX_ATTEMPTS: usize = 2;
 const CODING_ROUTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SESSION_EXTENSION_INITIALIZATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 const REASONING_ONLY_TURN_MESSAGE: &str =
@@ -83,7 +85,59 @@ const REASONING_ONLY_TURN_MESSAGE: &str =
 const UNPRODUCTIVE_TURN_CONTINUATION: &str =
     "Continue the current task now. Reasoning alone cannot complete a turn: call the appropriate tool or provide a user-visible final answer.";
 const DEFAULT_FRONTEND_INSTRUCTIONS: &str = "The following tools are provided directly by the frontend and will be executed by the frontend when called.";
-const COMPACT_NATIVE_CODING_HISTORY_TAIL_MESSAGES: usize = 8;
+const COMPACT_NATIVE_CODING_HISTORY_TAIL_MESSAGES: usize = 16;
+const EXPLICIT_CODING_ACTIONS: &[&str] = &[
+    "create",
+    "write",
+    "change",
+    "modify",
+    "edit",
+    "implement",
+    "fix",
+    "repair",
+    "refactor",
+    "build",
+    "test",
+    "debug",
+    "erstelle",
+    "schreib",
+    "ändere",
+    "aendere",
+    "bearbeit",
+    "implementiere",
+    "behebe",
+    "repariere",
+    "teste",
+    "debugge",
+    "baue",
+];
+const EXPLICIT_CODING_TARGETS: &[&str] = &[
+    "file",
+    "datei",
+    "code",
+    "function",
+    "funktion",
+    "class",
+    "module",
+    "component",
+    "repository",
+    "projekt",
+    "project",
+    "cargo",
+    "python",
+    "typescript",
+    "javascript",
+    "rust",
+    ".rs",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".go",
+    ".java",
+    ".swift",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolCategory {
@@ -123,24 +177,90 @@ fn collect_coding_route_decisions(
     invalid_tool_request
 }
 
-fn retain_first_compact_coding_request(
+fn retain_preferred_compact_coding_request(
+    frontend_requests: &mut Vec<ToolRequest>,
     remaining_requests: &mut Vec<ToolRequest>,
     filtered_response: &mut Message,
+    preferred_tool_name: Option<&str>,
 ) {
-    let mut saw_coding_request = false;
-    let dropped_ids = remaining_requests
-        .iter()
-        .filter_map(|request| {
-            let tool_call = request.tool_call.as_ref().ok()?;
-            if !crate::coding::tools::is_reserved_name(&tool_call.name) {
+    let retained_id = preferred_tool_name
+        .and_then(|preferred_tool_name| {
+            frontend_requests
+                .iter()
+                .chain(remaining_requests.iter())
+                .find_map(|request| {
+                    request
+                        .tool_call
+                        .as_ref()
+                        .ok()
+                        .filter(|tool_call| {
+                            crate::coding::tools::is_reserved_name(&tool_call.name)
+                                && tool_call.name == preferred_tool_name
+                        })
+                        .map(|_| request.id.clone())
+                })
+        })
+        .or_else(|| {
+            if preferred_tool_name
+                .is_some_and(|name| name != crate::coding::tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+            {
                 return None;
             }
-            if saw_coding_request {
-                Some(request.id.clone())
-            } else {
-                saw_coding_request = true;
-                None
-            }
+            frontend_requests
+                .iter()
+                .chain(remaining_requests.iter())
+                .find_map(|request| {
+                    request
+                        .tool_call
+                        .as_ref()
+                        .ok()
+                        .filter(|tool_call| {
+                            crate::coding::tools::is_reserved_name(&tool_call.name)
+                                && (preferred_tool_name.is_none()
+                                    || tool_call.name
+                                        != crate::coding::tools::WORKFLOW_START_TOOL_NAME)
+                                && (preferred_tool_name
+                                    != Some(crate::coding::tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+                                    || tool_call.name != crate::coding::tools::FIND_FILES_TOOL_NAME)
+                        })
+                        .map(|_| request.id.clone())
+                })
+        });
+    let Some(retained_id) = retained_id else {
+        if preferred_tool_name.is_some() {
+            frontend_requests.retain(|request| {
+                !matches!(
+                    &request.tool_call,
+                    Ok(tool_call) if crate::coding::tools::is_reserved_name(&tool_call.name)
+                )
+            });
+            remaining_requests.retain(|request| {
+                !matches!(
+                    &request.tool_call,
+                    Ok(tool_call) if crate::coding::tools::is_reserved_name(&tool_call.name)
+                )
+            });
+            filtered_response.content.retain(|content| {
+                !matches!(
+                    content,
+                    MessageContent::ToolRequest(request)
+                        if matches!(
+                            &request.tool_call,
+                            Ok(tool_call)
+                                if crate::coding::tools::is_reserved_name(&tool_call.name)
+                        )
+                )
+            });
+        }
+        return;
+    };
+    let dropped_ids = frontend_requests
+        .iter()
+        .chain(remaining_requests.iter())
+        .filter_map(|request| {
+            let tool_call = request.tool_call.as_ref().ok()?;
+            (crate::coding::tools::is_reserved_name(&tool_call.name) && request.id != retained_id)
+                .then(|| request.id.clone())
         })
         .collect::<std::collections::HashSet<_>>();
 
@@ -148,6 +268,7 @@ fn retain_first_compact_coding_request(
         return;
     }
 
+    frontend_requests.retain(|request| !dropped_ids.contains(&request.id));
     remaining_requests.retain(|request| !dropped_ids.contains(&request.id));
     filtered_response.content.retain(|content| {
         !matches!(content, MessageContent::ToolRequest(request) if dropped_ids.contains(&request.id))
@@ -177,7 +298,7 @@ fn compact_native_coding_history(messages: &[Message]) -> Vec<Message> {
         return messages.to_vec();
     }
 
-    let latest_user_index = messages.iter().rposition(|message| {
+    let original_user_index = messages.iter().position(|message| {
         message.role == rmcp::model::Role::User
             && message.is_agent_visible()
             && message.content.iter().any(|content| {
@@ -194,9 +315,9 @@ fn compact_native_coding_history(messages: &[Message]) -> Vec<Message> {
         .unwrap_or(tail_start);
 
     let mut compacted = Vec::with_capacity(
-        COMPACT_NATIVE_CODING_HISTORY_TAIL_MESSAGES + usize::from(latest_user_index.is_some()),
+        COMPACT_NATIVE_CODING_HISTORY_TAIL_MESSAGES + usize::from(original_user_index.is_some()),
     );
-    if let Some(index) = latest_user_index.filter(|index| *index < tail_start) {
+    if let Some(index) = original_user_index.filter(|index| *index < tail_start) {
         compacted.push(messages[index].clone());
     }
     compacted.extend(messages[tail_start..].iter().cloned());
@@ -421,6 +542,16 @@ fn latest_user_request(conversation: &Conversation) -> Option<String> {
         let text = agent_visible_message_text(message);
         (!text.trim().is_empty()).then_some(text)
     })
+}
+
+fn has_explicit_coding_intent(request: &str) -> bool {
+    let normalized = request.to_lowercase();
+    EXPLICIT_CODING_ACTIONS
+        .iter()
+        .any(|action| normalized.contains(action))
+        && EXPLICIT_CODING_TARGETS
+            .iter()
+            .any(|target| normalized.contains(target))
 }
 
 fn attach_turn_usage(
@@ -1450,17 +1581,31 @@ impl Agent {
                         };
                     }
 
-                    match agent_ref
-                        .add_extension_inner(config_clone, &session_id_clone)
-                        .await
+                    match tokio::time::timeout(
+                        SESSION_EXTENSION_INITIALIZATION_TIMEOUT,
+                        agent_ref.add_extension_inner(config_clone, &session_id_clone),
+                    )
+                    .await
                     {
-                        Ok(_) => ExtensionLoadResult {
+                        Ok(Ok(_)) => ExtensionLoadResult {
                             name,
                             success: true,
                             error: None,
                         },
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             let error_msg = e.to_string();
+                            warn!("Failed to load extension {}: {}", name, error_msg);
+                            ExtensionLoadResult {
+                                name,
+                                success: false,
+                                error: Some(error_msg),
+                            }
+                        }
+                        Err(_) => {
+                            let error_msg = format!(
+                                "Initialization exceeded {} seconds",
+                                SESSION_EXTENSION_INITIALIZATION_TIMEOUT.as_secs()
+                            );
                             warn!("Failed to load extension {}: {}", name, error_msg);
                             ExtensionLoadResult {
                                 name,
@@ -2017,6 +2162,15 @@ impl Agent {
         ponduin_mode: PonduinMode,
         cancel_token: &Option<CancellationToken>,
     ) -> Result<super::reply_parts::CodingToolExposure> {
+        if self
+            .coding_agent
+            .uses_compact_history_for_model(model_config)
+            && latest_user_request(conversation)
+                .is_some_and(|request| has_explicit_coding_intent(&request))
+        {
+            return Ok(super::reply_parts::CodingToolExposure::Active);
+        }
+
         let routing_tools = self.coding_agent.routing_tools(ponduin_mode);
         let Some(base_prompt) = self.coding_agent.routing_system_prompt(ponduin_mode) else {
             return Ok(super::reply_parts::CodingToolExposure::Inactive);
@@ -2205,28 +2359,6 @@ impl Agent {
             });
         let session_manager = self.config.session_manager.clone();
         let session_id = session_config.id.clone();
-        if !self.config.disable_session_naming {
-            let provider = provider.clone();
-            let manager_for_spawn = session_manager.clone();
-            let session_name_update_tx = self.config.session_name_update_tx.clone();
-            tokio::spawn(async move {
-                match manager_for_spawn
-                    .maybe_update_name(&session_id, provider)
-                    .await
-                {
-                    Ok(Some(update)) => {
-                        if let Some(tx) = session_name_update_tx {
-                            if tx.send(update).is_err() {
-                                warn!("Failed to publish generated session name");
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => warn!("Failed to generate session description: {}", e),
-                }
-            });
-        }
-
         // Count tool calls present before this reply — everything added during
         // the reply loop is part of the current turn and should not be summarized.
         let pre_turn_tool_count = conversation
@@ -2492,7 +2624,7 @@ impl Agent {
                                     });
 
                                 let ToolCategorizeResult {
-                                    frontend_requests,
+                                    mut frontend_requests,
                                     mut remaining_requests,
                                     mut filtered_response,
                                 } = self
@@ -2508,9 +2640,12 @@ impl Agent {
                                         .coding_agent
                                         .uses_compact_history_for_model(&model_config)
                                 {
-                                    retain_first_compact_coding_request(
+                                    retain_preferred_compact_coding_request(
+                                        &mut frontend_requests,
                                         &mut remaining_requests,
                                         &mut filtered_response,
+                                        self.coding_agent
+                                            .compact_preferred_tool_name(&session.working_dir),
                                     );
                                 }
 
@@ -2536,14 +2671,13 @@ impl Agent {
                                 );
 
                                 let suppress_user_visible_response = coding_tools_active
-                                    && self
-                                        .coding_agent
-                                        .workflow_continuation(&session.working_dir)
-                                        .is_some();
+                                    && ponduin_mode == PonduinMode::Auto;
 
-                                if let Some(live_response) = message_for_live_update(&filtered_response) {
-                                    yield AgentEvent::Message(live_response);
-                                    tokio::task::yield_now().await;
+                                if !suppress_user_visible_response {
+                                    if let Some(live_response) = message_for_live_update(&filtered_response) {
+                                        yield AgentEvent::Message(live_response);
+                                        tokio::task::yield_now().await;
+                                    }
                                 }
 
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
@@ -3078,6 +3212,22 @@ impl Agent {
                 }
                 can_drain_pending_steers = true;
 
+                if coding_tools_active
+                    && ponduin_mode == PonduinMode::Auto
+                    && !no_tools_called
+                {
+                    if let Some(summary) = self
+                        .coding_agent
+                        .completed_workflow_message(&session.working_dir)
+                    {
+                        let message = Message::assistant().with_text(summary.clone());
+                        last_assistant_text = summary;
+                        messages_to_add.push(message.clone());
+                        yield AgentEvent::Message(message);
+                        exit_chat = true;
+                    }
+                }
+
                 if tools_updated {
                     let refreshed_coding_exposure = if coding_tools_active {
                         super::reply_parts::CodingToolExposure::Active
@@ -3091,6 +3241,19 @@ impl Agent {
                             refreshed_coding_exposure,
                         )
                         .await?;
+
+                    if !no_tools_called {
+                        if let Some(continuation) = self
+                            .coding_agent
+                            .active_workflow_continuation(&session.working_dir)
+                        {
+                            messages_to_add.push(
+                                Message::user()
+                                    .with_text(continuation)
+                                    .with_visibility(false, true),
+                            );
+                        }
+                    }
                 }
 
                 {
@@ -3428,6 +3591,29 @@ impl Agent {
 
             if !stop_hook_handled_for_exit {
                 self.emit_stop_hook(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy()).await;
+            }
+
+            if !self.config.disable_session_naming && !is_token_cancelled(&cancel_token) {
+                let provider = provider.clone();
+                let manager_for_spawn = session_manager.clone();
+                let session_id = session_id.clone();
+                let session_name_update_tx = self.config.session_name_update_tx.clone();
+                tokio::spawn(async move {
+                    match manager_for_spawn
+                        .maybe_update_name(&session_id, provider)
+                        .await
+                    {
+                        Ok(Some(update)) => {
+                            if let Some(tx) = session_name_update_tx {
+                                if tx.send(update).is_err() {
+                                    warn!("Failed to publish generated session name");
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => warn!("Failed to generate session description: {}", e),
+                    }
+                });
             }
         }.instrument(reply_stream_span));
         Ok(inner)
@@ -4033,7 +4219,7 @@ mod tests {
     #[test]
     fn compact_native_coding_history_keeps_objective_and_complete_recent_tool_pairs() {
         let mut messages = vec![Message::user().with_text("repair the failing project")];
-        for index in 0..6 {
+        for index in 0..10 {
             let id = format!("call-{index}");
             messages.push(Message::assistant().with_tool_request(
                 id.clone(),
@@ -4056,14 +4242,57 @@ mod tests {
             })
         };
 
-        assert_eq!(compacted.len(), 9);
+        assert_eq!(compacted.len(), 17);
         assert_eq!(compacted[0].as_concat_text(), "repair the failing project");
         assert!(!contains_tool_response("call-0"));
         assert!(!contains_tool_response("call-1"));
-        for index in 2..6 {
+        for index in 2..10 {
             assert!(contains_tool_response(&format!("call-{index}")));
         }
         assert_eq!(compacted[1].role, rmcp::model::Role::Assistant);
+    }
+
+    #[test]
+    fn compact_native_coding_history_keeps_original_request_over_workflow_reminders() {
+        let mut messages = vec![Message::user().with_text("repair the failing project")];
+        for index in 0..6 {
+            let id = format!("call-{index}");
+            messages.push(Message::assistant().with_tool_request(
+                id.clone(),
+                Ok(CallToolRequestParams::new(format!("coding__tool_{index}"))),
+            ));
+            messages.push(Message::user().with_tool_response(
+                id,
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "result-{index}"
+                ))])),
+            ));
+            messages.push(
+                Message::user()
+                    .with_text(format!("workflow reminder {index}"))
+                    .with_visibility(false, true),
+            );
+        }
+
+        let compacted = compact_native_coding_history(&messages);
+
+        assert_eq!(compacted[0].as_concat_text(), "repair the failing project");
+        assert!(compacted
+            .iter()
+            .all(|message| message.as_concat_text() != "workflow reminder 0"));
+    }
+
+    #[test]
+    fn detects_explicit_coding_requests_without_routing_a_local_qwen_model() {
+        assert!(has_explicit_coding_intent(
+            "Bearbeite normalizer.py und teste die Änderung mit python3"
+        ));
+        assert!(has_explicit_coding_intent(
+            "Fix the failing Rust module and run cargo test"
+        ));
+        assert!(!has_explicit_coding_intent(
+            "Erkläre mir verständlich, was Rust Lifetimes sind"
+        ));
     }
 
     #[test]
@@ -4570,7 +4799,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
     }
 
     #[test]
-    fn compact_coding_requests_run_one_workflow_action_per_model_turn() {
+    fn compact_coding_requests_prefer_the_phase_allowed_action() {
         let mut filtered_response = Message::assistant()
             .with_tool_request(
                 "read",
@@ -4585,7 +4814,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                 )),
             )
             .with_tool_request("other", Ok(CallToolRequestParams::new("other__tool")));
-        let mut remaining_requests = filtered_response
+        let mut frontend_requests = filtered_response
             .content
             .iter()
             .filter_map(|content| match content {
@@ -4593,14 +4822,20 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let mut remaining_requests = Vec::new();
 
-        retain_first_compact_coding_request(&mut remaining_requests, &mut filtered_response);
+        retain_preferred_compact_coding_request(
+            &mut frontend_requests,
+            &mut remaining_requests,
+            &mut filtered_response,
+            Some(crate::coding::tools::APPLY_CHANGES_TOOL_NAME),
+        );
 
-        let remaining_ids = remaining_requests
+        let remaining_ids = frontend_requests
             .iter()
             .map(|request| request.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(remaining_ids, vec!["read", "other"]);
+        assert_eq!(remaining_ids, vec!["write", "other"]);
         let visible_ids = filtered_response
             .content
             .iter()
@@ -4609,7 +4844,47 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(visible_ids, vec!["read", "other"]);
+        assert_eq!(visible_ids, vec!["write", "other"]);
+    }
+
+    #[test]
+    fn compact_coding_requests_drop_an_invalid_workflow_restart() {
+        let mut filtered_response = Message::assistant()
+            .with_tool_request(
+                "restart",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::WORKFLOW_START_TOOL_NAME,
+                )),
+            )
+            .with_tool_request(
+                "repeat-search",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::FIND_FILES_TOOL_NAME,
+                )),
+            )
+            .with_tool_request("other", Ok(CallToolRequestParams::new("other__tool")));
+        let mut frontend_requests = filtered_response
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::ToolRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut remaining_requests = Vec::new();
+
+        retain_preferred_compact_coding_request(
+            &mut frontend_requests,
+            &mut remaining_requests,
+            &mut filtered_response,
+            Some(crate::coding::tools::WORKFLOW_SET_PLAN_TOOL_NAME),
+        );
+
+        let remaining_ids = frontend_requests
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_ids, vec!["other"]);
     }
 
     #[test]

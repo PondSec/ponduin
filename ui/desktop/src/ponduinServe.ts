@@ -137,7 +137,7 @@ const appendErrorTail = (target: string[], lines: string[], maxLines = 100): voi
 };
 
 const CERT_FINGERPRINT_PREFIX = 'PONDUIND_CERT_FINGERPRINT=';
-const TLS_FINGERPRINT_TIMEOUT_MS = 5000;
+const TLS_FINGERPRINT_TIMEOUT_MS = 15_000;
 
 interface ReadinessProbeResult {
   ok: boolean;

@@ -9,7 +9,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '../../../ui/dropdown-menu';
-import { getProviderMetadata } from '../modelInterface';
 import { getModelDisplayName } from '../predefinedModelsUtils';
 
 import { ModelSettingsPanel } from '../../localInference/ModelSettingsPanel';
@@ -101,31 +100,11 @@ export default function ModelsBottomBar({
   const menuModelLabel = isModelLoading ? loadingModelLabel : displayModelName;
 
   useEffect(() => {
-    if (!currentProvider) return;
-    getProviderMetadata(currentProvider)
-      .then((metadata) => {
-        setDisplayProvider(metadata.display_name || currentProvider);
-      })
-      .catch(() => {
-        setDisplayProvider(currentProvider);
-      });
-  }, [currentProvider, currentModel]);
+    setDisplayProvider(currentProvider);
+  }, [currentProvider]);
 
-  // Fetch provider default model when provider changes and no current model
   useEffect(() => {
-    if (currentProvider && !currentModel) {
-      (async () => {
-        try {
-          const metadata = await getProviderMetadata(currentProvider);
-          setProviderDefaultModel(metadata.default_model);
-        } catch (error) {
-          console.error('Failed to get provider default model:', error);
-          setProviderDefaultModel(null);
-        }
-      })();
-    } else if (currentModel) {
-      setProviderDefaultModel(null);
-    }
+    setProviderDefaultModel(null);
   }, [currentProvider, currentModel]);
 
   useEffect(() => {

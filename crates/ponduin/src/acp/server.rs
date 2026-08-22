@@ -1822,11 +1822,17 @@ impl PonduinAcpAgent {
         let mut chain_tracker = ToolChainTracker::default();
         let mut stream_error = None;
 
-        while let Some(event) = stream.next().await {
-            if cancel_token.is_cancelled() {
-                was_cancelled = true;
+        loop {
+            let event = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    was_cancelled = true;
+                    break;
+                }
+                event = stream.next() => event,
+            };
+            let Some(event) = event else {
                 break;
-            }
+            };
 
             match event {
                 Ok(crate::agents::AgentEvent::Message(message)) => {

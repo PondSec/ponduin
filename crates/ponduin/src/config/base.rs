@@ -42,6 +42,8 @@ fn write_secrets_file(path: &Path, content: &str) -> std::io::Result<()> {
 const KEYRING_SERVICE: &str = "ponduin";
 #[cfg(feature = "system-keyring")]
 const KEYRING_USERNAME: &str = "secrets";
+#[cfg(feature = "system-keyring")]
+const KEYRING_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const CONFIG_YAML_NAME: &str = "config.yaml";
 
 #[derive(Error, Debug)]
@@ -892,7 +894,7 @@ impl Config {
             SecretStorage::Keyring { service } => {
                 let json_value = serde_json::to_string(values)?;
                 match self.handle_keyring_operation(
-                    |entry| entry.set_password(&json_value),
+                    move |entry| entry.set_password(&json_value),
                     service,
                     Some(values),
                 ) {
@@ -1073,15 +1075,36 @@ impl Config {
         }
     }
 
+    #[cfg(feature = "system-keyring")]
+    fn handle_keyring_timeout<T>(
+        &self,
+        fallback_values: Option<&HashMap<String, Value>>,
+    ) -> Result<T, ConfigError> {
+        std::env::set_var("PONDUIN_DISABLE_KEYRING", "1");
+        tracing::warn!("Keyring operation timed out. Using file storage for secrets.");
+
+        if let Some(values) = fallback_values {
+            self.write_secrets_to_file(values)?;
+        }
+
+        Err(ConfigError::FallbackToFileStorage)
+    }
+
     /// Handle keyring operation with automatic fallback to file storage
     #[cfg(feature = "system-keyring")]
     fn handle_keyring_operation<T>(
         &self,
-        operation: impl FnOnce(keyring::Entry) -> Result<T, keyring::Error>,
+        operation: impl FnOnce(keyring::Entry) -> Result<T, keyring::Error> + Send + 'static,
         service: &str,
         fallback_values: Option<&HashMap<String, Value>>,
-    ) -> Result<T, ConfigError> {
-        // Try to get the keyring entry and perform the operation
+    ) -> Result<T, ConfigError>
+    where
+        T: Send + 'static,
+    {
+        if env::var("PONDUIN_DISABLE_KEYRING").is_ok() {
+            return self.handle_keyring_timeout(fallback_values);
+        }
+
         let entry = match Self::get_keyring_entry(service) {
             Ok(entry) => entry,
             Err(keyring_err) => {
@@ -1089,10 +1112,25 @@ impl Config {
             }
         };
 
-        // Perform the operation
-        match operation(entry) {
-            Ok(result) => Ok(result),
-            Err(keyring_err) => self.handle_keyring_fallback_error(&keyring_err, fallback_values),
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("ponduin-keyring".to_string())
+            .spawn(move || {
+                let _ = sender.send(operation(entry));
+            })
+            .map_err(|error| ConfigError::KeyringError(error.to_string()))?;
+
+        match receiver.recv_timeout(KEYRING_OPERATION_TIMEOUT) {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(keyring_err)) => {
+                self.handle_keyring_fallback_error(&keyring_err, fallback_values)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.handle_keyring_timeout(fallback_values)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ConfigError::KeyringError(
+                "Keyring operation stopped before it returned a result".to_string(),
+            )),
         }
     }
 }
@@ -1416,6 +1454,26 @@ mod tests {
 
         let result: Result<String, ConfigError> = config.get_secret("key");
         assert!(matches!(result, Err(ConfigError::NotFound(_))));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "system-keyring")]
+    #[test]
+    #[serial]
+    fn keyring_disabled_after_config_creation_uses_file_storage() -> Result<(), ConfigError> {
+        let _guard = env_lock::lock_env([("PONDUIN_DISABLE_KEYRING", None::<&str>)]);
+        let directory = TempDir::new()?;
+        let config_path = directory.path().join("config.yaml");
+        let config = Config::new(&config_path, "ponduin-test-keyring-fallback")?;
+
+        assert!(matches!(config.secrets, SecretStorage::Keyring { .. }));
+
+        std::env::set_var("PONDUIN_DISABLE_KEYRING", "1");
+        config.set_secret("api_key", &"fallback-value")?;
+
+        let value: String = config.get_secret("api_key")?;
+        assert_eq!(value, "fallback-value");
 
         Ok(())
     }

@@ -15,7 +15,6 @@ import { BottomMenuExtensionSelection } from './bottom_menu/BottomMenuExtensionS
 import { cn } from '../utils';
 import { AlertType, useAlerts } from './alerts';
 import { useModelAndProvider } from './ModelAndProviderContext';
-import { acpListProviderDetails } from '../acp/providers';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { toastError } from '../toasts';
 import MentionPopover, { DisplayItemWithMatch } from './MentionPopover';
@@ -617,19 +616,9 @@ export default function ChatInput({
         return;
       }
 
-      // Priority 3: Fall back to provider metadata known_models (may be outdated)
-      const providers = await acpListProviderDetails();
-      const currentProvider = providers.find((p) => p.name === provider);
-      if (currentProvider?.metadata?.known_models) {
-        const modelConfig = currentProvider.metadata.known_models.find((m) => m.name === model);
-        if (modelConfig?.context_limit) {
-          setTokenLimit(modelConfig.context_limit);
-          setIsTokenLimitLoaded(true);
-          return;
-        }
-      }
-
-      // Priority 4: Use default if nothing else found
+      // Use the conservative default if no local metadata is available. Loading
+      // the complete provider inventory here can block the active chat while a
+      // system keychain is waiting for a response.
       setTokenLimit(TOKEN_LIMIT_DEFAULT);
       setIsTokenLimitLoaded(true);
     } catch (err) {

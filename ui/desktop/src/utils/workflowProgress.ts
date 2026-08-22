@@ -6,16 +6,26 @@ export type WorkflowProgressStep = {
   status: 'active' | 'complete' | 'pending';
 };
 
+export type WorkflowPlanDetails = {
+  relevantFiles: string[];
+  risks: string[];
+  rollbackStrategy?: string;
+  validationCommands: string[];
+};
+
 export type WorkflowProgress = {
   additions?: number;
   changedFiles: number;
+  currentPhase: string;
   currentStep: number;
   deletions?: number;
   phaseCount: number;
+  phases: WorkflowProgressStep[];
+  plan: WorkflowPlanDetails;
   steps: WorkflowProgressStep[];
 };
 
-const WORKFLOW_PHASE_COUNT = 5;
+const WORKFLOW_PHASES = ['Analyse', 'Planung', 'Bearbeitung', 'Validierung', 'Review'];
 
 type CodingToolCall = {
   arguments: Record<string, unknown>;
@@ -37,6 +47,7 @@ export function getWorkflowProgress(messages: Message[]): WorkflowProgress | und
   if (!plan) {
     return undefined;
   }
+  const planDetails = workflowPlanDetails(plan.arguments);
   const planSteps = concretePlanSteps(plan.arguments);
   if (planSteps.length === 0) {
     return undefined;
@@ -44,17 +55,26 @@ export function getWorkflowProgress(messages: Message[]): WorkflowProgress | und
 
   const changedFiles = changedFileCount(workflowCalls);
   const currentStep = currentStepFor(workflowCalls);
+  const workflowCompleted = workflowCalls.some((call) => call.name === 'workflow_complete');
   const lineCounts = diffLineCounts(messages, workflowCalls);
-  const steps = planSteps.map((label, index, all) => ({
+  const phases = WORKFLOW_PHASES.map((label, index) => ({
     label,
-    detail: stepDetail(index, all.length, currentStep, changedFiles),
-    status: stepStatus(index, all.length, currentStep),
+    detail: phaseDetail(index, currentStep),
+    status: phaseStatus(index, currentStep),
+  }));
+  const steps = planSteps.map((label, index) => ({
+    label,
+    detail: stepDetail(index, currentStep, changedFiles, workflowCompleted),
+    status: stepStatus(index, currentStep, workflowCompleted),
   }));
 
   return {
+    currentPhase: WORKFLOW_PHASES[currentStep - 1],
     currentStep,
-    phaseCount: WORKFLOW_PHASE_COUNT,
+    phaseCount: WORKFLOW_PHASES.length,
     changedFiles,
+    phases,
+    plan: planDetails,
     steps,
     ...(lineCounts ? lineCounts : {}),
   };
@@ -115,12 +135,16 @@ function currentStepFor(calls: CodingToolCall[]): number {
     return 5;
   }
   if (names.has('review_changes') || transitions.has('begin_review')) {
-    return 4;
+    return 5;
   }
   if (names.has('run_validation') || names.has('run_process') || transitions.has('begin_validation')) {
     return 4;
   }
-  if (names.has('apply_changes')) {
+  if (
+    names.has('apply_changes') ||
+    names.has('write_file') ||
+    transitions.has('begin_editing')
+  ) {
     return 3;
   }
   if (names.has('workflow_set_plan')) {
@@ -129,63 +153,81 @@ function currentStepFor(calls: CodingToolCall[]): number {
   return 1;
 }
 
+function phaseStatus(index: number, currentStep: number): WorkflowProgressStep['status'] {
+  if (index + 1 < currentStep) {
+    return 'complete';
+  }
+  return index + 1 === currentStep ? 'active' : 'pending';
+}
+
+function phaseDetail(index: number, currentStep: number): string {
+  if (index + 1 !== currentStep) {
+    return '';
+  }
+  return [
+    'Relevante Dateien und Anforderungen werden erfasst.',
+    'Der konkrete Umsetzungsplan wird festgelegt.',
+    'Die geplante Änderung wird vorgenommen.',
+    'Die Änderung wird mit einer echten Prüfung validiert.',
+    'Die validierte Änderung wird abschließend geprüft.',
+  ][index];
+}
+
 function stepStatus(
   index: number,
-  stepCount: number,
-  currentStep: number
+  currentStep: number,
+  workflowCompleted: boolean
 ): WorkflowProgressStep['status'] {
-  if (currentStep === 5) {
+  if (workflowCompleted) {
     return 'complete';
   }
-  const activeIndex = Math.min(Math.max(currentStep - 1, 0), stepCount - 1);
-  if (index < activeIndex) {
+  const actionPhase = index + 3;
+  if (actionPhase < currentStep) {
     return 'complete';
   }
-  return index === activeIndex ? 'active' : 'pending';
+  return actionPhase === currentStep ? 'active' : 'pending';
 }
 
 function stepDetail(
   index: number,
-  stepCount: number,
   currentStep: number,
-  changedFiles: number
+  changedFiles: number,
+  workflowCompleted: boolean
 ): string {
-  const activeIndex = Math.min(Math.max(currentStep - 1, 0), stepCount - 1);
-  if (currentStep === 5) {
+  if (workflowCompleted) {
     return 'Abgeschlossen und durch den Workflow belegt.';
   }
-  if (index !== activeIndex) {
+  const actionPhase = index + 3;
+  if (actionPhase !== currentStep) {
     return '';
   }
-  if (currentStep === 1) {
-    return 'Der Agent erfasst die dafür notwendigen Projektinformationen.';
-  }
-  if (currentStep === 3) {
+  if (actionPhase === 3) {
     return changedFiles > 0
       ? `${changedFiles} Datei${changedFiles === 1 ? ' wurde' : 'en wurden'} bereits geändert.`
       : 'Die Änderung wird vorbereitet.';
   }
-  if (currentStep === 4) {
-    return 'Die aktuelle Revision wird geprüft.';
+  if (actionPhase === 4) {
+    return 'Die definierte Validierung wird ausgeführt.';
   }
-  return 'Der konkrete Plan wurde akzeptiert.';
+  return 'Die validierte Änderung wird abschließend geprüft.';
 }
 
 function changedFileCount(calls: CodingToolCall[]): number {
   const paths = new Set<string>();
   for (const call of calls) {
-    if (call.name !== 'apply_changes') {
-      continue;
-    }
-    const changes = Array.isArray(call.arguments.changes) ? call.arguments.changes : [];
-    for (const change of changes) {
-      const entry = record(change);
-      for (const key of ['path', 'destination']) {
-        const path = entry?.[key];
-        if (typeof path === 'string' && path.length > 0) {
-          paths.add(path);
+    if (call.name === 'apply_changes') {
+      const changes = Array.isArray(call.arguments.changes) ? call.arguments.changes : [];
+      for (const change of changes) {
+        const entry = record(change);
+        for (const key of ['path', 'destination']) {
+          const path = entry?.[key];
+          if (typeof path === 'string' && path.length > 0) {
+            paths.add(path);
+          }
         }
       }
+    } else if (call.name === 'write_file' && typeof call.arguments.path === 'string') {
+      paths.add(call.arguments.path);
     }
   }
   return paths.size;
@@ -193,14 +235,79 @@ function changedFileCount(calls: CodingToolCall[]): number {
 
 function concretePlanSteps(argumentsValue: Record<string, unknown>): string[] {
   const plan = record(argumentsValue.plan);
-  return firstNonEmptyStringArray(
+  const explicitSteps = firstNonEmptyStringArray(
     argumentsValue.plan_steps,
     argumentsValue.steps,
     plan?.plan_steps,
-    plan?.steps,
+    plan?.steps
+  );
+  const intendedChanges = firstNonEmptyStringArray(
     plan?.intended_changes,
     argumentsValue.intended_change
   );
+  if (explicitSteps.length >= 3) {
+    return explicitSteps;
+  }
+  if (intendedChanges.length >= 3) {
+    return intendedChanges;
+  }
+
+  const relevantFiles = firstNonEmptyStringArray(plan?.relevant_files, argumentsValue.relevant_files);
+  const scope = relevantFiles.length > 0 ? relevantFiles.join(', ') : 'the planned files';
+  const change = intendedChanges[0] ?? 'Apply the planned behavior change.';
+  const command = plannedValidationCommands(plan, argumentsValue)[0] ?? 'the planned validation command';
+
+  return [
+    `Change: ${change} (${scope}).`,
+    `Validation: run ${command} and require a successful result.`,
+    `Review: read ${scope} again and inspect only the retained planned change.`,
+  ];
+}
+
+function workflowPlanDetails(argumentsValue: Record<string, unknown>): WorkflowPlanDetails {
+  const plan = record(argumentsValue.plan);
+  const relevantFiles = firstNonEmptyStringArray(plan?.relevant_files, argumentsValue.relevant_files);
+  const risks = firstNonEmptyStringArray(plan?.risks, argumentsValue.risks);
+  const rollbackStrategy = firstNonEmptyStringArray(
+    plan?.rollback_strategy,
+    argumentsValue.rollback_strategy
+  )[0];
+  const validationCommands = plannedValidationCommands(plan, argumentsValue);
+
+  return { relevantFiles, risks, rollbackStrategy, validationCommands };
+}
+
+function plannedValidationCommands(
+  plan: Record<string, unknown> | undefined,
+  argumentsValue: Record<string, unknown>
+): string[] {
+  const checks = [
+    ...(Array.isArray(plan?.tests) ? plan.tests : []),
+    ...(Array.isArray(plan?.validation) ? plan.validation : []),
+  ];
+  const commands = checks.flatMap((check) => {
+    const command = record(record(check)?.command);
+    const program = command?.program;
+    if (typeof program !== 'string' || program.length === 0) {
+      return [];
+    }
+    const args = Array.isArray(command?.args)
+      ? command.args.filter((arg): arg is string => typeof arg === 'string')
+      : [];
+    return [[program, ...args].join(' ')];
+  });
+  if (commands.length > 0) {
+    return [...new Set(commands)];
+  }
+
+  const program = argumentsValue.validation_program;
+  if (typeof program !== 'string' || program.length === 0) {
+    return [];
+  }
+  const args = Array.isArray(argumentsValue.args)
+    ? argumentsValue.args.filter((arg): arg is string => typeof arg === 'string')
+    : [];
+  return [[program, ...args].join(' ')];
 }
 
 function firstNonEmptyStringArray(...values: unknown[]): string[] {

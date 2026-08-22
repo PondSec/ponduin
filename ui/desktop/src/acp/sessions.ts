@@ -60,6 +60,22 @@ export interface AcpLoadSessionResult {
 }
 
 const inFlightSessionLoads = new Map<string, Promise<AcpLoadSessionResult>>();
+const SESSION_LOAD_TIMEOUT_MS = 15_000;
+
+function withSessionLoadTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error('Loading the conversation timed out. Please try again.'));
+    }, SESSION_LOAD_TIMEOUT_MS);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  });
+}
 
 function parseSessionResponseMeta(rawMeta: unknown): LoadSessionMeta {
   const meta = (rawMeta ?? {}) as LoadSessionMeta;
@@ -180,7 +196,7 @@ export async function acpLoadSession(sessionId: string): Promise<AcpLoadSessionR
     return pendingLoad;
   }
 
-  const loadPromise = loadAcpSession(sessionId);
+  const loadPromise = withSessionLoadTimeout(loadAcpSession(sessionId));
   inFlightSessionLoads.set(sessionId, loadPromise);
   try {
     return await loadPromise;

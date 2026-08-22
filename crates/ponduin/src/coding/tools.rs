@@ -5,7 +5,9 @@ use crate::coding::file::{
     content_digest, FileReadOptions, FileSnapshot, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
     MIN_READ_LIMIT,
 };
-use crate::coding::git::{GitDiff, GitDiffRequest, GitLimits, GitOwnedPath, GitRepository};
+use crate::coding::git::{
+    GitDiff, GitDiffRequest, GitError, GitLimits, GitOwnedPath, GitRepository,
+};
 use crate::coding::intelligence::{IntelligenceLimits, RepositoryIndex, RepositoryIntelligence};
 use crate::coding::lsp::{
     LanguageServerClient, LanguageServerOperation, LanguageServerPosition, LanguageServerQuery,
@@ -18,6 +20,7 @@ use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, Proce
 use crate::coding::project::ProjectDiscovery;
 use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
+use crate::coding::sensitive::is_sensitive_path;
 use crate::coding::validation::{ValidationExecution, ValidationService};
 use crate::coding::workflow::{
     CodingWorkflow, RepairApproach, RequirementPriority, RequirementSource,
@@ -85,6 +88,7 @@ const MAX_ROLLBACK_RECORDS: usize = 20;
 const MAX_ROLLBACK_BYTES: usize = 64 * 1_024 * 1_024;
 const MAX_INTELLIGENCE_CACHE_ENTRIES: usize = 4;
 const MAX_WORKSPACE_WORKFLOWS: usize = 4;
+const MAX_READ_DIGESTS: usize = 256;
 
 #[derive(Debug, Default)]
 pub(crate) struct CodingToolState {
@@ -93,11 +97,13 @@ pub(crate) struct CodingToolState {
     intelligence_cache: Mutex<VecDeque<IntelligenceCacheEntry>>,
     workflows: Mutex<VecDeque<WorkspaceWorkflow>>,
     task_contexts: Mutex<VecDeque<WorkspaceTaskContext>>,
+    read_digests: Mutex<VecDeque<ReadDigest>>,
     mutation_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
 struct RollbackJournalEntry {
+    preview: MutationPreview,
     record: RollbackRecord,
     workspace_root: PathBuf,
     owned_paths: Vec<GitOwnedPath>,
@@ -129,6 +135,13 @@ struct WorkspaceTaskContext {
     task: WorkflowTaskState,
 }
 
+#[derive(Debug)]
+struct ReadDigest {
+    workspace_root: PathBuf,
+    path: PathBuf,
+    digest: String,
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowToolContext {
     status: WorkflowStatus,
@@ -157,22 +170,41 @@ impl CodingToolState {
 
     pub(crate) fn compact_native_definitions_for_workspace(
         &self,
-        _workspace_root: &Path,
+        workspace_root: &Path,
     ) -> Vec<Tool> {
-        // Ollama-native Qwen runs do not reliably accept a changed tool list on the turn after a
-        // tool call. Keep the small contract stable; execute still derives authority from the
-        // workflow state through definitions_for_workspace before every call.
-        compact_native_definitions(definitions())
+        // Native Ollama Qwen calls become unreliable when the declared tool names change after a
+        // call. The compact contract therefore stays stable while workflow guidance and each
+        // tool description state the valid phase.
+        let context = self.workflow_tool_context(workspace_root);
+        compact_native_definitions(definitions(), context.as_ref())
     }
 
     pub(crate) fn workflow_guidance_for_workspace(&self, workspace_root: &Path) -> Option<String> {
         let context = self.workflow_tool_context(workspace_root)?;
         let status = &context.status;
         let guidance = match status.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching
+                if !status.memory.read_files.is_empty() =>
+            {
+                format!(
+                    "Relevant files are already read ({}). Do not repeat coding__find_files. Unless \
+                     a specifically named additional file is still needed, call \
+                     coding__workflow_set_plan now with the returned paths and the exact change, \
+                     validation, and review steps.",
+                    status
+                        .memory
+                        .read_files
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             WorkflowPhase::Analyzing | WorkflowPhase::Searching => {
-                "Inspect only the repository context needed for the objective, then call \
-                 coding__workflow_set_plan. Editing and execution tools remain withheld until \
-                 the plan is accepted."
+                "Call coding__find_files and read the relevant source or test files before \
+                 coding__workflow_set_plan. Put only paths returned by those calls in the plan; \
+                 never use guessed paths, templates, or expressions. Editing and execution tools \
+                 remain withheld until the plan is accepted."
                     .to_string()
             }
             WorkflowPhase::Planning => {
@@ -256,6 +288,33 @@ impl CodingToolState {
         ))
     }
 
+    pub(crate) fn compact_preferred_tool_name_for_workspace(
+        &self,
+        workspace_root: &Path,
+    ) -> Option<&'static str> {
+        let context = self.workflow_tool_context(workspace_root)?;
+        let status = &context.status;
+        match status.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching
+                if !status.memory.read_files.is_empty() =>
+            {
+                Some(WORKFLOW_SET_PLAN_TOOL_NAME)
+            }
+            WorkflowPhase::Planning => Some(WORKFLOW_TRANSITION_TOOL_NAME),
+            WorkflowPhase::Editing if status.changed_files.is_empty() => Some(WRITE_FILE_TOOL_NAME),
+            WorkflowPhase::Editing => Some(WORKFLOW_TRANSITION_TOOL_NAME),
+            WorkflowPhase::Testing if context.review_ready => Some(WORKFLOW_TRANSITION_TOOL_NAME),
+            WorkflowPhase::Testing => Some(RUN_PROCESS_TOOL_NAME),
+            WorkflowPhase::Debugging => Some(WORKFLOW_TRANSITION_TOOL_NAME),
+            WorkflowPhase::Reviewing if context.completion_ready => {
+                Some(WORKFLOW_COMPLETE_TOOL_NAME)
+            }
+            WorkflowPhase::Reviewing => Some(REVIEW_CHANGES_TOOL_NAME),
+            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed => None,
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching => None,
+        }
+    }
+
     fn workflow_tool_context(&self, workspace_root: &Path) -> Option<WorkflowToolContext> {
         self.workflows
             .lock()
@@ -276,6 +335,7 @@ impl CodingToolState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         journal.push_back(RollbackJournalEntry {
+            preview: preview.clone(),
             record,
             workspace_root: workspace_root.to_path_buf(),
             owned_paths: preview
@@ -297,6 +357,60 @@ impl CodingToolState {
                 > MAX_ROLLBACK_BYTES
         {
             journal.pop_front();
+        }
+    }
+
+    fn recorded_mutation_diff(&self, workspace_root: &Path, request: &GitDiffRequest) -> GitDiff {
+        let requested_paths = (!request.paths.is_empty())
+            .then(|| request.paths.iter().cloned().collect::<BTreeSet<PathBuf>>());
+        let current_paths = self
+            .workflow_status(workspace_root, None)
+            .ok()
+            .map(|status| status.changed_files.into_iter().collect::<BTreeSet<_>>());
+        let journal = self
+            .rollback_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut files = Vec::new();
+        let mut skipped_sensitive = Vec::new();
+        let mut patch = String::new();
+
+        for entry in journal
+            .iter()
+            .filter(|entry| entry.workspace_root == workspace_root)
+        {
+            for file in &entry.preview.files {
+                if requested_paths
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(&file.path))
+                    || current_paths
+                        .as_ref()
+                        .is_some_and(|paths| !paths.contains(&file.path))
+                {
+                    continue;
+                }
+                if is_sensitive_path(&file.path) {
+                    if !skipped_sensitive.contains(&file.path) {
+                        skipped_sensitive.push(file.path.clone());
+                    }
+                    continue;
+                }
+                files.push(file.path.clone());
+                patch.push_str(&format!(
+                    "diff --git a/{path} b/{path}\n",
+                    path = file.path.display()
+                ));
+                patch.push_str(&file.diff);
+            }
+        }
+
+        GitDiff {
+            staged: false,
+            files,
+            skipped_sensitive,
+            patch,
+            truncated: false,
+            lossy_output: false,
         }
     }
 
@@ -605,6 +719,24 @@ impl CodingToolState {
         Ok(())
     }
 
+    pub(crate) fn start_pending_autonomous_workflow(
+        &self,
+        workspace_root: &Path,
+        config: &CodingConfig,
+    ) -> Result<(), ErrorData> {
+        if self.active_workflow_status(workspace_root).is_some() {
+            return Ok(());
+        }
+        let Some(task) = self.pending_task_context(workspace_root) else {
+            return Ok(());
+        };
+        if task.interaction_mode != crate::coding::TaskInteractionMode::Autonomous {
+            return Ok(());
+        }
+        self.start_workflow(workspace_root, task.normalized_objective, config)
+            .map(|_| ())
+    }
+
     pub(crate) fn recovery_instruction(&self, workspace_root: &Path) -> Option<String> {
         let status = match self.workflow_status(workspace_root, None) {
             Ok(status) => status,
@@ -635,6 +767,13 @@ impl CodingToolState {
             .map(|status| status.id)
     }
 
+    pub(crate) fn active_workflow_status(
+        &self,
+        workspace_root: &Path,
+    ) -> Option<crate::coding::workflow::WorkflowStatus> {
+        self.workflow_status(workspace_root, None).ok()
+    }
+
     pub(crate) fn active_workflow_continuation(&self, workspace_root: &Path) -> Option<String> {
         let status = self.workflow_status(workspace_root, None).ok()?;
         if matches!(
@@ -645,8 +784,10 @@ impl CodingToolState {
         }
         let guidance = self.workflow_guidance_for_workspace(workspace_root)?;
         Some(format!(
-            "The active coding workflow is incomplete. {} Do not provide a final prose response \
-             until the workflow has reached an evidence-backed terminal state.",
+            "The active coding workflow is incomplete. {} Submit exactly one native coding__ \
+             tool call for the next allowed action now. Emit no analysis, prose, plan restatement, \
+             code fence, or question before the call. Do not provide a final response until the \
+             workflow has reached an evidence-backed terminal state.",
             guidance
         ))
     }
@@ -734,6 +875,40 @@ impl CodingToolState {
         self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow.note_repository_activity();
         });
+    }
+
+    fn note_read_snapshot(&self, workspace_root: &Path, snapshot: &FileSnapshot) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut read_digests = self
+            .read_digests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read_digests
+            .retain(|entry| entry.workspace_root != workspace_root || entry.path != snapshot.path);
+        read_digests.push_back(ReadDigest {
+            workspace_root: workspace_root.to_path_buf(),
+            path: snapshot.path.clone(),
+            digest: snapshot.digest.clone(),
+        });
+        while read_digests.len() > MAX_READ_DIGESTS {
+            read_digests.pop_front();
+        }
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.note_read_files(vec![snapshot.path.clone()]);
+        });
+    }
+
+    fn last_read_digest(&self, workspace_root: &Path, path: &Path) -> Option<String> {
+        self.read_digests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|entry| entry.workspace_root == workspace_root && entry.path == path)
+            .map(|entry| entry.digest.clone())
     }
 
     fn note_read_files(&self, workspace_root: &Path, paths: Vec<PathBuf>) {
@@ -1108,11 +1283,22 @@ fn capability_recovery_guidance(status: &WorkflowStatus) -> String {
         return String::new();
     };
     match feedback.state {
-        TaskCapabilityState::Unavailable => format!(
-            "The last validation capability `{}` is unavailable. Do not retry that exact command; \
-             inspect current project capabilities for a supported alternative or report a clear blocker.",
-            feedback.capability
-        ),
+        TaskCapabilityState::Unavailable => {
+            if let Some(guidance) = planned_validation_process_guidance(status) {
+                format!(
+                    "The last validation capability `{}` is unavailable. Do not retry that exact \
+                     command. {guidance}",
+                    feedback.capability
+                )
+            } else {
+                format!(
+                    "The last validation capability `{}` is unavailable. Do not retry that exact \
+                     command; inspect current project capabilities for a supported alternative or \
+                     report a clear blocker.",
+                    feedback.capability
+                )
+            }
+        }
         TaskCapabilityState::NotExecutable => format!(
             "The last validation capability `{}` was discovered but cannot execute. Do not claim \
              validation; select an available narrower check or report the missing runtime.",
@@ -1135,6 +1321,22 @@ fn capability_recovery_guidance(status: &WorkflowStatus) -> String {
         ),
         TaskCapabilityState::Available => String::new(),
     }
+}
+
+fn planned_validation_process_guidance(status: &WorkflowStatus) -> Option<String> {
+    let command = status
+        .plan
+        .as_ref()?
+        .validation
+        .iter()
+        .find(|check| check.required)
+        .map(|check| &check.command)?;
+    let args = serde_json::to_string(&command.args).ok()?;
+    Some(format!(
+        "Run the plan's exact check now with coding__run_process: program `{}`, args {}. Do not \
+         call coding__project_capabilities again unless project files changed.",
+        command.program, args
+    ))
 }
 
 fn repair_pending_guidance() -> String {
@@ -1190,11 +1392,14 @@ pub fn definitions() -> Vec<Tool> {
     ]
 }
 
-fn compact_native_definitions(tools: Vec<Tool>) -> Vec<Tool> {
+fn compact_native_definitions(
+    tools: Vec<Tool>,
+    context: Option<&WorkflowToolContext>,
+) -> Vec<Tool> {
     tools
         .into_iter()
         .filter(|tool| compact_native_tool_allowed(tool.name.as_ref()))
-        .map(compact_native_tool_schema)
+        .map(|tool| compact_native_tool_schema(tool, context))
         .collect()
 }
 
@@ -1220,30 +1425,8 @@ fn compact_native_tool_allowed(name: &str) -> bool {
     )
 }
 
-fn compact_native_tool_schema(mut tool: Tool) -> Tool {
-    tool.description = Some(
-        match tool.name.as_ref() {
-            REPOSITORY_PROFILE_TOOL_NAME => "Inspect repository.",
-            REPOSITORY_INSTRUCTIONS_TOOL_NAME => "Read root instructions.",
-            FIND_FILES_TOOL_NAME => "Find files; terms and globs allowed.",
-            SEARCH_TEXT_TOOL_NAME => "Search text; pattern required.",
-            READ_FILE_TOOL_NAME => "Read one relative path.",
-            PROJECT_CAPABILITIES_TOOL_NAME => "Inspect capabilities.",
-            WORKFLOW_START_TOOL_NAME => "Start workflow; objective required.",
-            WORKFLOW_SET_PLAN_TOOL_NAME => "Set inspected plan.",
-            WORKFLOW_TRANSITION_TOOL_NAME => "Advance workflow phase.",
-            WORKFLOW_STATUS_TOOL_NAME => "Read workflow status.",
-            WORKFLOW_COMPLETE_TOOL_NAME => "Complete after review.",
-            APPLY_CHANGES_TOOL_NAME => "Apply versioned changes.",
-            WRITE_FILE_TOOL_NAME => "Create or update one file.",
-            ROLLBACK_CHANGES_TOOL_NAME => "Rollback change batch.",
-            RUN_PROCESS_TOOL_NAME => "Run validation process.",
-            RUN_VALIDATION_TOOL_NAME => "Run planned validation.",
-            REVIEW_CHANGES_TOOL_NAME => "Review retained changes.",
-            _ => "Compact coding workflow action.",
-        }
-        .into(),
-    );
+fn compact_native_tool_schema(mut tool: Tool, context: Option<&WorkflowToolContext>) -> Tool {
+    tool.description = Some(compact_native_tool_description(tool.name.as_ref(), context).into());
     tool.input_schema = match tool.name.as_ref() {
         REPOSITORY_PROFILE_TOOL_NAME | PROJECT_CAPABILITIES_TOOL_NAME => object!({
             "type": "object",
@@ -1299,7 +1482,10 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
             "properties": {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
-                "expected_digest": {"type": "string"}
+                "expected_digest": {
+                    "type": "string",
+                    "description": "Existing path: exact digest from read; omit for new path."
+                }
             }
         }),
         ROLLBACK_CHANGES_TOOL_NAME => object!({
@@ -1307,54 +1493,14 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
             "required": ["rollback_id"],
             "properties": {"rollback_id": {"type": "string"}}
         }),
-        RUN_PROCESS_TOOL_NAME => object!({
-            "type": "object",
-            "required": ["program"],
-            "properties": {
-                "program": {"type": "string"},
-                "args": {"type": "array", "items": {"type": "string"}},
-                "timeout_seconds": {"type": "integer"}
-            }
-        }),
-        WORKFLOW_SET_PLAN_TOOL_NAME => object!({
-            "type": "object",
-            "required": ["workflow_id", "relevant_files", "intended_change", "validation_program", "plan_steps"],
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "relevant_files": {"type": "array", "items": {"type": "string"}},
-                "intended_change": {"type": "string"},
-                "plan_steps": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 12,
-                    "description": "Concrete ordered task actions, never generic phases.",
-                    "items": {"type": "string"}
-                },
-                "validation_program": {"type": "string"},
-                "args": {"type": "array", "items": {"type": "string"}}
-            }
-        }),
-        WORKFLOW_TRANSITION_TOOL_NAME => object!({
-            "type": "object",
-            "required": ["workflow_id", "transition"],
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "transition": {"type": "string", "enum": ["begin_editing", "begin_validation", "begin_repair", "begin_review"]}
-            }
-        }),
+        RUN_PROCESS_TOOL_NAME => object!({"type": "object", "additionalProperties": false}),
+        WORKFLOW_SET_PLAN_TOOL_NAME => object!({"type": "object", "additionalProperties": false}),
+        WORKFLOW_TRANSITION_TOOL_NAME => object!({"type": "object", "additionalProperties": false}),
         WORKFLOW_STATUS_TOOL_NAME => object!({
             "type": "object",
             "properties": {"workflow_id": {"type": "string"}}
         }),
-        WORKFLOW_COMPLETE_TOOL_NAME => object!({
-            "type": "object",
-            "required": ["workflow_id", "summary", "remaining_risks"],
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "summary": {"type": "string"},
-                "remaining_risks": {"type": "array", "items": {"type": "string"}}
-            }
-        }),
+        WORKFLOW_COMPLETE_TOOL_NAME => object!({"type": "object", "additionalProperties": false}),
         RUN_VALIDATION_TOOL_NAME => object!({
             "type": "object",
             "required": ["command_id"],
@@ -1365,6 +1511,139 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
     }
     .into();
     tool
+}
+
+fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolContext>) -> String {
+    let generic = match name {
+            REPOSITORY_PROFILE_TOOL_NAME => "Inspect repository.",
+            REPOSITORY_INSTRUCTIONS_TOOL_NAME => "Read root instructions.",
+            FIND_FILES_TOOL_NAME => "Find files; terms and globs allowed.",
+            SEARCH_TEXT_TOOL_NAME => "Search text; pattern required.",
+            READ_FILE_TOOL_NAME => "Read one relative path.",
+            PROJECT_CAPABILITIES_TOOL_NAME => "Inspect capabilities.",
+            WORKFLOW_START_TOOL_NAME => "Start workflow; objective required.",
+            WORKFLOW_SET_PLAN_TOOL_NAME => {
+                "Record the concrete 3-step plan derived from inspected files and the retained task."
+            }
+            WORKFLOW_TRANSITION_TOOL_NAME => "Advance to the workflow's only valid next phase.",
+            WORKFLOW_STATUS_TOOL_NAME => "Read workflow status.",
+            WORKFLOW_COMPLETE_TOOL_NAME => "Complete after the recorded review.",
+            APPLY_CHANGES_TOOL_NAME => "Apply versioned changes.",
+            WRITE_FILE_TOOL_NAME => {
+                "Write one planned file in Editing only; existing paths require expected_digest from read."
+            }
+            ROLLBACK_CHANGES_TOOL_NAME => "Rollback change batch.",
+            RUN_PROCESS_TOOL_NAME => "Run the workflow's exact planned validation in Testing only.",
+            RUN_VALIDATION_TOOL_NAME => {
+                "Run only a command_id from project capabilities."
+            }
+            REVIEW_CHANGES_TOOL_NAME => "Review only after validation in Reviewing.",
+            _ => "Compact coding workflow action.",
+    };
+    let Some(context) = context else {
+        return match name {
+            WORKFLOW_START_TOOL_NAME => {
+                "No workflow is active. For a requested change, call this first with the task objective."
+                    .to_string()
+            }
+            FIND_FILES_TOOL_NAME
+            | SEARCH_TEXT_TOOL_NAME
+            | READ_FILE_TOOL_NAME
+            | WORKFLOW_SET_PLAN_TOOL_NAME
+            | WORKFLOW_TRANSITION_TOOL_NAME
+            | WRITE_FILE_TOOL_NAME
+            | RUN_PROCESS_TOOL_NAME
+            | RUN_VALIDATION_TOOL_NAME
+            | REVIEW_CHANGES_TOOL_NAME
+            | WORKFLOW_COMPLETE_TOOL_NAME => {
+                "No workflow is active. Do not call this yet; start the workflow first.".to_string()
+            }
+            _ => generic.to_string(),
+        };
+    };
+    let status = &context.status;
+    if name == WORKFLOW_START_TOOL_NAME
+        && !matches!(
+            status.phase,
+            WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed
+        )
+    {
+        return "A workflow is already active. Do not start another one. Follow the current phase \
+                and use its next allowed action."
+            .to_string();
+    }
+    if status.phase == WorkflowPhase::Reviewing && context.completion_ready {
+        return if name == WORKFLOW_COMPLETE_TOOL_NAME {
+            "The review is complete. This is the only allowed action: call it now with a concise \
+             evidence-backed summary naming the changed file and successful validation, plus \
+             remaining_risks as an array (use [] when none remain)."
+                .to_string()
+        } else {
+            "The review is complete. Do not call this tool again. The only allowed action is \
+             coding__workflow_complete now with an evidence-backed summary and \
+             remaining_risks."
+                .to_string()
+        };
+    }
+    match (status.phase, name) {
+        (WorkflowPhase::Analyzing | WorkflowPhase::Searching, FIND_FILES_TOOL_NAME)
+            if !status.memory.read_files.is_empty() =>
+        {
+            "Relevant files are already read. Do not search again; call coding__workflow_set_plan \
+             now with the returned paths and a concrete change, validation, and review plan."
+                .to_string()
+        }
+        (WorkflowPhase::Analyzing | WorkflowPhase::Searching, WORKFLOW_SET_PLAN_TOOL_NAME) => {
+            "Current phase: Searching. After returned relevant files have been read, call this now with a 3-6 step plan: exact behavior change and file; exact validation command and expected outcome; then read-back and review. Do not submit a one-line or vague plan."
+                .to_string()
+        }
+        (WorkflowPhase::Analyzing | WorkflowPhase::Searching, WORKFLOW_TRANSITION_TOOL_NAME) => {
+            "Current phase: Searching. Do not transition; inspect relevant files and set the plan first."
+                .to_string()
+        }
+        (WorkflowPhase::Planning, WORKFLOW_TRANSITION_TOOL_NAME) => {
+            "Current phase: Planning. Call this now with transition `begin_editing`.".to_string()
+        }
+        (WorkflowPhase::Planning, WORKFLOW_SET_PLAN_TOOL_NAME) => {
+            "The plan is already accepted. Do not call this again; transition to Editing.".to_string()
+        }
+        (WorkflowPhase::Editing, WRITE_FILE_TOOL_NAME) if status.changed_files.is_empty() => {
+            "Current phase: Editing. Write one planned file now; read an existing file first.".to_string()
+        }
+        (WorkflowPhase::Editing, WORKFLOW_TRANSITION_TOOL_NAME) if !status.changed_files.is_empty() => {
+            "Current phase: Editing with a retained change. Call this now with transition `begin_validation`.".to_string()
+        }
+        (WorkflowPhase::Editing, PROJECT_CAPABILITIES_TOOL_NAME) if !status.changed_files.is_empty() => {
+            "A planned change exists. Do not inspect capabilities; transition to Validation.".to_string()
+        }
+        (WorkflowPhase::Testing, RUN_PROCESS_TOOL_NAME) => status
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.validation.iter().find(|check| check.required))
+            .and_then(|check| serde_json::to_string(&check.command.args).ok().map(|args| {
+                format!(
+                    "Current phase: Testing. Run this exact planned check now: program `{}`, args {}.",
+                    check.command.program, args
+                )
+            }))
+            .unwrap_or_else(|| generic.to_string()),
+        (WorkflowPhase::Testing, RUN_VALIDATION_TOOL_NAME) => {
+            "Use this only for an exact command_id already returned by Project Capabilities; otherwise run the plan with Run Process.".to_string()
+        }
+        (WorkflowPhase::Testing, PROJECT_CAPABILITIES_TOOL_NAME) => {
+            "Do not call this again unless project files changed. Run the planned check with Run Process.".to_string()
+        }
+        (WorkflowPhase::Testing, WORKFLOW_TRANSITION_TOOL_NAME) => {
+            "Do not transition yet. Run the planned validation process first.".to_string()
+        }
+        (WorkflowPhase::Reviewing, REVIEW_CHANGES_TOOL_NAME) if !context.completion_ready => {
+            "Current phase: Reviewing. Run this review now before completion.".to_string()
+        }
+        (WorkflowPhase::Reviewing, WORKFLOW_COMPLETE_TOOL_NAME) if context.completion_ready => {
+            "The review is complete. Finish the workflow with its evidence-backed summary.".to_string()
+        }
+        _ => generic.to_string(),
+    }
 }
 
 fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> {
@@ -1847,13 +2126,16 @@ pub(crate) async fn execute_async(
         }
         REVIEW_CHANGES_TOOL_NAME => {
             let request: GitDiffRequest = parse_arguments(&tool_call)?;
-            let repository = GitRepository::open(&workspace, git_limits(config, 2_000))
-                .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
-            let diff = repository
-                .diff(request)
-                .await
-                .map_err(|error| invalid_arguments(error.to_string()))?;
+            let diff = match GitRepository::open(&workspace, git_limits(config, 2_000)).await {
+                Ok(repository) => repository
+                    .diff(request.clone())
+                    .await
+                    .map_err(|error| invalid_arguments(error.to_string()))?,
+                Err(GitError::NotRepository) if !request.staged => {
+                    state.recorded_mutation_diff(workspace.root(), &request)
+                }
+                Err(error) => return Err(invalid_arguments(error.to_string())),
+            };
             let review = ReviewAnalyzer::analyze(&diff);
             state.record_review(workspace.root(), &review)?;
             bounded_review_result(review, config.output_limit)
@@ -2006,7 +2288,7 @@ pub(crate) fn execute_with_state(
                 },
             )
             .map_err(|error| invalid_arguments(error.to_string()))?;
-            state.note_read_files(workspace.root(), vec![snapshot.path.clone()]);
+            state.note_read_snapshot(workspace.root(), &snapshot);
             json_result(&snapshot, config.output_limit)
         }
         PREVIEW_CHANGES_TOOL_NAME => {
@@ -2040,7 +2322,7 @@ pub(crate) fn execute_with_state(
             json_result(&applied.result, config.output_limit)
         }
         WRITE_FILE_TOOL_NAME => {
-            let params: WriteFileParams = parse_arguments(&tool_call)?;
+            let mut params: WriteFileParams = parse_arguments(&tool_call)?;
             let write_path = workspace
                 .resolve_for_write(&params.path)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
@@ -2049,6 +2331,13 @@ pub(crate) fn execute_with_state(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(invalid_arguments(error.to_string())),
             };
+            if path_exists && params.expected_digest.is_none() {
+                let relative_path = write_path
+                    .strip_prefix(workspace.root())
+                    .map(Path::to_path_buf)
+                    .map_err(|_| invalid_arguments("write path escaped the workspace"))?;
+                params.expected_digest = state.last_read_digest(workspace.root(), &relative_path);
+            }
             let updating_existing_file = path_exists && params.expected_digest.is_some();
             let mut change = serde_json::Map::new();
             change.insert(
@@ -2210,6 +2499,11 @@ pub(crate) fn execute_with_state(
                 parse_arguments::<WorkflowSetPlanParams>(&tool_call)?
             } else {
                 let compact: WorkflowCompactPlanParams = parse_arguments(&tool_call)?;
+                if compact.intended_change.trim().is_empty() {
+                    return Err(invalid_arguments(
+                        "intended_change must be one non-empty sentence; plan field `intended changes` is required",
+                    ));
+                }
                 WorkflowSetPlanParams {
                     workflow_id: compact.workflow_id.clone(),
                     plan: compact.into_plan(),
@@ -2218,9 +2512,9 @@ pub(crate) fn execute_with_state(
             if params.plan.relevant_files.is_empty() {
                 return Err(invalid_arguments(
                     "`plan.relevant_files` must list workspace-relative paths affected by the \
-                     plan. In an empty or greenfield project, list the intended new paths (for \
-                     example `pyproject.toml`, `src/package/__init__.py`, and `tests/test_package.py`); \
-                     do not send an empty array.",
+                     plan. For a greenfield project, include the intended new paths (for example \
+                     `pyproject.toml`). Use actual paths returned by repository discovery; do not \
+                     infer paths or send an empty array.",
                 ));
             }
             normalize_plan_paths(&workspace, &mut params.plan)?;
@@ -3277,6 +3571,7 @@ fn review_changes_tool() -> Tool {
     Tool::new(
         REVIEW_CHANGES_TOOL_NAME.to_string(),
         "Review bounded staged or unstaged local Git changes without executing repository code. \
+         In a non-Git workspace, review the agent's retained mutation previews instead. \
          Reports conservative security, reliability, error-handling, maintainability, and debug \
          findings with exact paths and added-line numbers. Sensitive files and secret values are \
          omitted."
@@ -4133,10 +4428,10 @@ impl WorkflowCompactPlanParams {
         }
         let validation_id = "required-validation".to_string();
         let expected_files = self.relevant_files.clone();
-        let intended_changes = if self.plan_steps.is_empty() {
-            vec![self.intended_change]
-        } else {
+        let intended_changes = if (3..=6).contains(&self.plan_steps.len()) {
             self.plan_steps
+        } else {
+            compact_plan_steps(&self.relevant_files, &self.intended_change, &program, &args)
         };
         WorkflowPlan {
             affected_components: self
@@ -4181,6 +4476,30 @@ impl WorkflowCompactPlanParams {
                     .to_string(),
         }
     }
+}
+
+fn compact_plan_steps(
+    relevant_files: &[PathBuf],
+    intended_change: &str,
+    program: &str,
+    args: &[String],
+) -> Vec<String> {
+    let files = relevant_files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let command = if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    };
+
+    vec![
+        format!("Change {files}: {intended_change}"),
+        format!("Run `{command}` and require a successful exit status."),
+        format!("Read {files} again and review only the retained planned change."),
+    ]
 }
 
 #[derive(Debug, Deserialize)]
@@ -4471,7 +4790,7 @@ mod tests {
             config,
             state,
             CallToolRequestParams::new(WORKFLOW_TRANSITION_TOOL_NAME).with_arguments(object!({
-                "workflow_id": workflow_id,
+                    "workflow_id": workflow_id,
                 "transition": transition
             })),
             root,
@@ -4545,6 +4864,186 @@ mod tests {
         .unwrap();
         transition(config, state, root, &workflow_id, "begin_editing");
         workflow_id
+    }
+
+    #[test]
+    fn unavailable_validation_capability_uses_the_planned_process_command() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let initial_start_description = state
+            .compact_native_definitions_for_workspace(workspace.root())
+            .into_iter()
+            .find(|tool| tool.name == WORKFLOW_START_TOOL_NAME)
+            .and_then(|tool| tool.description)
+            .unwrap()
+            .into_owned();
+        assert!(initial_start_description.contains("No workflow is active"));
+        let initial_read_description = state
+            .compact_native_definitions_for_workspace(workspace.root())
+            .into_iter()
+            .find(|tool| tool.name == READ_FILE_TOOL_NAME)
+            .and_then(|tool| tool.description)
+            .unwrap()
+            .into_owned();
+        assert!(initial_read_description.contains("start the workflow first"));
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "validate a Python fixture"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let workflow_id = serde_json::from_str::<Value>(&result_text(started)).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let searching_plan_description = state
+            .compact_native_definitions_for_workspace(workspace.root())
+            .into_iter()
+            .find(|tool| tool.name == WORKFLOW_SET_PLAN_TOOL_NAME)
+            .and_then(|tool| tool.description)
+            .unwrap()
+            .into_owned();
+        assert!(searching_plan_description.contains("Current phase: Searching"));
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
+                "workflow_id": workflow_id,
+                "relevant_files": ["normalizer.py"],
+                "intended_change": "Normalize status values to lowercase.",
+                "plan_steps": [
+                    "Update normalizer.py to normalize statuses as lowercase.",
+                    "Run python3 -m unittest -v and require a passing result.",
+                    "Read normalizer.py again and review only the retained change."
+                ],
+                "validation_program": "python3",
+                "args": ["-m", "unittest", "-v"]
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let mut status = state.workflow_status(workspace.root(), None).unwrap();
+        status.phase = WorkflowPhase::Testing;
+        status.memory.capability_feedback.push(
+            crate::coding::workflow::CapabilityFeedbackEvidence {
+                revision: status.revision,
+                capability: "required-validation".to_string(),
+                state: TaskCapabilityState::Unavailable,
+            },
+        );
+
+        let guidance = capability_recovery_guidance(&status);
+
+        assert!(guidance.contains("coding__run_process"));
+        assert!(guidance.contains("program `python3`"));
+        assert!(guidance.contains("[\"-m\",\"unittest\",\"-v\"]"));
+        assert!(guidance.contains("Do not call coding__project_capabilities again"));
+    }
+
+    #[test]
+    fn compact_tools_describe_the_current_workflow_action_without_changing_names() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let workspace = CodingWorkspace::new(temp_dir.path()).unwrap();
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "validate a Python fixture"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let workflow_id = serde_json::from_str::<Value>(&result_text(started)).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
+                "workflow_id": workflow_id.clone(),
+                "plan": {
+                    "affected_components": ["fixture"],
+                    "relevant_files": ["result.txt"],
+                    "risks": [],
+                    "intended_changes": ["write the fixture result"],
+                    "requirements": [{
+                        "id": "implementation",
+                        "description": "write result.txt",
+                        "source": "user",
+                        "priority": "high",
+                        "mandatory": true,
+                        "verification": {"expected_files": ["result.txt"], "check_ids": ["python-tests"]}
+                    }],
+                    "tests": [],
+                    "validation": [{
+                        "id": "python-tests",
+                        "description": "run Python tests",
+                        "command": {"program": "python3", "args": ["-m", "unittest", "-v"], "cwd": "."},
+                        "required": true
+                    }],
+                    "rollback_strategy": "remove result.txt"
+                }
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let description = |name: &str| {
+            state
+                .compact_native_definitions_for_workspace(workspace.root())
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.description)
+                .unwrap()
+                .into_owned()
+        };
+        assert!(description(WORKFLOW_START_TOOL_NAME).contains("already active"));
+        assert!(description(WORKFLOW_TRANSITION_TOOL_NAME).contains("begin_editing"));
+
+        transition(
+            &config,
+            &state,
+            temp_dir.path(),
+            &workflow_id,
+            "begin_editing",
+        );
+        assert!(description(WRITE_FILE_TOOL_NAME).contains("Write one planned file now"));
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "result.txt",
+                "content": "ready\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        transition(
+            &config,
+            &state,
+            temp_dir.path(),
+            &workflow_id,
+            "begin_validation",
+        );
+
+        let process_description = description(RUN_PROCESS_TOOL_NAME);
+        assert!(process_description.contains("program `python3`"));
+        assert!(process_description.contains("[\"-m\",\"unittest\",\"-v\"]"));
+        assert_eq!(
+            state
+                .compact_native_definitions_for_workspace(workspace.root())
+                .len(),
+            16
+        );
     }
 
     #[test]
@@ -4716,6 +5215,73 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
             "<h1>America</h1>\n"
+        );
+    }
+
+    #[test]
+    fn write_file_requires_a_read_before_omitting_an_existing_file_digest() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        fs::write(
+            temp_dir.path().join("normalizer.py"),
+            "return value.strip()\n",
+        )
+        .unwrap();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["normalizer.py"]);
+
+        let error = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "normalizer.py",
+                "content": "return value.strip().lower()\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("file already exists"));
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("normalizer.py")).unwrap(),
+            "return value.strip()\n"
+        );
+    }
+
+    #[test]
+    fn write_file_uses_the_latest_read_digest_when_it_is_omitted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        fs::write(
+            temp_dir.path().join("normalizer.py"),
+            "return value.strip()\n",
+        )
+        .unwrap();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["normalizer.py"]);
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(READ_FILE_TOOL_NAME)
+                .with_arguments(object!({"path": "normalizer.py"})),
+            temp_dir.path(),
+        )
+        .unwrap();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "normalizer.py",
+                "content": "return value.strip().lower()\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("normalizer.py")).unwrap(),
+            "return value.strip().lower()\n"
         );
     }
 
@@ -4915,7 +5481,8 @@ mod tests {
                 "intended_change": "normalize labels as lowercase",
                 "plan_steps": [
                     "Update lib.rs to normalize labels as lowercase",
-                    "Run the library test suite"
+                    "Run the library test suite and require it to pass",
+                    "Read lib.rs again and review the retained change"
                 ],
                 "validation_program": "cargo test --lib",
                 "args": ["--no-fail-fast"]
@@ -4931,10 +5498,11 @@ mod tests {
             planned["plan"]["intended_changes"],
             serde_json::json!([
                 "Update lib.rs to normalize labels as lowercase",
-                "Run the library test suite"
+                "Run the library test suite and require it to pass",
+                "Read lib.rs again and review the retained change"
             ])
         );
-        assert_eq!(planned["plan"]["requirements"].as_array().unwrap().len(), 2);
+        assert_eq!(planned["plan"]["requirements"].as_array().unwrap().len(), 3);
         assert_eq!(
             planned["plan"]["validation"][0]["command"]["program"],
             "cargo"
@@ -4962,6 +5530,72 @@ mod tests {
             plan.validation[0].command.args,
             vec!["--check".to_string(), "script.js".to_string()]
         );
+    }
+
+    #[test]
+    fn compact_plan_without_steps_generates_change_validation_and_review_steps() {
+        let plan = WorkflowCompactPlanParams {
+            workflow_id: serde_json::from_str("\"workflow_00000000-0000-7000-8000-000000000000\"")
+                .unwrap(),
+            relevant_files: vec![PathBuf::from("normalizer.py")],
+            intended_change: "normalize values as lowercase".to_string(),
+            plan_steps: Vec::new(),
+            validation_program: "python3 -m unittest -v".to_string(),
+            args: Vec::new(),
+        }
+        .into_plan();
+
+        assert_eq!(plan.intended_changes.len(), 3);
+        assert_eq!(
+            plan.intended_changes[0],
+            "Change normalizer.py: normalize values as lowercase"
+        );
+        assert_eq!(
+            plan.intended_changes[1],
+            "Run `python3 -m unittest -v` and require a successful exit status."
+        );
+        assert_eq!(
+            plan.intended_changes[2],
+            "Read normalizer.py again and review only the retained planned change."
+        );
+    }
+
+    #[test]
+    fn workflow_guidance_moves_from_reading_to_planning_without_repeating_discovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "repair the normalizer"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let workspace_root = temp_dir.path().canonicalize().unwrap();
+        state.note_read_files(&workspace_root, vec![PathBuf::from("normalizer.py")]);
+
+        let guidance = state
+            .workflow_guidance_for_workspace(&workspace_root)
+            .unwrap();
+        assert!(guidance.contains("Do not repeat coding__find_files"));
+        assert!(guidance.contains(WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert_eq!(
+            state.compact_preferred_tool_name_for_workspace(&workspace_root),
+            Some(WORKFLOW_SET_PLAN_TOOL_NAME)
+        );
+
+        let find_description = state
+            .compact_native_definitions_for_workspace(&workspace_root)
+            .into_iter()
+            .find(|tool| tool.name == FIND_FILES_TOOL_NAME)
+            .and_then(|tool| tool.description)
+            .unwrap()
+            .into_owned();
+        assert!(find_description.contains("Do not search again"));
     }
 
     #[test]
@@ -5348,6 +5982,41 @@ mod tests {
         .await
         .unwrap();
         assert!(exposed_tool_names(&state, temp_dir.path()).contains(WORKFLOW_COMPLETE_TOOL_NAME));
+        assert_eq!(
+            state.compact_preferred_tool_name_for_workspace(
+                &temp_dir
+                    .path()
+                    .canonicalize()
+                    .expect("canonical workspace path"),
+            ),
+            Some(WORKFLOW_COMPLETE_TOOL_NAME)
+        );
+        let complete_description = state
+            .compact_native_definitions_for_workspace(
+                &temp_dir
+                    .path()
+                    .canonicalize()
+                    .expect("canonical workspace path"),
+            )
+            .into_iter()
+            .find(|tool| tool.name == WORKFLOW_COMPLETE_TOOL_NAME)
+            .and_then(|tool| tool.description)
+            .expect("workflow completion description")
+            .into_owned();
+        let repeated_review_description = state
+            .compact_native_definitions_for_workspace(
+                &temp_dir
+                    .path()
+                    .canonicalize()
+                    .expect("canonical workspace path"),
+            )
+            .into_iter()
+            .find(|tool| tool.name == REVIEW_CHANGES_TOOL_NAME)
+            .and_then(|tool| tool.description)
+            .expect("review description")
+            .into_owned();
+        assert!(complete_description.contains("only allowed action"));
+        assert!(repeated_review_description.contains("Do not call this tool again"));
         let completed = execute_with_state(
             &config,
             &state,
@@ -6095,6 +6764,45 @@ mod tests {
         assert_eq!(report["findings"][0]["path"], "src/app.rs");
         assert_eq!(report["findings"][0]["line"], 1);
         assert!(!text.contains("abcdefgh"));
+    }
+
+    #[tokio::test]
+    async fn reviews_agent_owned_mutation_without_a_git_repository() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let workflow_id = begin_editing_workflow(&config, &state, temp_dir.path(), &["app.py"]);
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "app.py",
+                "content": "def normalize(value):\n    return value.lower()\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        transition(
+            &config,
+            &state,
+            temp_dir.path(),
+            &workflow_id,
+            "begin_review",
+        );
+
+        let result = execute_async(
+            &config,
+            &state,
+            CallToolRequestParams::new(REVIEW_CHANGES_TOOL_NAME),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let report: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert_eq!(report["files"], serde_json::json!(["app.py"]));
+        assert!(exposed_tool_names(&state, temp_dir.path()).contains(WORKFLOW_COMPLETE_TOOL_NAME));
     }
 
     #[tokio::test]

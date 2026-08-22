@@ -11,7 +11,6 @@ const createDropdownRef = (): React.RefObject<HTMLDivElement> =>
 
 let mockCurrentModel: string | null = 'config-model';
 let mockCurrentProvider: string | null = 'config-provider';
-const mockGetProviders = vi.fn();
 const mockOnModelChanged = vi.fn();
 
 vi.mock('../../../ModelAndProviderContext', () => ({
@@ -19,16 +18,6 @@ vi.mock('../../../ModelAndProviderContext', () => ({
     currentModel: mockCurrentModel,
     currentProvider: mockCurrentProvider,
   }),
-}));
-
-vi.mock('../../../ConfigContext', () => ({
-  useConfig: () => ({
-    getProviders: mockGetProviders,
-  }),
-}));
-
-vi.mock('../modelInterface', () => ({
-  getProviderMetadata: vi.fn().mockResolvedValue({ display_name: 'Config Provider' }),
 }));
 
 vi.mock('../predefinedModelsUtils', () => ({
@@ -59,7 +48,6 @@ describe('ModelsBottomBar', () => {
     vi.clearAllMocks();
     mockCurrentModel = 'config-model';
     mockCurrentProvider = 'config-provider';
-    mockGetProviders.mockResolvedValue([]);
   });
 
   it('shows a loading placeholder while the active session model is still loading', async () => {

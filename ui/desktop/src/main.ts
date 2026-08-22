@@ -36,6 +36,7 @@ import { ensureWinShims } from './utils/winShims';
 import { addRecentDir, loadRecentDirs } from './utils/recentDirs';
 import { formatAppName, errorMessage, formatErrorForLogging } from './utils/conversionUtils';
 import { isRetiredPonduinChatApp } from './utils/retiredApps';
+import { taskWorkingDirectory } from './utils/taskWorkingDirectory';
 import type { FileAccessScope, Settings, SettingKey } from './utils/settings';
 import { defaultSettings, getKeyboardShortcuts } from './utils/settings';
 import * as crypto from 'crypto';
@@ -924,20 +925,6 @@ const getServerSecret = (settings: Settings): string => {
   return GENERATED_SECRET;
 };
 
-function workingDirectoryForAccessScope(
-  requestedDirectory: string,
-  scope: FileAccessScope
-): string {
-  switch (scope) {
-    case 'workspace':
-      return requestedDirectory;
-    case 'user':
-      return os.homedir();
-    case 'computer':
-      return path.parse(os.homedir()).root;
-  }
-}
-
 const getActiveExternalBackend = (settings: Settings): ExternalBackend | null => {
   const envBackend = getExternalBackendFromEnv();
   if (envBackend) {
@@ -1073,7 +1060,7 @@ const createChat = async (
   }
 
   const serverSecret = externalBackend ? externalBackend.secret : GENERATED_SECRET;
-  let workingDir = workingDirectoryForAccessScope(
+  let workingDir = taskWorkingDirectory(
     dir || os.homedir(),
     settings.fileAccessScope
   );

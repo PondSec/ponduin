@@ -1148,6 +1148,31 @@ impl TaskIntent {
         {
             Self::Create
         } else if [
+            "make a change",
+            "make changes",
+            "correct change",
+            "apply a change",
+            "apply changes",
+            "change the",
+            "edit ",
+            "modify",
+            "update",
+            "implement",
+            "refactor",
+            "rewrite",
+            "ändern",
+            "aendern",
+            "bearbeiten",
+            "aktualisieren",
+            "implementieren",
+            "refaktor",
+            "umschreiben",
+        ]
+        .iter()
+        .any(|term| request.contains(term))
+        {
+            Self::Modify
+        } else if [
             "analyse",
             "analys",
             "analyze",
@@ -2984,6 +3009,16 @@ mod tests {
                 "Create index.html, styles.css, and script.js. Work through inspection and validation."
             ),
             TaskIntent::Create
+        );
+    }
+
+    #[test]
+    fn modification_intent_wins_over_inspection_when_a_change_is_requested() {
+        assert_eq!(
+            TaskIntent::detect(
+                "Inspect this small Python project. Make the smallest correct change so the tests pass."
+            ),
+            TaskIntent::Modify
         );
     }
 

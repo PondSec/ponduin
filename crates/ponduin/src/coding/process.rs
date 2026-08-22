@@ -3,7 +3,7 @@ use crate::coding::workspace::{CodingWorkspace, WorkspaceError};
 use crate::subprocess::configure_subprocess;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -607,7 +607,6 @@ fn classify_command(program: &str, args: &[String]) -> Result<(), ProcessError> 
 
 fn apply_minimal_environment(command: &mut Command, process_temp: &Path) {
     const INHERITED: &[&str] = &[
-        "PATH",
         "HOME",
         "USER",
         "LOGNAME",
@@ -625,6 +624,7 @@ fn apply_minimal_environment(command: &mut Command, process_temp: &Path) {
         }
     }
     command
+        .env("PATH", controlled_search_path())
         .env("TMPDIR", process_temp)
         .env("TEMP", process_temp)
         .env("TMP", process_temp)
@@ -636,6 +636,40 @@ fn apply_minimal_environment(command: &mut Command, process_temp: &Path) {
         .env("PAGER", "cat")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("PONDUIN_CODING_AGENT", "1");
+}
+
+fn controlled_search_path() -> OsString {
+    #[cfg(target_os = "macos")]
+    const FALLBACK_DIRECTORIES: &[&str] = &[
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    const FALLBACK_DIRECTORIES: &[&str] = &[
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ];
+    #[cfg(windows)]
+    const FALLBACK_DIRECTORIES: &[&str] = &[];
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut directories = std::env::split_paths(&inherited).collect::<Vec<_>>();
+    for directory in FALLBACK_DIRECTORIES {
+        let directory = PathBuf::from(directory);
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+
+    std::env::join_paths(directories).unwrap_or(inherited)
 }
 
 fn default_cwd() -> PathBuf {
@@ -752,6 +786,16 @@ mod tests {
     #[cfg(windows)]
     fn python_program() -> &'static str {
         "python"
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn controlled_search_path_includes_common_macos_executable_directories() {
+        let directories = std::env::split_paths(&controlled_search_path()).collect::<Vec<_>>();
+
+        assert!(directories.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(directories.contains(&PathBuf::from("/usr/local/bin")));
+        assert!(directories.contains(&PathBuf::from("/usr/bin")));
     }
 
     #[cfg(unix)]

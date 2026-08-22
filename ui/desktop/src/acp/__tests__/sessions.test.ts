@@ -1,7 +1,12 @@
 import type { SessionInfo } from '@agentclientprotocol/sdk';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getAcpClient } from '../acpConnection';
-import { acpGetSessionListItem, acpLoadSession, sessionInfoToSession } from '../sessions';
+import {
+  acpGetSessionListItem,
+  acpLoadSession,
+  isAcpSessionLoadInFlight,
+  sessionInfoToSession,
+} from '../sessions';
 
 vi.mock('../acpConnection', () => ({
   getAcpClient: vi.fn(),
@@ -74,6 +79,33 @@ describe('ACP sessions', () => {
     expect(sessionInfoToSession(result.sessionInfo).model_config?.model_name).toBe(
       'claude-sonnet-4-5'
     );
+  });
+
+  it('times out a stalled load and clears its in-flight marker', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = {
+        ponduin: {
+          sessionInfo_unstable: vi.fn().mockImplementation(() => new Promise(() => {})),
+        },
+      };
+      vi.mocked(getAcpClient).mockResolvedValue(
+        client as unknown as Awaited<ReturnType<typeof getAcpClient>>
+      );
+
+      const pendingLoad = acpLoadSession('stalled-session');
+      expect(isAcpSessionLoadInFlight('stalled-session')).toBe(true);
+      const rejectedLoad = expect(pendingLoad).rejects.toThrow(
+        'Loading the conversation timed out'
+      );
+
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await rejectedLoad;
+      expect(isAcpSessionLoadInFlight('stalled-session')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('returns a list item from ACP session info', async () => {

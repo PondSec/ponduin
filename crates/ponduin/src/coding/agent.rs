@@ -69,6 +69,12 @@ impl CodingAgent {
             .workflow_guidance_for_workspace(workspace.root())
     }
 
+    pub(crate) fn compact_preferred_tool_name(&self, working_dir: &Path) -> Option<&'static str> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        self.tool_state
+            .compact_preferred_tool_name_for_workspace(workspace.root())
+    }
+
     pub(crate) fn register_task_context(
         &self,
         ponduin_mode: PonduinMode,
@@ -124,6 +130,28 @@ impl CodingAgent {
     pub(crate) fn terminal_workflow_message(&self, working_dir: &Path) -> Option<String> {
         let workspace = CodingWorkspace::new(working_dir).ok()?;
         self.tool_state.terminal_workflow_message(workspace.root())
+    }
+
+    pub(crate) fn completed_workflow_message(&self, working_dir: &Path) -> Option<String> {
+        let workspace = CodingWorkspace::new(working_dir).ok()?;
+        let status = self.tool_state.active_workflow_status(workspace.root())?;
+        if status.phase != crate::coding::workflow::WorkflowPhase::Completed {
+            return None;
+        }
+        let changed_files = status
+            .changed_files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let changed_files = if changed_files.is_empty() {
+            "no workspace files".to_string()
+        } else {
+            changed_files.join(", ")
+        };
+        Some(format!(
+            "Workflow completed with recorded validation and review evidence. Changed files: {changed_files}. Validation runs: {}.",
+            status.validation_count
+        ))
     }
 
     pub(crate) fn block_for_action_limit(&self, working_dir: &Path, limit: u32) {
@@ -195,10 +223,17 @@ impl CodingAgent {
         let compact_tool_guidance = if uses_compact_qwen_coding_tools(model_config) {
             "When work remains, call exactly one suitable tool for the next smallest verified step \
              and emit no prose before it. Do not announce a tool or wait for a helper: only a \
-             valid call from the disclosed tools advances the task. The compact tool contract is \
-             intentional: use only the fields it shows, then use the returned result before \
-             choosing the next action. For a file creation or update, use coding__write_file for \
-             one file at a time; do not serialize a change batch inside a string."
+             valid call from the disclosed tools advances the task. Never write a tool call, JSON, \
+             or a code fence as prose; invoke the native tool interface. The compact tool contract \
+             is intentional: use only the fields it shows, then use the returned result before \
+             choosing the next action. Follow the workflow sequence: start, inspect, set plan, \
+             begin_editing, write, begin_validation, run the plan's exact program and args with \
+             coding__run_process, begin_review, review, then complete. Use \
+             coding__run_validation only after coding__project_capabilities returned its exact \
+             command_id. For a file creation or update, use coding__write_file for one file at a \
+             time; do not serialize a change batch inside a string. For an existing file, first \
+             read it and include its exact returned digest as expected_digest in the write; for a \
+             new file omit expected_digest."
         } else {
             ""
         };
@@ -281,8 +316,19 @@ impl CodingAgent {
         }
         let workspace = CodingWorkspace::new(working_dir)
             .map_err(|error| ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None))?;
+        if ponduin_mode == PonduinMode::Auto
+            && matches!(
+                tool_call.name.as_ref(),
+                tools::FIND_FILES_TOOL_NAME | tools::READ_FILE_TOOL_NAME
+            )
+        {
+            self.tool_state
+                .start_pending_autonomous_workflow(workspace.root(), &self.config)?;
+        }
         self.fill_missing_workflow_objective(&mut tool_call, workspace.root());
+        self.fill_placeholder_workflow_id(&mut tool_call, workspace.root());
         normalize_structured_tool_arguments(&mut tool_call);
+        self.fill_compact_workflow_defaults(&mut tool_call, workspace.root());
         let exposed = self.tool_state.definitions_for_workspace(workspace.root());
         if !exposed.iter().any(|tool| tool.name == tool_call.name) {
             let next_tools = exposed
@@ -354,7 +400,15 @@ impl CodingAgent {
         let recovery = match repetitions {
             1 if error.message.contains("not currently allowed") => {
                 next_step_guidance.as_deref().unwrap_or(
-                    "The request was blocked. Read the active workflow status and take its next allowed step before retrying.",
+                    "No coding workflow is active. Call coding__workflow_start now with a concise \
+                     objective; then inspect the required files and set the plan before retrying \
+                     any write or process tool.",
+                )
+            }
+            1 if tool_name == tools::RUN_VALIDATION_TOOL_NAME => {
+                next_step_guidance.as_deref().unwrap_or(
+                    "Do not retry coding__run_validation without an exact discovered command id. \
+                     Call coding__run_process with the plan's executable and args instead.",
                 )
             }
             1 if is_versioned_mutation_tool(tool_name)
@@ -408,10 +462,16 @@ impl CodingAgent {
             }
             1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
                 && error.message.contains("plan field `intended changes`") => {
-                "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"] with the current workflow_id."
+                "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"]. Do not include workflow_id."
+            }
+            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME => {
+                "Use only relevant_files, intended_change, validation_program, and optional args. \
+                 validation_program must start with an executable, never an explanatory sentence. \
+                 For Python tests use validation_program \"python3\" and args [\"-m\", \
+                 \"unittest\", \"-v\"]. Do not include workflow_id."
             }
             1 => "The request was not executed. Correct the tool name and arguments from the currently exposed schema before retrying.",
-            2 => "Do not repeat this tool contract. Call coding__find_files with one concrete filename or symbol next, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
+            2 => "Do not repeat this tool contract. Call coding__find_files with a source-file glob suitable for the repository language, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
             _ => "The workflow is now blocked after repeated identical tool-contract failures. Report the recorded stop reason and do not claim success.",
         };
         ErrorData::new(
@@ -453,6 +513,263 @@ impl CodingAgent {
                 Value::String(task.normalized_objective),
             );
     }
+
+    fn fill_placeholder_workflow_id(
+        &self,
+        tool_call: &mut CallToolRequestParams,
+        workspace_root: &Path,
+    ) {
+        if !matches!(
+            tool_call.name.as_ref(),
+            tools::WORKFLOW_SET_PLAN_TOOL_NAME
+                | tools::WORKFLOW_TRANSITION_TOOL_NAME
+                | tools::WORKFLOW_COMPLETE_TOOL_NAME
+        ) {
+            return;
+        }
+        let placeholder = tool_call
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("workflow_id"))
+            .and_then(Value::as_str)
+            .is_none_or(|workflow_id| {
+                let workflow_id = workflow_id.trim();
+                workflow_id.is_empty()
+                    || (workflow_id.starts_with("{{") && workflow_id.ends_with("}}"))
+            });
+        if !placeholder {
+            return;
+        }
+        let Some(workflow_id) = self.tool_state.active_workflow_id(workspace_root) else {
+            return;
+        };
+        tool_call
+            .arguments
+            .get_or_insert_with(Default::default)
+            .insert(
+                "workflow_id".to_string(),
+                Value::String(workflow_id.to_string()),
+            );
+    }
+
+    fn fill_compact_workflow_defaults(
+        &self,
+        tool_call: &mut CallToolRequestParams,
+        workspace_root: &Path,
+    ) {
+        let Some(status) = self.tool_state.active_workflow_status(workspace_root) else {
+            return;
+        };
+        let tool_name = tool_call.name.clone();
+        let arguments = tool_call.arguments.get_or_insert_with(Default::default);
+
+        match tool_name.as_ref() {
+            tools::WORKFLOW_SET_PLAN_TOOL_NAME if status.plan.is_none() => {
+                if [
+                    "relevant_files",
+                    "intended_change",
+                    "plan_steps",
+                    "validation_program",
+                    "args",
+                ]
+                .iter()
+                .any(|field| arguments.contains_key(*field))
+                {
+                    return;
+                }
+                if status.memory.read_files.is_empty() {
+                    return;
+                }
+                let Some((program, args)) = default_validation_command(
+                    &status.task.original_user_request,
+                    &status.memory.read_files,
+                ) else {
+                    return;
+                };
+                let relevant_files = status
+                    .memory
+                    .read_files
+                    .iter()
+                    .map(|path| Value::String(path.display().to_string()))
+                    .collect::<Vec<_>>();
+                let change_files = status
+                    .memory
+                    .read_files
+                    .iter()
+                    .filter(|path| !is_test_path(path))
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>();
+                let evidence_files = status
+                    .memory
+                    .read_files
+                    .iter()
+                    .filter(|path| is_test_path(path))
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>();
+                let changed_scope = if change_files.is_empty() {
+                    status
+                        .memory
+                        .read_files
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    change_files.join(", ")
+                };
+                let evidence_scope = if evidence_files.is_empty() {
+                    "the inspected requirements".to_string()
+                } else {
+                    evidence_files.join(", ")
+                };
+                let command = if args.is_empty() {
+                    program.clone()
+                } else {
+                    format!("{program} {}", args.join(" "))
+                };
+
+                arguments
+                    .entry("relevant_files".to_string())
+                    .or_insert_with(|| Value::Array(relevant_files));
+                arguments
+                    .entry("intended_change".to_string())
+                    .or_insert_with(|| {
+                        Value::String(format!(
+                            "Update only {changed_scope} to satisfy behavior evidenced by {evidence_scope}."
+                        ))
+                    });
+                arguments
+                    .entry("plan_steps".to_string())
+                    .or_insert_with(|| {
+                        Value::Array(vec![
+                            Value::String(format!(
+                                "Apply the smallest behavior change in {changed_scope} required by {evidence_scope}."
+                            )),
+                            Value::String(format!(
+                                "Run `{command}` and require the targeted validation to pass."
+                            )),
+                            Value::String(format!(
+                                "Read {changed_scope} again and review the diff to confirm the change stayed within scope."
+                            )),
+                        ])
+                    });
+                arguments
+                    .entry("validation_program".to_string())
+                    .or_insert_with(|| Value::String(program));
+                arguments
+                    .entry("args".to_string())
+                    .or_insert_with(|| Value::Array(args.into_iter().map(Value::String).collect()));
+            }
+            tools::WORKFLOW_TRANSITION_TOOL_NAME if !arguments.contains_key("transition") => {
+                let transition = match status.phase {
+                    crate::coding::workflow::WorkflowPhase::Planning => Some("begin_editing"),
+                    crate::coding::workflow::WorkflowPhase::Editing
+                        if !status.changed_files.is_empty() =>
+                    {
+                        Some("begin_validation")
+                    }
+                    crate::coding::workflow::WorkflowPhase::Testing
+                        if status.validation_count > 0 =>
+                    {
+                        Some("begin_review")
+                    }
+                    crate::coding::workflow::WorkflowPhase::Debugging => Some("begin_repair"),
+                    _ => None,
+                };
+                if let Some(transition) = transition {
+                    arguments.insert(
+                        "transition".to_string(),
+                        Value::String(transition.to_string()),
+                    );
+                }
+            }
+            tools::RUN_PROCESS_TOOL_NAME if !arguments.contains_key("program") => {
+                if let Some(check) = status
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.validation.iter().find(|check| check.required))
+                {
+                    arguments.insert(
+                        "program".to_string(),
+                        Value::String(check.command.program.clone()),
+                    );
+                    arguments.insert(
+                        "args".to_string(),
+                        Value::Array(
+                            check
+                                .command
+                                .args
+                                .iter()
+                                .cloned()
+                                .map(Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+            }
+            tools::WORKFLOW_COMPLETE_TOOL_NAME
+                if !arguments.contains_key("summary")
+                    && status.phase == crate::coding::workflow::WorkflowPhase::Reviewing =>
+            {
+                let changed_files = status
+                    .changed_files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                arguments.insert(
+                    "summary".to_string(),
+                    Value::String(format!(
+                        "Completed the workflow for {}. Recorded validation and review cover {}.",
+                        status.objective,
+                        if changed_files.is_empty() {
+                            "the planned workspace files".to_string()
+                        } else {
+                            changed_files
+                        }
+                    )),
+                );
+                arguments
+                    .entry("remaining_risks".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn default_validation_command(
+    original_request: &str,
+    read_files: &[PathBuf],
+) -> Option<(String, Vec<String>)> {
+    let request = original_request.to_ascii_lowercase();
+    if request.contains("python3 -m unittest")
+        || read_files
+            .iter()
+            .any(|path| path.extension().is_some_and(|extension| extension == "py"))
+    {
+        return Some((
+            "python3".to_string(),
+            vec!["-m".to_string(), "unittest".to_string(), "-v".to_string()],
+        ));
+    }
+    if request.contains("cargo test")
+        || read_files
+            .iter()
+            .any(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
+    {
+        return Some(("cargo".to_string(), vec!["test".to_string()]));
+    }
+    if request.contains("pnpm test") {
+        return Some(("pnpm".to_string(), vec!["test".to_string()]));
+    }
+    None
+}
+
+fn is_test_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("test_") || name.ends_with("_test.py"))
 }
 
 fn normalize_structured_tool_arguments(tool_call: &mut CallToolRequestParams) {
@@ -475,7 +792,7 @@ fn normalize_structured_tool_arguments(tool_call: &mut CallToolRequestParams) {
         };
         let value = serde_json::from_str::<Value>(serialized).ok().or_else(|| {
             (!*object)
-                .then(|| serde_json::from_str(&format!("[{serialized}]")).ok())
+                .then(|| parse_serialized_array(serialized))
                 .flatten()
         });
         let Some(value) = value else {
@@ -483,6 +800,14 @@ fn normalize_structured_tool_arguments(tool_call: &mut CallToolRequestParams) {
         };
         if (*object && value.is_object()) || (!*object && value.is_array()) {
             arguments.insert((*field).to_string(), value);
+        }
+    }
+    if tool_call.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
+        && !arguments.contains_key("validation_program")
+    {
+        if let Some((program, args)) = infer_validation_command(arguments) {
+            arguments.insert("validation_program".to_string(), Value::String(program));
+            arguments.insert("args".to_string(), Value::Array(args));
         }
     }
     if tool_call.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
@@ -508,6 +833,60 @@ fn normalize_structured_tool_arguments(tool_call: &mut CallToolRequestParams) {
         .collect();
         arguments.insert("plan".to_string(), Value::Object(plan));
     }
+}
+
+fn parse_serialized_array(serialized: &str) -> Option<Value> {
+    serde_json::from_str(&format!("[{serialized}]"))
+        .ok()
+        .or_else(|| {
+            let items = serialized
+                .trim()
+                .strip_prefix('[')?
+                .strip_suffix(']')?
+                .replace(';', ",");
+            serde_json::from_str(&format!("[{items}]")).ok()
+        })
+}
+
+fn infer_validation_command(
+    arguments: &serde_json::Map<String, Value>,
+) -> Option<(String, Vec<Value>)> {
+    const EXECUTABLES: &[&str] = &[
+        "python", "python3", "pytest", "cargo", "pnpm", "npm", "yarn", "bun", "go", "make", "just",
+    ];
+    const STOP_WORDS: &[&str] = &[
+        "and", "then", "expected", "expect", "expects", "und", "danach", "erwartet", "erwarte",
+    ];
+
+    arguments
+        .get("plan_steps")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|step| {
+            let tokens = step
+                .split_whitespace()
+                .map(|token| {
+                    token.trim_matches(|character: char| {
+                        matches!(
+                            character,
+                            '`' | '\'' | '"' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']'
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            let executable_index = tokens
+                .iter()
+                .position(|token| EXECUTABLES.contains(token))?;
+            let program = tokens[executable_index].to_string();
+            let args = tokens[executable_index + 1..]
+                .iter()
+                .take_while(|token| !STOP_WORDS.contains(&token.to_ascii_lowercase().as_str()))
+                .filter(|token| !token.is_empty())
+                .map(|token| Value::String((*token).to_string()))
+                .collect::<Vec<_>>();
+            Some((program, args))
+        })
 }
 
 fn contract_failure_class(tool_name: &str, message: &str) -> &'static str {
@@ -547,7 +926,7 @@ fn is_versioned_mutation_tool(tool_name: &str) -> bool {
 
 fn uses_compact_qwen_coding_tools(model_config: &ModelConfig) -> bool {
     let model = model_config.model_name.to_ascii_lowercase();
-    model.contains("qwen3") && !model.contains("qwen3-coder")
+    model.contains("qwen2.5") || (model.contains("qwen3") && !model.contains("qwen3-coder"))
 }
 
 #[cfg(test)]
@@ -555,6 +934,7 @@ mod tests {
     use super::*;
     use rmcp::object;
     use serde_json::Value;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpStream};
@@ -677,7 +1057,7 @@ mod tests {
         assert!(agent
             .active_workflow_continuation(temp_dir.path())
             .unwrap()
-            .contains("Do not provide a final prose response"));
+            .contains("Submit exactly one native coding__ tool call"));
         assert!(agent
             .recovery_exhausted_message(temp_dir.path())
             .unwrap()
@@ -764,6 +1144,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_workflow_derives_a_concrete_plan_after_pre_workflow_reads() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("normalizer.py"),
+            "def normalize_status(value: str) -> str:\n    return value.strip()\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("test_normalizer.py"),
+            "from normalizer import normalize_status\n\nassert normalize_status(' Ready ') == 'ready'\n",
+        )
+        .unwrap();
+        let agent = enabled_agent();
+        agent.register_task_context(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Read normalizer.py and test_normalizer.py, update only normalizer.py, run python3 -m unittest -v, then review the diff."
+                .to_string(),
+        );
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::READ_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": "normalizer.py"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::READ_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": "test_normalizer.py"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let planned = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let planned: Value =
+            serde_json::from_str(&planned.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(planned["phase"], "planning");
+        assert_eq!(
+            planned["plan"]["relevant_files"],
+            serde_json::json!(["normalizer.py", "test_normalizer.py"])
+        );
+        assert_eq!(
+            planned["plan"]["validation"][0]["command"]["program"],
+            "python3"
+        );
+        assert_eq!(
+            planned["plan"]["validation"][0]["command"]["args"],
+            serde_json::json!(["-m", "unittest", "-v"])
+        );
+        assert_eq!(
+            planned["plan"]["intended_changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let editing = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_TRANSITION_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let editing: Value =
+            serde_json::from_str(&editing.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(editing["phase"], "editing");
+    }
+
+    #[tokio::test]
     async fn compact_plan_recovery_requires_a_nonempty_intended_change() {
         let temp_dir = tempfile::tempdir().unwrap();
         let agent = enabled_agent();
@@ -802,6 +1268,55 @@ mod tests {
             .message
             .contains("intended_change must be one non-empty sentence"));
         assert!(error.message.contains("validation_program \"cargo\""));
+    }
+
+    #[tokio::test]
+    async fn compact_plan_adds_the_active_workflow_id_when_it_is_omitted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair lib.rs"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let planned = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(
+                    object!({
+                        "relevant_files": ["lib.rs"],
+                        "intended_change": "normalize the label",
+                        "validation_program": "cargo",
+                        "args": ["test"]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let status: Value =
+            serde_json::from_str(&planned.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(status["phase"], "planning");
+
+        let editing = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_TRANSITION_TOOL_NAME)
+                    .with_arguments(object!({"transition": "begin_editing"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let status: Value =
+            serde_json::from_str(&editing.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(status["phase"], "editing");
     }
 
     #[tokio::test]
@@ -1008,6 +1523,27 @@ mod tests {
         assert!(!arguments.contains_key("affected_components"));
     }
 
+    #[test]
+    fn compact_plan_normalization_repairs_qwen_array_and_validation_omissions() {
+        let mut call = CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+            .with_arguments(object!({
+                "workflow_id": "workflow_00000000-0000-7000-8000-000000000000",
+                "relevant_files": ["normalizer.py", "test_normalizer.py"],
+                "intended_change": "Normalize status values to lowercase.",
+                "plan_steps": "[\"Update normalizer.py to lowercase the stripped value\"; \"Validate with python3 -m unittest -v test_normalizer.py expected one passing test\"; \"Read normalizer.py after the change for review\"]"
+            }));
+
+        normalize_structured_tool_arguments(&mut call);
+
+        let arguments = call.arguments.unwrap();
+        assert_eq!(arguments["plan_steps"].as_array().unwrap().len(), 3);
+        assert_eq!(arguments["validation_program"], "python3");
+        assert_eq!(
+            arguments["args"],
+            serde_json::json!(["-m", "unittest", "-v", "test_normalizer.py"])
+        );
+    }
+
     #[tokio::test]
     async fn serialized_compact_plan_lists_receive_a_schema_specific_recovery() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1088,7 +1624,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            3
         );
     }
 
@@ -1313,6 +1849,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         assert!(error.message.contains("not currently allowed"));
         assert!(error.message.contains(tools::WORKFLOW_START_TOOL_NAME));
+        assert!(error.message.contains("No coding workflow is active"));
         assert!(!temp_dir.path().join("must-not-exist.txt").exists());
     }
 
@@ -1328,6 +1865,7 @@ mod tests {
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
 
+        assert_eq!(names.len(), names.iter().collect::<HashSet<_>>().len());
         assert_eq!(tools.len(), 16);
         assert!(names.contains(&tools::WRITE_FILE_TOOL_NAME));
         assert!(!names.contains(&tools::APPLY_CHANGES_TOOL_NAME));
@@ -1343,6 +1881,10 @@ mod tests {
             .unwrap();
         assert!(prompt.contains("call exactly one suitable tool"));
         assert!(prompt.contains("coding__write_file"));
+        assert!(prompt.contains("exact returned digest as expected_digest"));
+        assert!(prompt.contains("plan's exact program and args with coding__run_process"));
+        assert!(prompt.contains("coding__project_capabilities returned its exact command_id"));
+        assert!(prompt.contains("Never write a tool call, JSON"));
 
         let emulated_model = model.clone().with_toolshim(true);
         let emulated_tools = agent.tools_for_workspace_for_model(
@@ -1381,11 +1923,11 @@ mod tests {
             .find(|tool| tool.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME)
             .unwrap();
         let plan_schema = Value::Object((*plan_tool.input_schema).clone());
-        assert!(plan_schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("intended_change".to_string())));
+        assert!(plan_schema.get("required").is_none());
         assert!(plan_schema["properties"].get("plan").is_none());
+        assert!(plan_schema["properties"].get("workflow_id").is_none());
+        assert!(plan_schema["properties"].get("plan_steps").is_none());
+        assert_eq!(plan_schema["additionalProperties"], Value::Bool(false));
 
         let coder_model = ModelConfig::new("qwen3-coder:30b");
         assert!(
@@ -1394,6 +1936,18 @@ mod tests {
                 .len()
                 > tools.len()
         );
+
+        let qwen25_coder = ModelConfig::new("qwen2.5-coder:7b");
+        let qwen25_tools =
+            agent.tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &qwen25_coder);
+        assert_eq!(qwen25_tools.len(), tools.len());
+        assert!(qwen25_tools
+            .iter()
+            .any(|tool| tool.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(agent
+            .system_prompt_for_model(PonduinMode::Auto, &qwen25_coder)
+            .unwrap()
+            .contains("call exactly one suitable tool"));
     }
 
     #[test]
