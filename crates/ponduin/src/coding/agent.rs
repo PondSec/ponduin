@@ -370,7 +370,53 @@ impl CodingAgent {
                 )
             })?
         };
-        result.map_err(|error| self.with_contract_recovery(workspace.root(), &tool_name, error))
+        let result = result
+            .map_err(|error| self.with_contract_recovery(workspace.root(), &tool_name, error))?;
+        if ponduin_mode == PonduinMode::Auto && tool_name == tools::FIND_FILES_TOOL_NAME {
+            if let Some(editing) = self
+                .advance_empty_greenfield_workflow(workspace.root())
+                .await?
+            {
+                return Ok(editing);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn advance_empty_greenfield_workflow(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<Option<CallToolResult>, ErrorData> {
+        let Some(status) = self.tool_state.active_workflow_status(workspace_root) else {
+            return Ok(None);
+        };
+        if !status.memory.empty_workspace_discovered
+            || status.plan.is_some()
+            || !workspace_has_no_user_files(workspace_root)
+            || greenfield_plan_defaults(&status.task.original_user_request).is_none()
+        {
+            return Ok(None);
+        }
+
+        Box::pin(
+            self.execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+                    .with_arguments(serde_json::Map::new()),
+                workspace_root,
+            ),
+        )
+        .await?;
+        let editing = Box::pin(
+            self.execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_TRANSITION_TOOL_NAME)
+                    .with_arguments(serde_json::Map::new()),
+                workspace_root,
+            ),
+        )
+        .await?;
+        Ok(Some(editing))
     }
 
     fn with_contract_recovery(
@@ -1332,6 +1378,45 @@ mod tests {
         let editing: Value =
             serde_json::from_str(&editing.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(editing["phase"], "editing");
+    }
+
+    #[tokio::test]
+    async fn empty_greenfield_search_registers_the_plan_and_enters_editing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent.register_task_context(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Erstelle eine moderne Website mit HTML, CSS und JavaScript.".to_string(),
+        );
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let editing = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::FIND_FILES_TOOL_NAME)
+                    .with_arguments(object!({"query": "index.html"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let editing: Value =
+            serde_json::from_str(&editing.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(editing["phase"], "editing");
+        assert_eq!(
+            editing["plan"]["relevant_files"],
+            serde_json::json!(["index.html", "styles.css", "script.js"])
+        );
     }
 
     #[tokio::test]
