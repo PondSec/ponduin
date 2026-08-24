@@ -184,6 +184,14 @@ impl CodingToolState {
         let status = &context.status;
         let guidance = match status.phase {
             WorkflowPhase::Analyzing | WorkflowPhase::Searching
+                if status.memory.empty_workspace_discovered =>
+            {
+                "The initial workspace discovery found no user files. Call \
+                 coding__workflow_set_plan now; it will create the concrete greenfield plan. Do \
+                 not repeat discovery or try to read a nonexistent file."
+                    .to_string()
+            }
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching
                 if !status.memory.read_files.is_empty() =>
             {
                 format!(
@@ -307,6 +315,11 @@ impl CodingToolState {
         let context = self.workflow_tool_context(workspace_root)?;
         let status = &context.status;
         match status.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching
+                if status.memory.empty_workspace_discovered =>
+            {
+                Some(WORKFLOW_SET_PLAN_TOOL_NAME)
+            }
             WorkflowPhase::Analyzing | WorkflowPhase::Searching
                 if !status.memory.read_files.is_empty() =>
             {
@@ -886,6 +899,16 @@ impl CodingToolState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow.note_repository_activity();
+        });
+    }
+
+    fn note_empty_workspace_discovery(&self, workspace_root: &Path) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.note_empty_workspace_discovery();
         });
     }
 
@@ -1535,6 +1558,11 @@ fn compact_native_tool_needs_schema(name: &str, context: Option<&WorkflowToolCon
     };
     let status = &context.status;
     match status.phase {
+        WorkflowPhase::Analyzing | WorkflowPhase::Searching
+            if status.memory.empty_workspace_discovered =>
+        {
+            name == WORKFLOW_SET_PLAN_TOOL_NAME
+        }
         WorkflowPhase::Analyzing | WorkflowPhase::Searching => matches!(
             name,
             FIND_FILES_TOOL_NAME | READ_FILE_TOOL_NAME | WORKFLOW_SET_PLAN_TOOL_NAME
@@ -1626,6 +1654,20 @@ fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolCont
         };
     }
     match (status.phase, name) {
+        (WorkflowPhase::Analyzing | WorkflowPhase::Searching, WORKFLOW_SET_PLAN_TOOL_NAME)
+            if status.memory.empty_workspace_discovered =>
+        {
+            "The workspace is confirmed empty. This is the only immediate action: call this now \
+             to record the inferred greenfield plan."
+                .to_string()
+        }
+        (
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching,
+            FIND_FILES_TOOL_NAME | READ_FILE_TOOL_NAME,
+        ) if status.memory.empty_workspace_discovered => {
+            "The workspace is confirmed empty. Do not call this; record the greenfield plan now."
+                .to_string()
+        }
         (WorkflowPhase::Analyzing | WorkflowPhase::Searching, FIND_FILES_TOOL_NAME)
             if !status.memory.read_files.is_empty() =>
         {
@@ -2338,6 +2380,9 @@ pub(crate) fn execute_with_state(
             let result = RepositorySearch::new(&workspace)
                 .find_files(&params.query, params.scope, limits)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
+            if result.scanned_files == 0 && !result.truncated {
+                state.note_empty_workspace_discovery(workspace.root());
+            }
             json_result(&result, config.output_limit)
         }
         SEARCH_TEXT_TOOL_NAME => {
@@ -5688,6 +5733,45 @@ mod tests {
             .unwrap()
             .into_owned();
         assert!(find_description.contains("Do not search again"));
+    }
+
+    #[test]
+    fn empty_workspace_discovery_advances_directly_to_the_greenfield_plan() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "create a website"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(FIND_FILES_TOOL_NAME)
+                .with_arguments(object!({"query": "index.html"})),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let workspace_root = temp_dir.path().canonicalize().unwrap();
+        let status = state.workflow_status(&workspace_root, None).unwrap();
+        assert!(status.memory.empty_workspace_discovered);
+
+        let guidance = state
+            .workflow_guidance_for_workspace(&workspace_root)
+            .unwrap();
+        assert!(guidance.contains("found no user files"));
+        assert!(guidance.contains(WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert_eq!(
+            state.compact_preferred_tool_name_for_workspace(&workspace_root),
+            Some(WORKFLOW_SET_PLAN_TOOL_NAME)
+        );
     }
 
     #[test]

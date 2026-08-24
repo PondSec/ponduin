@@ -134,6 +134,12 @@ impl CodingWorkflow {
         }
     }
 
+    pub fn note_empty_workspace_discovery(&mut self) {
+        if !self.is_terminal() {
+            self.memory.empty_workspace_discovered = true;
+        }
+    }
+
     pub fn note_read_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         if self.is_terminal() {
             return;
@@ -1449,6 +1455,8 @@ pub struct ReviewEvidence {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowMemory {
     pub assumptions: Vec<String>,
+    #[serde(default)]
+    pub empty_workspace_discovered: bool,
     pub read_files: Vec<PathBuf>,
     pub relevant_symbols: Vec<RelevantSymbolEvidence>,
     pub executed_commands: Vec<CommandEvidence>,
