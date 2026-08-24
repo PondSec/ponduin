@@ -1382,6 +1382,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_greenfield_editing_directs_the_model_to_write_the_first_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        let model = ModelConfig::new("qwen3.5:9b");
+        agent.register_task_context(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Erstelle eine Website mit HTML, CSS und JavaScript.".to_string(),
+        );
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_TRANSITION_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let guidance = agent.workflow_guidance(temp_dir.path()).unwrap();
+        assert!(guidance.contains("coding__write_file now to create `index.html`"));
+        assert!(guidance.contains("Do not read, search, preview, or transition first"));
+
+        let write_file = agent
+            .tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &model)
+            .into_iter()
+            .find(|tool| tool.name == tools::WRITE_FILE_TOOL_NAME)
+            .unwrap();
+        assert!(write_file
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("only immediate action"));
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WRITE_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": "index.html", "content": "<!doctype html>"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
+            "<!doctype html>"
+        );
+    }
+
+    #[tokio::test]
     async fn compact_plan_recovery_requires_a_nonempty_intended_change() {
         let temp_dir = tempfile::tempdir().unwrap();
         let agent = enabled_agent();

@@ -213,6 +213,17 @@ impl CodingToolState {
                     .to_string()
             }
             WorkflowPhase::Editing if status.repair_pending => repair_pending_guidance(),
+            WorkflowPhase::Editing if is_greenfield_execution(status) => {
+                let first_file = first_greenfield_file(status)
+                    .unwrap_or_else(|| "the first planned file".to_string());
+                format!(
+                    "Greenfield execution: the workspace inspection found no existing user files. \
+                     Call coding__write_file now to create `{first_file}` with `path` and complete \
+                     `content`. It is a new path, so omit `expected_digest`. Do not read, search, \
+                     preview, or transition first. Submit exactly one native coding__write_file call \
+                     and emit no prose before it."
+                )
+            }
             WorkflowPhase::Editing if status.changed_files.is_empty() => {
                 "The workflow is in Editing with no retained change. Use the currently exposed \
                  mutation tool now. Phase-transition tools are intentionally withheld \
@@ -1607,8 +1618,19 @@ fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolCont
         (WorkflowPhase::Planning, WORKFLOW_SET_PLAN_TOOL_NAME) => {
             "The plan is already accepted. Do not call this again; transition to Editing.".to_string()
         }
+        (WorkflowPhase::Editing, WRITE_FILE_TOOL_NAME) if is_greenfield_execution(status) => {
+            let first_file = first_greenfield_file(status)
+                .unwrap_or_else(|| "the first planned file".to_string());
+            format!(
+                "Greenfield: this is the only immediate action. Create `{first_file}` now with \
+                 path and complete content. It is new, so omit expected_digest. Do not read, \
+                 search, preview, or transition first."
+            )
+        }
         (WorkflowPhase::Editing, WRITE_FILE_TOOL_NAME) if status.changed_files.is_empty() => {
-            "Current phase: Editing. Write one planned file now; read an existing file first.".to_string()
+            "Current phase: Editing. Write one planned file now. Read it first only when the path \
+             already exists."
+                .to_string()
         }
         (WorkflowPhase::Editing, WORKFLOW_TRANSITION_TOOL_NAME) if !status.changed_files.is_empty() => {
             "Current phase: Editing with a retained change. Call this now with transition `begin_validation`.".to_string()
@@ -1644,6 +1666,25 @@ fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolCont
         }
         _ => generic.to_string(),
     }
+}
+
+fn is_greenfield_execution(status: &WorkflowStatus) -> bool {
+    status.phase == WorkflowPhase::Editing
+        && status.changed_files.is_empty()
+        && status.memory.read_files.is_empty()
+        && status
+            .plan
+            .as_ref()
+            .is_some_and(|plan| !plan.relevant_files.is_empty())
+}
+
+fn first_greenfield_file(status: &WorkflowStatus) -> Option<String> {
+    status
+        .plan
+        .as_ref()?
+        .relevant_files
+        .first()
+        .map(|path| path.display().to_string())
 }
 
 fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> {
