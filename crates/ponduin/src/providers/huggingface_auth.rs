@@ -98,6 +98,13 @@ pub fn has_configured_token() -> Result<bool> {
     has_configured_token_from_sources(has_usable_or_refreshable_oauth_token(), hf_token_secret)
 }
 
+pub fn has_configured_token_for_inventory() -> Result<bool> {
+    has_configured_token_from_sources(
+        has_usable_or_refreshable_oauth_token(),
+        hf_token_secret_for_inventory,
+    )
+}
+
 fn has_configured_token_from_sources(
     has_oauth_token: bool,
     secret_fallback: impl FnOnce() -> Result<Option<String>>,
@@ -111,6 +118,14 @@ fn has_configured_token_from_sources(
 
 pub fn hf_token_secret() -> Result<Option<String>> {
     match Config::global().get_secret::<String>(HUGGINGFACE_TOKEN_SECRET_KEY) {
+        Ok(token) => Ok(Some(token)),
+        Err(ConfigError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn hf_token_secret_for_inventory() -> Result<Option<String>> {
+    match Config::global().get_secret_for_inventory::<String>(HUGGINGFACE_TOKEN_SECRET_KEY) {
         Ok(token) => Ok(Some(token)),
         Err(ConfigError::NotFound(_)) => Ok(None),
         Err(error) => Err(error.into()),

@@ -139,7 +139,7 @@ pub fn huggingface_inventory() -> InventoryRegistration {
             Config::global(),
         ))
     })
-    .with_configured(|| huggingface_auth::has_configured_token().unwrap_or(false))
+    .with_configured(|| huggingface_auth::has_configured_token_for_inventory().unwrap_or(false))
 }
 
 pub fn refresh_only() -> InventoryRegistration {

@@ -541,7 +541,7 @@ fn huggingface_declarative_inventory_configured(config: &DeclarativeProviderConf
                 .get_secret_for_inventory::<String>(key)
                 .is_ok()
         },
-        || huggingface_auth::has_configured_token().unwrap_or(false),
+        || huggingface_auth::has_configured_token_for_inventory().unwrap_or(false),
     )
 }
 
