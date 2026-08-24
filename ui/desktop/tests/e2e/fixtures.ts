@@ -9,6 +9,47 @@ type PonduinTestFixtures = {
   ponduinPage: Page;
 };
 
+let debugPortSequence = 0;
+
+function nextDebugPort(): number {
+  const processPortRange = 20_000 + (process.pid % 2_000) * 20;
+  return processPortRange + debugPortSequence++;
+}
+
+async function stopDebugPortListener(debugPort: number): Promise<void> {
+  if (process.platform === 'win32') {
+    return;
+  }
+
+  const listenerPids = async () => {
+    try {
+      const { stdout } = await execAsync(`lsof -ti tcp:${debugPort} -sTCP:LISTEN`);
+      return stdout
+        .split(/\s+/)
+        .map((value) => Number(value))
+        .filter((pid) => Number.isInteger(pid) && pid > 0);
+    } catch {
+      return [];
+    }
+  };
+
+  for (const pid of await listenerPids()) {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      // The listener exited while the cleanup was resolving its process ID.
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  for (const pid of await listenerPids()) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // The graceful shutdown already completed.
+    }
+  }
+}
+
 /**
  * Test-scoped fixture that launches a fresh Electron app for EACH test.
  *
@@ -34,11 +75,10 @@ export const test = base.extend<PonduinTestFixtures>({
 
     let appProcess: ChildProcess | null = null;
     let browser: Browser | null = null;
+    let debugPort: number | null = null;
 
     try {
-      // Assign a unique debug port for this test to enable parallel execution
-      // Base port 9222, offset by worker index * 100 + parallel slot
-      const debugPort = 9222 + testInfo.parallelIndex * 10;
+      debugPort = nextDebugPort();
       console.log(`Using debug port ${debugPort} for parallel test execution`);
 
       // Start the electron-forge process with Playwright remote debugging enabled
@@ -156,6 +196,10 @@ export const test = base.extend<PonduinTestFixtures>({
       // Close the CDP connection
       if (browser) {
         await browser.close().catch(console.error);
+      }
+
+      if (debugPort !== null) {
+        await stopDebugPortListener(debugPort).catch(console.error);
       }
 
       // Kill the npm process tree
