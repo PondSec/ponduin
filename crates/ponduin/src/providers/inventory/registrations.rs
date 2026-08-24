@@ -62,7 +62,7 @@ pub fn openai_inventory() -> InventoryRegistration {
             }
         }
         config
-            .get_secret::<serde_json::Value>("OPENAI_API_KEY")
+            .get_secret_for_inventory::<serde_json::Value>("OPENAI_API_KEY")
             .is_ok()
     })
 }
@@ -83,7 +83,9 @@ pub fn anthropic_inventory() -> InventoryRegistration {
             identity = identity.with_secret("api_key", api_key);
         }
         if let Ok(headers) = config
-            .get_secret::<std::collections::HashMap<String, String>>("ANTHROPIC_CUSTOM_HEADERS")
+            .get_secret_for_inventory::<std::collections::HashMap<String, String>>(
+                "ANTHROPIC_CUSTOM_HEADERS",
+            )
         {
             identity = identity.with_secret("headers", serialize_string_map(&headers)?);
         }

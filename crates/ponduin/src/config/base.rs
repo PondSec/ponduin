@@ -861,6 +861,40 @@ impl Config {
             .and_then(|v| Ok(serde_json::from_value(v.clone())?))
     }
 
+    /// Get a secret for non-interactive inventory work.
+    ///
+    /// Provider inventory is requested while the desktop client initializes. On
+    /// platforms with a system keyring, opening a keychain item may require user
+    /// interaction. Inventory must not make the client wait for that interaction
+    /// just to render a provider list, so it only uses keyring values already
+    /// present in this process's cache. File-backed secret storage remains safe
+    /// to load eagerly.
+    pub fn get_secret_for_inventory<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: &str,
+    ) -> Result<T, ConfigError> {
+        let env_key = key.to_uppercase();
+        if let Ok(val) = env::var(&env_key) {
+            let value = Self::parse_env_value(&val)?;
+            return Ok(serde_json::from_value(value)?);
+        }
+
+        let cached_values = self.secrets_cache.lock().unwrap().clone();
+        if let Some(values) = cached_values {
+            return values
+                .get(key)
+                .ok_or_else(|| ConfigError::NotFound(key.to_string()))
+                .and_then(|value| Ok(serde_json::from_value(value.clone())?));
+        }
+
+        #[cfg(feature = "system-keyring")]
+        if matches!(&self.secrets, SecretStorage::Keyring { .. }) {
+            return Err(ConfigError::NotFound(key.to_string()));
+        }
+
+        self.get_secret(key)
+    }
+
     /// Get secrets. If primary is in env, use env for all keys. Otherwise, use secret storage.
     pub fn get_secrets(
         &self,
@@ -907,7 +941,8 @@ impl Config {
             }
         }
 
-        self.invalidate_secrets_cache();
+        let mut cache = self.secrets_cache.lock().unwrap();
+        *cache = Some(values.clone());
         Ok(())
     }
 
@@ -1417,6 +1452,54 @@ mod tests {
         let result: Result<String, ConfigError> = config.get_secret("key");
         assert!(matches!(result, Err(ConfigError::NotFound(_))));
 
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_secret_reads_file_backed_storage() -> Result<(), ConfigError> {
+        let config = new_test_config();
+        config.set_secret("key", &"value")?;
+
+        let value: String = config.get_secret_for_inventory("key")?;
+
+        assert_eq!(value, "value");
+        Ok(())
+    }
+
+    #[cfg(feature = "system-keyring")]
+    #[test]
+    fn inventory_secret_does_not_open_an_uncached_keyring() {
+        let config = Config {
+            config_paths: vec![PathBuf::from("unused-config.yaml")],
+            secrets: SecretStorage::Keyring {
+                service: "ponduin-test".to_string(),
+            },
+            guard: Mutex::new(()),
+            secrets_cache: Arc::new(Mutex::new(None)),
+        };
+
+        let result: Result<String, ConfigError> = config.get_secret_for_inventory("key");
+
+        assert!(matches!(result, Err(ConfigError::NotFound(key)) if key == "key"));
+    }
+
+    #[cfg(feature = "system-keyring")]
+    #[test]
+    fn inventory_secret_uses_cached_keyring_values() -> Result<(), ConfigError> {
+        let mut values = HashMap::new();
+        values.insert("key".to_string(), Value::String("value".to_string()));
+        let config = Config {
+            config_paths: vec![PathBuf::from("unused-config.yaml")],
+            secrets: SecretStorage::Keyring {
+                service: "ponduin-test".to_string(),
+            },
+            guard: Mutex::new(()),
+            secrets_cache: Arc::new(Mutex::new(Some(values))),
+        };
+
+        let value: String = config.get_secret_for_inventory("key")?;
+
+        assert_eq!(value, "value");
         Ok(())
     }
 

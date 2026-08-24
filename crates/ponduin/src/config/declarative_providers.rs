@@ -26,6 +26,24 @@ pub fn custom_providers_dir() -> std::path::PathBuf {
 /// Resolves values via Config (secret if `secret`, param otherwise), falls back to `default`.
 /// Returns an error if a `required` var is missing.
 pub fn expand_env_vars(template: &str, env_vars: &[EnvVarConfig]) -> Result<String> {
+    expand_env_vars_with_secret_lookup(template, env_vars, |key| {
+        Config::global().get_secret::<String>(key).ok()
+    })
+}
+
+fn expand_env_vars_for_inventory(template: &str, env_vars: &[EnvVarConfig]) -> Result<String> {
+    expand_env_vars_with_secret_lookup(template, env_vars, |key| {
+        Config::global()
+            .get_secret_for_inventory::<String>(key)
+            .ok()
+    })
+}
+
+fn expand_env_vars_with_secret_lookup(
+    template: &str,
+    env_vars: &[EnvVarConfig],
+    secret_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
     let config = Config::global();
     let mut result = template.to_string();
     for var in env_vars {
@@ -34,7 +52,7 @@ pub fn expand_env_vars(template: &str, env_vars: &[EnvVarConfig]) -> Result<Stri
             continue;
         }
         let value = if var.secret {
-            config.get_secret::<String>(&var.name).ok()
+            secret_lookup(&var.name)
         } else {
             config.get_param::<String>(&var.name).ok()
         };
@@ -367,6 +385,17 @@ pub fn register_declarative_providers(
 /// runtime overrides from env_vars. Called lazily (at provider instantiation)
 /// so values configured through the UI after startup are picked up.
 fn resolve_config(config: &mut DeclarativeProviderConfig) -> Result<()> {
+    resolve_config_with(config, expand_env_vars)
+}
+
+fn resolve_config_for_inventory(config: &mut DeclarativeProviderConfig) -> Result<()> {
+    resolve_config_with(config, expand_env_vars_for_inventory)
+}
+
+fn resolve_config_with(
+    config: &mut DeclarativeProviderConfig,
+    expand_env_vars: fn(&str, &[EnvVarConfig]) -> Result<String>,
+) -> Result<()> {
     if let Some(ref env_vars) = config.env_vars {
         config.base_url = expand_env_vars(&config.base_url, env_vars)?;
 
@@ -418,12 +447,12 @@ pub fn register_declarative_provider(
                         },
                         move || {
                             let mut cfg = identity_config.clone();
-                            resolve_config(&mut cfg)?;
+                            resolve_config_for_inventory(&mut cfg)?;
                             declarative_inventory_identity(&cfg)
                         },
                         move || {
                             let mut cfg = inventory_configured_config.clone();
-                            if resolve_config(&mut cfg).is_err() {
+                            if resolve_config_for_inventory(&mut cfg).is_err() {
                                 return false;
                             }
                             huggingface_declarative_inventory_configured(&cfg)
@@ -441,7 +470,7 @@ pub fn register_declarative_provider(
                     },
                     move || {
                         let mut cfg = identity_config.clone();
-                        resolve_config(&mut cfg)?;
+                        resolve_config_for_inventory(&mut cfg)?;
                         declarative_inventory_identity(&cfg)
                     },
                 );
@@ -457,7 +486,7 @@ pub fn register_declarative_provider(
                     },
                     move || {
                         let mut cfg = identity_config.clone();
-                        resolve_config(&mut cfg)?;
+                        resolve_config_for_inventory(&mut cfg)?;
                         declarative_inventory_identity(&cfg)
                     },
                 );
@@ -477,7 +506,7 @@ pub fn register_declarative_provider(
                 },
                 move || {
                     let mut cfg = identity_config.clone();
-                    resolve_config(&mut cfg)?;
+                    resolve_config_for_inventory(&mut cfg)?;
                     declarative_inventory_identity(&cfg)
                 },
             );
@@ -496,7 +525,7 @@ pub fn register_declarative_provider(
                 },
                 move || {
                     let mut cfg = identity_config.clone();
-                    resolve_config(&mut cfg)?;
+                    resolve_config_for_inventory(&mut cfg)?;
                     declarative_inventory_identity(&cfg)
                 },
             );
@@ -507,7 +536,11 @@ pub fn register_declarative_provider(
 fn huggingface_declarative_inventory_configured(config: &DeclarativeProviderConfig) -> bool {
     huggingface_declarative_inventory_configured_from_sources(
         config,
-        |key| Config::global().get_secret::<String>(key).is_ok(),
+        |key| {
+            Config::global()
+                .get_secret_for_inventory::<String>(key)
+                .is_ok()
+        },
         || huggingface_auth::has_configured_token().unwrap_or(false),
     )
 }
