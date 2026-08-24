@@ -3074,7 +3074,12 @@ impl Agent {
                                     if request_msg.created > final_response.created {
                                         request_msg.created = final_response.created;
                                     }
-                                    messages_to_add.push(request_msg);
+                                    // The request is persisted above so it survives a reload, but it also
+                                    // has to reach the live event stream. Without this event ACP clients
+                                    // receive only the matching tool response and render an empty row until
+                                    // they reload the session history.
+                                    messages_to_add.push(request_msg.clone());
+                                    yield AgentEvent::Message(request_msg);
                                     yield AgentEvent::Message(project_message_for_user_event(&final_response));
                                     messages_to_add.push(final_response);
                                 }
