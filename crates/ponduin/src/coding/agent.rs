@@ -781,6 +781,7 @@ mod tests {
             panic!("expected workflow status text");
         };
         let started: Value = serde_json::from_str(&started_text.text).unwrap();
+        observe_repository(&agent, temp_dir.path()).await;
 
         agent
             .execute(
@@ -831,6 +832,7 @@ mod tests {
             panic!("expected workflow status text");
         };
         let started: Value = serde_json::from_str(&started_text.text).unwrap();
+        observe_repository(&agent, temp_dir.path()).await;
 
         let error = agent
             .execute(
@@ -868,6 +870,7 @@ mod tests {
             )
             .await
             .unwrap();
+        observe_repository(&agent, temp_dir.path()).await;
 
         let planned = agent
             .execute(
@@ -1161,6 +1164,7 @@ mod tests {
             .unwrap();
         let workflow_id: Value =
             serde_json::from_str(&started.content[0].as_text().unwrap().text).unwrap();
+        observe_repository(&agent, temp_dir.path()).await;
 
         let planned = agent
             .execute(
@@ -1729,6 +1733,7 @@ mod tests {
         )
         .await;
         let workflow_id = started["id"].as_str().unwrap().to_string();
+        observe_repository(agent, working_dir).await;
         execute_json(
             agent,
             working_dir,
@@ -1766,6 +1771,15 @@ mod tests {
         .await;
         transition_workflow(agent, working_dir, &workflow_id, "begin_editing").await;
         workflow_id
+    }
+
+    async fn observe_repository(agent: &CodingAgent, working_dir: &Path) {
+        execute_json(
+            agent,
+            working_dir,
+            CallToolRequestParams::new(tools::REPOSITORY_PROFILE_TOOL_NAME),
+        )
+        .await;
     }
 
     async fn transition_workflow(
