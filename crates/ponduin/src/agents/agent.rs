@@ -409,8 +409,34 @@ fn message_for_live_update(message: &Message) -> Option<Message> {
     (!message.content.is_empty()).then(|| message.clone())
 }
 
-fn live_response_allowed(coding_tools_active: bool, workflow_continuation: bool) -> bool {
-    !coding_tools_active || !workflow_continuation
+fn live_updates_for_response(message: &Message, workflow_continuation: bool) -> Vec<Message> {
+    if !workflow_continuation {
+        return message_for_live_update(message).into_iter().collect();
+    }
+
+    let mut workflow_trace = message.clone();
+    workflow_trace.content.retain(|content| {
+        matches!(
+            content,
+            MessageContent::Thinking(_)
+                | MessageContent::RedactedThinking(_)
+                | MessageContent::ToolRequest(_)
+                | MessageContent::FrontendToolRequest(_)
+        )
+    });
+
+    let mut updates = Vec::new();
+    if !workflow_trace.content.is_empty() {
+        updates.push(workflow_trace);
+    }
+
+    if !message.as_concat_text().trim().is_empty() {
+        updates.push(Message::assistant().with_text(
+            "Workflow in progress: Ponduin is continuing with the required actions and validation before it can report a final result.",
+        ));
+    }
+
+    updates
 }
 
 fn agent_visible_message_text(message: &Message) -> String {
@@ -2545,14 +2571,12 @@ impl Agent {
                                         .workflow_continuation(&session.working_dir)
                                         .is_some();
 
-                                if live_response_allowed(
-                                    coding_tools_active,
+                                for live_response in live_updates_for_response(
+                                    &filtered_response,
                                     suppress_user_visible_response,
                                 ) {
-                                    if let Some(live_response) = message_for_live_update(&filtered_response) {
-                                        yield AgentEvent::Message(live_response);
-                                        tokio::task::yield_now().await;
-                                    }
+                                    yield AgentEvent::Message(live_response);
+                                    tokio::task::yield_now().await;
                                 }
 
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
@@ -4040,10 +4064,25 @@ mod tests {
     }
 
     #[test]
-    fn active_coding_workflow_withholds_live_model_prose() {
-        assert!(!live_response_allowed(true, true));
-        assert!(live_response_allowed(true, false));
-        assert!(live_response_allowed(false, true));
+    fn active_coding_workflow_surfaces_trace_without_unverified_model_prose() {
+        let response = Message::assistant()
+            .with_thinking("I need to inspect the project first.", "sig")
+            .with_text("The task is complete.");
+
+        let updates = live_updates_for_response(&response, true);
+
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(
+            updates[0].content.as_slice(),
+            [MessageContent::Thinking(_)]
+        ));
+        assert!(updates[1]
+            .content
+            .iter()
+            .any(|content| matches!(content, MessageContent::Text(text) if text.text.contains("Workflow in progress"))));
+        assert!(updates
+            .iter()
+            .all(|update| !update.as_concat_text().contains("The task is complete.")));
     }
 
     #[test]
@@ -4648,6 +4687,30 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             progress.content.as_slice(),
             [MessageContent::Text(_), MessageContent::ToolRequest(_)]
         ));
+    }
+
+    #[test]
+    fn active_coding_workflow_surfaces_tool_progress() {
+        let response = Message::assistant()
+            .with_text("I will inspect the project.")
+            .with_tool_request(
+                "read",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::READ_FILE_TOOL_NAME,
+                )),
+            );
+
+        let updates = live_updates_for_response(&response, true);
+
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(
+            updates[0].content.as_slice(),
+            [MessageContent::ToolRequest(_)]
+        ));
+        assert!(updates[1]
+            .content
+            .iter()
+            .any(|content| matches!(content, MessageContent::Text(text) if text.text.contains("Workflow in progress"))));
     }
 
     #[tokio::test]
