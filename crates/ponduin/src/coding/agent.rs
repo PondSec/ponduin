@@ -1423,6 +1423,8 @@ mod tests {
         let guidance = agent.workflow_guidance(temp_dir.path()).unwrap();
         assert!(guidance.contains("coding__write_file now to create `index.html`"));
         assert!(guidance.contains("Do not read, search, preview, or transition first"));
+        assert!(guidance.contains("under 80 lines"));
+        assert!(guidance.contains("Do not embed CSS or JavaScript"));
 
         let write_file = agent
             .tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &model)
@@ -1434,6 +1436,11 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("only immediate action"));
+        assert!(write_file
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("linking styles.css and script.js"));
 
         agent
             .execute(

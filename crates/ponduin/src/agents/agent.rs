@@ -85,7 +85,9 @@ const REASONING_ONLY_TURN_MESSAGE: &str =
 const UNPRODUCTIVE_TURN_CONTINUATION: &str =
     "Continue the current task now. Reasoning alone cannot complete a turn: call the appropriate tool or provide a user-visible final answer.";
 const DEFAULT_FRONTEND_INSTRUCTIONS: &str = "The following tools are provided directly by the frontend and will be executed by the frontend when called.";
-const COMPACT_NATIVE_CODING_HISTORY_TAIL_MESSAGES: usize = 16;
+// Native local models need the original request and the latest complete tool
+// exchange, but replaying every workflow status makes each action slower.
+const COMPACT_NATIVE_CODING_HISTORY_TAIL_MESSAGES: usize = 3;
 const EXPLICIT_CODING_ACTIONS: &[&str] = &[
     "create",
     "write",
@@ -4217,7 +4219,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_native_coding_history_keeps_objective_and_complete_recent_tool_pairs() {
+    fn compact_native_coding_history_keeps_objective_and_latest_complete_tool_pair() {
         let mut messages = vec![Message::user().with_text("repair the failing project")];
         for index in 0..10 {
             let id = format!("call-{index}");
@@ -4242,13 +4244,11 @@ mod tests {
             })
         };
 
-        assert_eq!(compacted.len(), 17);
+        assert_eq!(compacted.len(), 3);
         assert_eq!(compacted[0].as_concat_text(), "repair the failing project");
         assert!(!contains_tool_response("call-0"));
-        assert!(!contains_tool_response("call-1"));
-        for index in 2..10 {
-            assert!(contains_tool_response(&format!("call-{index}")));
-        }
+        assert!(!contains_tool_response("call-8"));
+        assert!(contains_tool_response("call-9"));
         assert_eq!(compacted[1].role, rmcp::model::Role::Assistant);
     }
 

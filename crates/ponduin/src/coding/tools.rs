@@ -216,12 +216,13 @@ impl CodingToolState {
             WorkflowPhase::Editing if is_greenfield_execution(status) => {
                 let first_file = first_greenfield_file(status)
                     .unwrap_or_else(|| "the first planned file".to_string());
+                let web_bundle_requirement = greenfield_web_bundle_requirement(status);
                 format!(
                     "Greenfield execution: the workspace inspection found no existing user files. \
                      Call coding__write_file now to create `{first_file}` with `path` and complete \
                      `content`. It is a new path, so omit `expected_digest`. Do not read, search, \
                      preview, or transition first. Submit exactly one native coding__write_file call \
-                     and emit no prose before it."
+                     and emit no prose before it.{web_bundle_requirement}"
                 )
             }
             WorkflowPhase::Editing if status.changed_files.is_empty() => {
@@ -1438,6 +1439,10 @@ fn compact_native_tool_allowed(name: &str) -> bool {
 
 fn compact_native_tool_schema(mut tool: Tool, context: Option<&WorkflowToolContext>) -> Tool {
     tool.description = Some(compact_native_tool_description(tool.name.as_ref(), context).into());
+    if !compact_native_tool_needs_schema(tool.name.as_ref(), context) {
+        tool.input_schema = object!({"type": "object"}).into();
+        return tool;
+    }
     tool.input_schema = match tool.name.as_ref() {
         REPOSITORY_PROFILE_TOOL_NAME | PROJECT_CAPABILITIES_TOOL_NAME => object!({
             "type": "object",
@@ -1522,6 +1527,30 @@ fn compact_native_tool_schema(mut tool: Tool, context: Option<&WorkflowToolConte
     }
     .into();
     tool
+}
+
+fn compact_native_tool_needs_schema(name: &str, context: Option<&WorkflowToolContext>) -> bool {
+    let Some(context) = context else {
+        return name == WORKFLOW_START_TOOL_NAME;
+    };
+    let status = &context.status;
+    match status.phase {
+        WorkflowPhase::Analyzing | WorkflowPhase::Searching => matches!(
+            name,
+            FIND_FILES_TOOL_NAME | READ_FILE_TOOL_NAME | WORKFLOW_SET_PLAN_TOOL_NAME
+        ),
+        WorkflowPhase::Planning => name == WORKFLOW_TRANSITION_TOOL_NAME,
+        WorkflowPhase::Editing if status.changed_files.is_empty() => name == WRITE_FILE_TOOL_NAME,
+        WorkflowPhase::Editing => name == WORKFLOW_TRANSITION_TOOL_NAME,
+        WorkflowPhase::Testing if context.review_ready => name == WORKFLOW_TRANSITION_TOOL_NAME,
+        WorkflowPhase::Testing => name == RUN_PROCESS_TOOL_NAME,
+        WorkflowPhase::Debugging => true,
+        WorkflowPhase::Reviewing if context.completion_ready => name == WORKFLOW_COMPLETE_TOOL_NAME,
+        WorkflowPhase::Reviewing => name == REVIEW_CHANGES_TOOL_NAME,
+        WorkflowPhase::Completed | WorkflowPhase::Blocked | WorkflowPhase::Failed => {
+            name == WORKFLOW_START_TOOL_NAME
+        }
+    }
 }
 
 fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolContext>) -> String {
@@ -1621,10 +1650,11 @@ fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolCont
         (WorkflowPhase::Editing, WRITE_FILE_TOOL_NAME) if is_greenfield_execution(status) => {
             let first_file = first_greenfield_file(status)
                 .unwrap_or_else(|| "the first planned file".to_string());
+            let web_bundle_requirement = greenfield_web_bundle_requirement(status);
             format!(
                 "Greenfield: this is the only immediate action. Create `{first_file}` now with \
                  path and complete content. It is new, so omit expected_digest. Do not read, \
-                 search, preview, or transition first."
+                 search, preview, or transition first.{web_bundle_requirement}"
             )
         }
         (WorkflowPhase::Editing, WRITE_FILE_TOOL_NAME) if status.changed_files.is_empty() => {
@@ -1685,6 +1715,25 @@ fn first_greenfield_file(status: &WorkflowStatus) -> Option<String> {
         .relevant_files
         .first()
         .map(|path| path.display().to_string())
+}
+
+fn greenfield_web_bundle_requirement(status: &WorkflowStatus) -> &'static str {
+    let Some(plan) = &status.plan else {
+        return "";
+    };
+    let has_file = |name| {
+        plan.relevant_files
+            .iter()
+            .any(|path| path == Path::new(name))
+    };
+    if first_greenfield_file(status).as_deref() == Some("index.html")
+        && has_file("styles.css")
+        && has_file("script.js")
+    {
+        " Build a concise semantic HTML document only (under 80 lines), linking styles.css and script.js. Do not embed CSS or JavaScript in index.html because those planned files are created separately."
+    } else {
+        ""
+    }
 }
 
 fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> {
