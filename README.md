@@ -46,7 +46,7 @@ Ponduin provides two primary ways to work:
 ```text
 ┌──────────────────────────────────────────────────────────┐
 │                    Ponduin Desktop                       │
-│              Electron · React · TypeScript              │
+│              Electron · React · TypeScript               │
 └───────────────────────────┬──────────────────────────────┘
                             │
 ┌───────────────────────────▼──────────────────────────────┐
