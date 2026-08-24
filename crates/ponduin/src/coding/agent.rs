@@ -9,6 +9,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool,
 };
 use serde_json::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -565,6 +566,55 @@ impl CodingAgent {
 
         match tool_name.as_ref() {
             tools::WORKFLOW_SET_PLAN_TOOL_NAME if status.plan.is_none() => {
+                if !arguments.contains_key("plan")
+                    && status.memory.read_files.is_empty()
+                    && workspace_has_no_user_files(workspace_root)
+                {
+                    let Some((relevant_files, program, args)) =
+                        greenfield_plan_defaults(&status.task.original_user_request)
+                    else {
+                        return;
+                    };
+                    let files = relevant_files
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect::<Vec<_>>();
+                    let scope = relevant_files.join(", ");
+                    arguments
+                        .entry("relevant_files".to_string())
+                        .or_insert_with(|| Value::Array(files));
+                    arguments
+                        .entry("intended_change".to_string())
+                        .or_insert_with(|| {
+                            Value::String(format!(
+                                "Create the requested greenfield implementation in {scope}."
+                            ))
+                        });
+                    arguments
+                        .entry("plan_steps".to_string())
+                        .or_insert_with(|| {
+                            Value::Array(vec![
+                                Value::String(format!(
+                                    "Create the requested implementation across {scope}."
+                                )),
+                                Value::String(format!(
+                                    "Run `{program} {}` and require a successful exit status.",
+                                    args.join(" ")
+                                )),
+                                Value::String(format!(
+                                    "Read {scope} again and review that the created files satisfy the request."
+                                )),
+                            ])
+                        });
+                    arguments
+                        .entry("validation_program".to_string())
+                        .or_insert_with(|| Value::String(program));
+                    arguments.entry("args".to_string()).or_insert_with(|| {
+                        Value::Array(args.into_iter().map(Value::String).collect())
+                    });
+                    return;
+                }
                 if [
                     "relevant_files",
                     "intended_change",
@@ -762,6 +812,61 @@ fn default_validation_command(
     }
     if request.contains("pnpm test") {
         return Some(("pnpm".to_string(), vec!["test".to_string()]));
+    }
+    if request.contains("javascript") || request.contains(" html") || request.contains("website") {
+        return Some((
+            "node".to_string(),
+            vec!["--check".to_string(), "script.js".to_string()],
+        ));
+    }
+    None
+}
+
+fn workspace_has_no_user_files(workspace_root: &Path) -> bool {
+    fs::read_dir(workspace_root).ok().is_some_and(|entries| {
+        entries.flatten().all(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.'))
+        })
+    })
+}
+
+fn greenfield_plan_defaults(original_request: &str) -> Option<(Vec<String>, String, Vec<String>)> {
+    let request = original_request.to_ascii_lowercase();
+    if request.contains("html") || request.contains("website") || request.contains("webseite") {
+        let mut files = vec!["index.html".to_string()];
+        if request.contains("css") {
+            files.push("styles.css".to_string());
+        }
+        if request.contains("javascript") || request.contains(" js") {
+            files.push("script.js".to_string());
+        }
+        let script = files.iter().find(|path| path.ends_with(".js"))?.to_string();
+        return Some((
+            files,
+            "node".to_string(),
+            vec!["--check".to_string(), script],
+        ));
+    }
+    if request.contains("python") {
+        return Some((
+            vec!["main.py".to_string()],
+            "python3".to_string(),
+            vec![
+                "-m".to_string(),
+                "py_compile".to_string(),
+                "main.py".to_string(),
+            ],
+        ));
+    }
+    if request.contains("rust") || request.contains("cargo") {
+        return Some((
+            vec!["src/main.rs".to_string()],
+            "cargo".to_string(),
+            vec!["check".to_string()],
+        ));
     }
     None
 }
@@ -1227,6 +1332,53 @@ mod tests {
         let editing: Value =
             serde_json::from_str(&editing.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(editing["phase"], "editing");
+    }
+
+    #[tokio::test]
+    async fn compact_workflow_derives_a_greenfield_web_plan_from_an_empty_tool_call() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent.register_task_context(
+            PonduinMode::Auto,
+            temp_dir.path(),
+            "Erstelle eine moderne Website mit HTML, CSS und JavaScript.".to_string(),
+        );
+
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let planned = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME)
+                    .with_arguments(object!({})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let planned: Value =
+            serde_json::from_str(&planned.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(planned["phase"], "planning");
+        assert_eq!(
+            planned["plan"]["relevant_files"],
+            serde_json::json!(["index.html", "styles.css", "script.js"])
+        );
+        assert_eq!(
+            planned["plan"]["validation"][0]["command"]["program"],
+            "node"
+        );
+        assert_eq!(
+            planned["plan"]["validation"][0]["command"]["args"],
+            serde_json::json!(["--check", "script.js"])
+        );
     }
 
     #[tokio::test]
