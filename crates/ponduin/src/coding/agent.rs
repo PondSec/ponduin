@@ -640,18 +640,12 @@ impl CodingAgent {
                     arguments
                         .entry("plan_steps".to_string())
                         .or_insert_with(|| {
-                            Value::Array(vec![
-                                Value::String(format!(
-                                    "Create the requested implementation across {scope}."
-                                )),
-                                Value::String(format!(
-                                    "Run `{program} {}` and require a successful exit status.",
-                                    args.join(" ")
-                                )),
-                                Value::String(format!(
-                                    "Read {scope} again and review that the created files satisfy the request."
-                                )),
-                            ])
+                            Value::Array(
+                                greenfield_plan_steps(&relevant_files, &program, &args)
+                                    .into_iter()
+                                    .map(Value::String)
+                                    .collect(),
+                            )
                         });
                     arguments
                         .entry("validation_program".to_string())
@@ -760,7 +754,8 @@ impl CodingAgent {
                 let transition = match status.phase {
                     crate::coding::workflow::WorkflowPhase::Planning => Some("begin_editing"),
                     crate::coding::workflow::WorkflowPhase::Editing
-                        if !status.changed_files.is_empty() =>
+                        if !greenfield_plan_has_pending_files(&status)
+                            && !status.changed_files.is_empty() =>
                     {
                         Some("begin_validation")
                     }
@@ -877,6 +872,42 @@ fn workspace_has_no_user_files(workspace_root: &Path) -> bool {
                 .is_some_and(|name| name.starts_with('.'))
         })
     })
+}
+
+fn greenfield_plan_has_pending_files(status: &crate::coding::workflow::WorkflowStatus) -> bool {
+    status.memory.empty_workspace_discovered
+        && status.plan.as_ref().is_some_and(|plan| {
+            plan.relevant_files
+                .iter()
+                .any(|path| !status.changed_files.contains(path))
+        })
+}
+
+fn greenfield_plan_steps(files: &[String], program: &str, args: &[String]) -> Vec<String> {
+    let command = if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    };
+
+    if files == ["index.html", "styles.css", "script.js"] {
+        return vec![
+            "Create index.html with semantic page structure and links to styles.css and script.js."
+                .to_string(),
+            "Create styles.css with the responsive visual design for the page.".to_string(),
+            "Create script.js with the requested dependency-free page interactions.".to_string(),
+            format!("Run `{command}` and require a successful exit status."),
+            "Read all created files again and review that structure, styling, and interactions agree."
+                .to_string(),
+        ];
+    }
+
+    let scope = files.join(", ");
+    vec![
+        format!("Create the requested implementation across {scope}."),
+        format!("Run `{command}` and require a successful exit status."),
+        format!("Read {scope} again and review that the created files satisfy the request."),
+    ]
 }
 
 fn greenfield_plan_defaults(original_request: &str) -> Option<(Vec<String>, String, Vec<String>)> {
@@ -1463,6 +1494,16 @@ mod tests {
         assert_eq!(
             planned["plan"]["validation"][0]["command"]["args"],
             serde_json::json!(["--check", "script.js"])
+        );
+        assert_eq!(
+            planned["plan"]["intended_changes"],
+            serde_json::json!([
+                "Create index.html with semantic page structure and links to styles.css and script.js.",
+                "Create styles.css with the responsive visual design for the page.",
+                "Create script.js with the requested dependency-free page interactions.",
+                "Run `node --check script.js` and require a successful exit status.",
+                "Read all created files again and review that structure, styling, and interactions agree."
+            ])
         );
     }
 

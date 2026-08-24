@@ -326,6 +326,7 @@ impl CodingToolState {
                 Some(WORKFLOW_SET_PLAN_TOOL_NAME)
             }
             WorkflowPhase::Planning => Some(WORKFLOW_TRANSITION_TOOL_NAME),
+            WorkflowPhase::Editing if is_greenfield_execution(status) => Some(WRITE_FILE_TOOL_NAME),
             WorkflowPhase::Editing if status.changed_files.is_empty() => Some(WRITE_FILE_TOOL_NAME),
             WorkflowPhase::Editing => Some(WORKFLOW_TRANSITION_TOOL_NAME),
             WorkflowPhase::Testing if context.review_ready => Some(WORKFLOW_TRANSITION_TOOL_NAME),
@@ -1568,6 +1569,7 @@ fn compact_native_tool_needs_schema(name: &str, context: Option<&WorkflowToolCon
             FIND_FILES_TOOL_NAME | READ_FILE_TOOL_NAME | WORKFLOW_SET_PLAN_TOOL_NAME
         ),
         WorkflowPhase::Planning => name == WORKFLOW_TRANSITION_TOOL_NAME,
+        WorkflowPhase::Editing if is_greenfield_execution(status) => name == WRITE_FILE_TOOL_NAME,
         WorkflowPhase::Editing if status.changed_files.is_empty() => name == WRITE_FILE_TOOL_NAME,
         WorkflowPhase::Editing => name == WORKFLOW_TRANSITION_TOOL_NAME,
         WorkflowPhase::Testing if context.review_ready => name == WORKFLOW_TRANSITION_TOOL_NAME,
@@ -1704,6 +1706,16 @@ fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolCont
              already exists."
                 .to_string()
         }
+        (WorkflowPhase::Editing, WORKFLOW_TRANSITION_TOOL_NAME)
+            if is_greenfield_execution(status) =>
+        {
+            let next_file = first_greenfield_file(status)
+                .unwrap_or_else(|| "the next planned file".to_string());
+            format!(
+                "The greenfield bundle is incomplete. Create `{next_file}` before validation; \
+                 do not transition yet."
+            )
+        }
         (WorkflowPhase::Editing, WORKFLOW_TRANSITION_TOOL_NAME) if !status.changed_files.is_empty() => {
             "Current phase: Editing with a retained change. Call this now with transition `begin_validation`.".to_string()
         }
@@ -1742,21 +1754,18 @@ fn compact_native_tool_description(name: &str, context: Option<&WorkflowToolCont
 
 fn is_greenfield_execution(status: &WorkflowStatus) -> bool {
     status.phase == WorkflowPhase::Editing
-        && status.changed_files.is_empty()
         && status.memory.read_files.is_empty()
-        && status
-            .plan
-            .as_ref()
-            .is_some_and(|plan| !plan.relevant_files.is_empty())
+        && first_greenfield_file(status).is_some()
 }
 
 fn first_greenfield_file(status: &WorkflowStatus) -> Option<String> {
+    let changed_files = status.changed_files.iter().collect::<BTreeSet<_>>();
     status
         .plan
         .as_ref()?
         .relevant_files
-        .first()
-        .map(|path| path.display().to_string())
+        .iter()
+        .find_map(|path| (!changed_files.contains(path)).then(|| path.display().to_string()))
 }
 
 fn greenfield_web_bundle_requirement(status: &WorkflowStatus) -> &'static str {
@@ -1768,13 +1777,17 @@ fn greenfield_web_bundle_requirement(status: &WorkflowStatus) -> &'static str {
             .iter()
             .any(|path| path == Path::new(name))
     };
-    if first_greenfield_file(status).as_deref() == Some("index.html")
-        && has_file("styles.css")
-        && has_file("script.js")
-    {
-        " Build a concise semantic HTML document only (under 80 lines), linking styles.css and script.js. Do not embed CSS or JavaScript in index.html because those planned files are created separately."
-    } else {
-        ""
+    match first_greenfield_file(status).as_deref() {
+        Some("index.html") if has_file("styles.css") && has_file("script.js") => {
+            " Build a concise semantic HTML document only (under 80 lines), linking styles.css and script.js. Do not embed CSS or JavaScript in index.html because those planned files are created separately."
+        }
+        Some("styles.css") => {
+            " Create only the planned stylesheet now: provide a calm, responsive visual system for index.html and do not embed HTML or JavaScript."
+        }
+        Some("script.js") => {
+            " Create only the planned JavaScript now: keep it dependency-free, add the page interactions, and ensure it is valid for `node --check`."
+        }
+        _ => "",
     }
 }
 
@@ -1948,11 +1961,15 @@ fn definitions_for_workflow(context: Option<&WorkflowToolContext>) -> Vec<Tool> 
             "The retained change requires no validation, so begin_review is the only valid next \
              workflow transition.",
         )),
-        WorkflowPhase::Editing if !status.changed_files.is_empty() => Some((
-            "begin_validation",
-            "A retained change exists, so begin_validation is the only valid next workflow \
+        WorkflowPhase::Editing
+            if !is_greenfield_execution(status) && !status.changed_files.is_empty() =>
+        {
+            Some((
+                "begin_validation",
+                "A retained change exists, so begin_validation is the only valid next workflow \
              transition.",
-        )),
+            ))
+        }
         WorkflowPhase::Testing if context.review_ready => Some((
             "begin_review",
             "Current-revision validation evidence is acceptable, so begin_review is the only \
@@ -5771,6 +5788,115 @@ mod tests {
         assert_eq!(
             state.compact_preferred_tool_name_for_workspace(&workspace_root),
             Some(WORKFLOW_SET_PLAN_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn greenfield_web_bundle_writes_every_planned_file_before_validation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let started = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "create an HTML, CSS, and JavaScript website"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let started: Value = serde_json::from_str(&result_text(started)).unwrap();
+        let workflow_id = started["id"].as_str().unwrap();
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(FIND_FILES_TOOL_NAME)
+                .with_arguments(object!({"query": "*.{html,css,js}"})),
+            temp_dir.path(),
+        )
+        .unwrap();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(object!({
+                "workflow_id": workflow_id,
+                "relevant_files": ["index.html", "styles.css", "script.js"],
+                "intended_change": "Create a small web bundle.",
+                "plan_steps": [
+                    "Create index.html with semantic page structure.",
+                    "Create styles.css with responsive styling.",
+                    "Create script.js with page interactions.",
+                    "Run node --check script.js.",
+                    "Read the created files and review the bundle."
+                ],
+                "validation_program": "node",
+                "args": ["--check", "script.js"]
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        transition(
+            &config,
+            &state,
+            temp_dir.path(),
+            workflow_id,
+            "begin_editing",
+        );
+
+        for (path, content, next_file) in [
+            (
+                "index.html",
+                "<link rel=\"stylesheet\" href=\"styles.css\">",
+                "styles.css",
+            ),
+            ("styles.css", "body { color: #222; }", "script.js"),
+        ] {
+            execute_with_state(
+                &config,
+                &state,
+                CallToolRequestParams::new(WRITE_FILE_TOOL_NAME)
+                    .with_arguments(object!({"path": path, "content": content})),
+                temp_dir.path(),
+            )
+            .unwrap();
+
+            let workspace_root = temp_dir.path().canonicalize().unwrap();
+            let guidance = state
+                .workflow_guidance_for_workspace(&workspace_root)
+                .unwrap();
+            assert!(guidance.contains(next_file), "{guidance}");
+            assert_eq!(
+                state.compact_preferred_tool_name_for_workspace(&workspace_root),
+                Some(WRITE_FILE_TOOL_NAME)
+            );
+            assert!(!exposed_tool_names(&state, temp_dir.path())
+                .contains(WORKFLOW_TRANSITION_TOOL_NAME));
+        }
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME)
+                .with_arguments(object!({"path": "script.js", "content": "console.log('ready');"})),
+            temp_dir.path(),
+        )
+        .unwrap();
+        let workspace_root = temp_dir.path().canonicalize().unwrap();
+        let status = state.workflow_status(&workspace_root, None).unwrap();
+        assert_eq!(status.phase, WorkflowPhase::Editing, "{status:#?}");
+        assert_eq!(
+            status.changed_files,
+            vec![
+                PathBuf::from("index.html"),
+                PathBuf::from("script.js"),
+                PathBuf::from("styles.css"),
+            ],
+            "{status:#?}"
+        );
+        assert_eq!(
+            exposed_transition_values(&state, temp_dir.path()),
+            ["begin_validation"]
         );
     }
 
