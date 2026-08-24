@@ -532,6 +532,22 @@ fn message_for_live_update(message: &Message) -> Option<Message> {
     (!message.content.is_empty()).then(|| message.clone())
 }
 
+fn coding_progress_message_for_live_update(message: &Message) -> Option<Message> {
+    let content = message
+        .content
+        .iter()
+        .filter_map(|content| match content.user_visible_content() {
+            Some(MessageContent::Text(text)) if !text.text.trim().is_empty() => {
+                Some(MessageContent::Text(text))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    (!content.is_empty())
+        .then(|| Message::new(message.role.clone(), message.created, content).with_generated_id())
+}
+
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
 }
@@ -2672,6 +2688,12 @@ impl Agent {
                                     },
                                 );
 
+                                let num_tool_requests = frontend_requests.len() + remaining_requests.len();
+                                let coding_progress = (coding_tools_active
+                                    && ponduin_mode == PonduinMode::Auto
+                                    && num_tool_requests > 0)
+                                    .then(|| coding_progress_message_for_live_update(&filtered_response))
+                                    .flatten();
                                 let suppress_user_visible_response = coding_tools_active
                                     && ponduin_mode == PonduinMode::Auto;
 
@@ -2680,9 +2702,12 @@ impl Agent {
                                         yield AgentEvent::Message(live_response);
                                         tokio::task::yield_now().await;
                                     }
+                                } else if let Some(progress) = coding_progress {
+                                    messages_to_add.push(progress.clone());
+                                    yield AgentEvent::Message(progress);
+                                    tokio::task::yield_now().await;
                                 }
 
-                                let num_tool_requests = frontend_requests.len() + remaining_requests.len();
                                 if num_tool_requests == 0 {
                                     let text = filtered_response.as_concat_text();
                                     if !suppress_user_visible_response && !text.is_empty() {
@@ -4912,6 +4937,35 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             progress.content.as_slice(),
             [MessageContent::Text(_), MessageContent::ToolRequest(_)]
         ));
+    }
+
+    #[test]
+    fn coding_progress_exposes_only_user_visible_model_text() {
+        use rmcp::model::{Annotations, Role, TextContent};
+
+        let assistant_only = TextContent::new("private model context")
+            .with_annotations(Annotations::default().with_audience(vec![Role::Assistant]));
+        let response = Message::assistant()
+            .with_content(MessageContent::Text(assistant_only))
+            .with_text("The file was read; I will now update the targeted function.")
+            .with_thinking("private reasoning", "")
+            .with_tool_request(
+                "write",
+                Ok(CallToolRequestParams::new(
+                    crate::coding::tools::WRITE_FILE_TOOL_NAME,
+                )),
+            );
+
+        let progress = coding_progress_message_for_live_update(&response).expect("progress text");
+
+        assert_eq!(
+            progress.as_concat_text(),
+            "The file was read; I will now update the targeted function."
+        );
+        assert!(progress
+            .content
+            .iter()
+            .all(|content| matches!(content, MessageContent::Text(_))));
     }
 
     #[tokio::test]
