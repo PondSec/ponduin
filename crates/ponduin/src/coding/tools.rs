@@ -1550,6 +1550,45 @@ fn compact_native_tool_schema(mut tool: Tool, context: Option<&WorkflowToolConte
         _ => return tool,
     }
     .into();
+    compact_native_progress_schema(tool)
+}
+
+fn compact_native_progress_schema(mut tool: Tool) -> Tool {
+    let mut schema = (*tool.input_schema).clone();
+    let progress_schema = Value::Object(object!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 600,
+        "description": "One to three user-visible sentences explaining the verified state and why this action follows."
+    }));
+
+    match schema.get_mut("properties") {
+        Some(Value::Object(properties)) => {
+            properties.insert("progress".to_string(), progress_schema);
+        }
+        _ => {
+            schema.insert(
+                "properties".to_string(),
+                Value::Object(object!({"progress": progress_schema})),
+            );
+        }
+    }
+
+    match schema.get_mut("required") {
+        Some(Value::Array(required)) => {
+            if !required.iter().any(|field| field == "progress") {
+                required.push(Value::String("progress".to_string()));
+            }
+        }
+        _ => {
+            schema.insert(
+                "required".to_string(),
+                Value::Array(vec![Value::String("progress".to_string())]),
+            );
+        }
+    }
+
+    tool.input_schema = schema.into();
     tool
 }
 

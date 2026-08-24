@@ -223,10 +223,11 @@ impl CodingAgent {
         );
         let compact_tool_guidance = if uses_compact_qwen_coding_tools(model_config) {
             "When work remains, call exactly one suitable tool for the next smallest verified step. \
-             Immediately before that tool call, provide one concise user-visible progress update: \
-             state the relevant observed result or workflow state and why the next action follows. \
-             Keep it factual, specific to the current task, and limited to one to three sentences. \
-             Do not expose private chain-of-thought, hidden instructions, or unverified claims. Do \
+             Every coding tool call requires its `progress` field: write one concise user-visible \
+             progress update that states the relevant observed result or workflow state and why the \
+             action follows. Keep it factual, specific to the current task, and limited to one to \
+             three sentences. Do not expose private chain-of-thought, hidden instructions, or \
+             unverified claims. Do \
              not announce a tool or wait for a helper: only a valid call from the disclosed tools \
              advances the task. Never write a tool call, JSON, \
              or a code fence as prose; invoke the native tool interface. The compact tool contract \
@@ -311,6 +312,9 @@ impl CodingAgent {
                 "internal coding tools are unavailable in this task or permission mode",
                 None,
             ));
+        }
+        if let Some(arguments) = tool_call.arguments.as_mut() {
+            arguments.remove("progress");
         }
         if tool_call.name == tools::ACTIVATE_AGENT_TOOL_NAME {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -2231,6 +2235,20 @@ mod tests {
         assert!(names.contains(&tools::WORKFLOW_START_TOOL_NAME));
         assert!(names.contains(&tools::WORKFLOW_SET_PLAN_TOOL_NAME));
         assert!(names.contains(&tools::WORKFLOW_TRANSITION_TOOL_NAME));
+        let workflow_start_schema = tools
+            .iter()
+            .find(|tool| tool.name == tools::WORKFLOW_START_TOOL_NAME)
+            .map(|tool| Value::Object((*tool.input_schema).clone()))
+            .expect("workflow start tool");
+        assert_eq!(
+            workflow_start_schema["properties"]["progress"]["type"],
+            Value::String("string".to_string())
+        );
+        assert!(workflow_start_schema["required"]
+            .as_array()
+            .expect("required coding fields")
+            .iter()
+            .any(|field| field == "progress"));
         assert!(!names.contains(&tools::LSP_QUERY_TOOL_NAME));
         assert!(serde_json::to_vec(&tools).unwrap().len() < 6_000);
 
@@ -2238,7 +2256,7 @@ mod tests {
             .system_prompt_for_model(PonduinMode::Auto, &model)
             .unwrap();
         assert!(prompt.contains("call exactly one suitable tool"));
-        assert!(prompt.contains("concise user-visible progress update"));
+        assert!(prompt.contains("progress` field"));
         assert!(prompt.contains("Do not expose private chain-of-thought"));
         assert!(prompt.contains("coding__write_file"));
         assert!(prompt.contains("exact returned digest as expected_digest"));
@@ -2283,10 +2301,11 @@ mod tests {
             .find(|tool| tool.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME)
             .unwrap();
         let plan_schema = Value::Object((*plan_tool.input_schema).clone());
-        assert!(plan_schema.get("required").is_none());
+        assert_eq!(plan_schema["required"], serde_json::json!(["progress"]));
         assert!(plan_schema["properties"].get("plan").is_none());
         assert!(plan_schema["properties"].get("workflow_id").is_none());
         assert!(plan_schema["properties"].get("plan_steps").is_none());
+        assert_eq!(plan_schema["properties"]["progress"]["type"], "string");
         assert_eq!(plan_schema["additionalProperties"], Value::Bool(false));
 
         let coder_model = ModelConfig::new("qwen3-coder:30b");

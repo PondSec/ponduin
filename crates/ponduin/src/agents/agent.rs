@@ -548,6 +548,21 @@ fn coding_progress_message_for_live_update(message: &Message) -> Option<Message>
         .then(|| Message::new(message.role.clone(), message.created, content).with_generated_id())
 }
 
+fn coding_tool_progress_message_for_live_update(request: &ToolRequest) -> Option<Message> {
+    let tool_call = request.tool_call.as_ref().ok()?;
+    if !crate::coding::tools::is_reserved_name(&tool_call.name) {
+        return None;
+    }
+    let text = tool_call
+        .arguments
+        .as_ref()?
+        .get("progress")?
+        .as_str()?
+        .trim();
+
+    (!text.is_empty()).then(|| Message::assistant().with_text(text).with_generated_id())
+}
+
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
 }
@@ -2689,11 +2704,21 @@ impl Agent {
                                 );
 
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
-                                let coding_progress = (coding_tools_active
+                                let coding_progress = if coding_tools_active
                                     && ponduin_mode == PonduinMode::Auto
-                                    && num_tool_requests > 0)
-                                    .then(|| coding_progress_message_for_live_update(&filtered_response))
-                                    .flatten();
+                                    && num_tool_requests > 0
+                                {
+                                    coding_progress_message_for_live_update(&filtered_response)
+                                        .into_iter()
+                                        .chain(
+                                            remaining_requests
+                                                .iter()
+                                                .filter_map(coding_tool_progress_message_for_live_update),
+                                        )
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                };
                                 let suppress_user_visible_response = coding_tools_active
                                     && ponduin_mode == PonduinMode::Auto;
 
@@ -2702,10 +2727,12 @@ impl Agent {
                                         yield AgentEvent::Message(live_response);
                                         tokio::task::yield_now().await;
                                     }
-                                } else if let Some(progress) = coding_progress {
-                                    messages_to_add.push(progress.clone());
-                                    yield AgentEvent::Message(progress);
-                                    tokio::task::yield_now().await;
+                                } else {
+                                    for progress in coding_progress {
+                                        messages_to_add.push(progress.clone());
+                                        yield AgentEvent::Message(progress);
+                                        tokio::task::yield_now().await;
+                                    }
                                 }
 
                                 if num_tool_requests == 0 {
@@ -4966,6 +4993,32 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .content
             .iter()
             .all(|content| matches!(content, MessageContent::Text(_))));
+    }
+
+    #[test]
+    fn coding_tool_progress_is_streamed_as_visible_text() {
+        let request =
+            ToolRequest {
+                id: "write".to_string(),
+                tool_call: Ok(CallToolRequestParams::new(
+                    crate::coding::tools::WRITE_FILE_TOOL_NAME,
+                )
+                .with_arguments(rmcp::object!({
+                    "path": "index.html",
+                    "content": "<main />",
+                    "progress": "The page structure is defined; I am now writing the first file."
+                }))),
+                metadata: None,
+                tool_meta: None,
+            };
+
+        let progress =
+            coding_tool_progress_message_for_live_update(&request).expect("progress text");
+
+        assert_eq!(
+            progress.as_concat_text(),
+            "The page structure is defined; I am now writing the first file."
+        );
     }
 
     #[tokio::test]
