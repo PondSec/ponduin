@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "自动压缩阈值"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "编辑自动压缩阈值"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "保存自动压缩阈值"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "立即压缩"
   },

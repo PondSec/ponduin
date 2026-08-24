@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "Compactar automáticamente al"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "Editar el umbral de compactación automática"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "Guardar el umbral de compactación automática"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "Compactar ahora"
   },

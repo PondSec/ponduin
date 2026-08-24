@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "Otomatik sıkıştırma eşiği"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "Otomatik sıkıştırma eşiğini düzenle"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "Otomatik sıkıştırma eşiğini kaydet"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "Şimdi sıkıştır"
   },

@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "Tự động nén tại"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "Chỉnh sửa ngưỡng nén tự động"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "Lưu ngưỡng nén tự động"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "Nén ngay"
   },

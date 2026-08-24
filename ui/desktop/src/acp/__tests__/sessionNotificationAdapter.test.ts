@@ -114,6 +114,30 @@ function firstContent(message: Message): Message['content'][number] {
 
 describe('createAcpSessionNotificationAdapter', () => {
   describe('apply', () => {
+    it('maps standard ACP usage updates into token state', () => {
+      const adapter = createAcpSessionNotificationAdapter();
+
+      expect(
+        adapter.apply(
+          acpUpdate({
+            sessionUpdate: 'usage_update',
+            used: 42,
+            size: 200,
+            cost: { amount: 0.12, currency: 'USD' },
+          } as SessionNotification['update'])
+        )
+      ).toEqual([
+        {
+          type: 'tokenState',
+          tokenState: {
+            totalTokens: 42,
+            contextLimit: 200,
+            accumulatedCost: 0.12,
+          },
+        },
+      ]);
+    });
+
     describe('message chunks', () => {
       it('maps and merges text chunks by role', () => {
         const adapter = createAcpSessionNotificationAdapter();
@@ -758,6 +782,7 @@ describe('createAcpSessionNotificationAdapter', () => {
           type: 'tokenState',
           tokenState: {
             totalTokens: 42,
+            contextLimit: 200,
             accumulatedInputTokens: 10,
             accumulatedOutputTokens: 15,
             accumulatedTotalTokens: 25,

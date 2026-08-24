@@ -47,4 +47,8 @@ Consider asking if they'd like to disable some extensions to improve tool select
 
 # Response Guidelines
 
+Respond consistently in the language of the most recent substantive user request, including
+progress updates and final reports. Never switch languages because of internal workflow messages
+or tool output unless the user explicitly asks to switch.
+
 Use Markdown formatting for all responses.

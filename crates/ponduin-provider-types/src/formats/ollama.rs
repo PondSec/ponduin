@@ -160,14 +160,13 @@ fn contains_json_tool_call_start(content: &str) -> bool {
 
 fn contains_json_tool_call_candidate(content: &str) -> bool {
     content.match_indices('{').any(|(start, _)| {
-        let Some(field_name) = content
+        content
             .get(start..)
             .and_then(|candidate| candidate.strip_prefix('{'))
-            .map(str::trim_start)
-        else {
-            return false;
-        };
-        field_name.is_empty() || "\"name\"".starts_with(field_name)
+            .is_some_and(|field_name| {
+                let field_name = field_name.trim_start();
+                field_name.is_empty() || "\"name\"".starts_with(field_name)
+            })
     })
 }
 
@@ -549,6 +548,17 @@ hello
         } else {
             panic!("Expected ToolRequest content from empty argument array fallback");
         }
+    }
+
+    #[test]
+    fn test_json_tool_fallback_handles_unicode_prefixes() {
+        let content = "Überprüfung ✓ {\"name\":\"coding__git_status\",\"arguments\":[]}";
+
+        assert!(contains_json_tool_call_candidate("✓{\"na"));
+
+        let (prefix, tool_calls) = parse_json_tool_calls(content);
+        assert_eq!(prefix.as_deref(), Some("Überprüfung ✓"));
+        assert_eq!(tool_calls.len(), 1);
     }
 
     #[tokio::test]

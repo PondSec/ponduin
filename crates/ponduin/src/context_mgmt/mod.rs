@@ -23,7 +23,11 @@ use tokio::task::JoinHandle;
 use tracing::info;
 use tracing::log::warn;
 
-pub const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.8;
+/// Keep half of the advertised context window free by default. This gives
+/// locally hosted models enough headroom for tool results and generation on
+/// memory-constrained machines while allowing an explicit configuration
+/// override for larger deployments.
+pub const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.5;
 
 const TOOLCALL_SUMMARIZATION_BATCH_SIZE: usize = 10;
 
@@ -1086,21 +1090,44 @@ mod tests {
 
     #[test]
     fn test_compute_tool_call_cutoff_scales_with_context() {
-        // Default threshold (0.8)
-        assert_eq!(compute_tool_call_cutoff(128_000, 0.8), 15); // 102K effective
-        assert_eq!(compute_tool_call_cutoff(200_000, 0.8), 24); // 160K effective
-        assert_eq!(compute_tool_call_cutoff(1_000_000, 0.8), 120); // 800K effective
-                                                                   // Clamp at minimum
-        assert_eq!(compute_tool_call_cutoff(50_000, 0.8), 10);
-        assert_eq!(compute_tool_call_cutoff(10_000, 0.8), 10);
+        // Default threshold (0.5) reserves half of the advertised context window.
+        assert_eq!(
+            compute_tool_call_cutoff(128_000, DEFAULT_COMPACTION_THRESHOLD),
+            10
+        ); // 64K effective
+        assert_eq!(
+            compute_tool_call_cutoff(200_000, DEFAULT_COMPACTION_THRESHOLD),
+            15
+        ); // 100K effective
+        assert_eq!(
+            compute_tool_call_cutoff(1_000_000, DEFAULT_COMPACTION_THRESHOLD),
+            75
+        ); // 500K effective
+           // Clamp at minimum
+        assert_eq!(
+            compute_tool_call_cutoff(50_000, DEFAULT_COMPACTION_THRESHOLD),
+            10
+        );
+        assert_eq!(
+            compute_tool_call_cutoff(10_000, DEFAULT_COMPACTION_THRESHOLD),
+            10
+        );
         // Clamp at maximum (500)
-        assert_eq!(compute_tool_call_cutoff(10_000_000, 0.8), 500);
+        assert_eq!(
+            compute_tool_call_cutoff(10_000_000, DEFAULT_COMPACTION_THRESHOLD),
+            500
+        );
         // Lower compaction threshold means earlier summarization
         assert_eq!(compute_tool_call_cutoff(200_000, 0.3), 10); // 60K effective
         assert_eq!(compute_tool_call_cutoff(1_000_000, 0.5), 75); // 500K effective
-                                                                  // Invalid threshold falls back to default 0.8
-        assert_eq!(compute_tool_call_cutoff(200_000, 0.0), 24); // falls back to 0.8
-        assert_eq!(compute_tool_call_cutoff(200_000, -1.0), 24); // falls back to 0.8
+                                                                  // Invalid threshold falls back to the safe default.
+        assert_eq!(compute_tool_call_cutoff(200_000, 0.0), 15);
+        assert_eq!(compute_tool_call_cutoff(200_000, -1.0), 15);
+    }
+
+    #[test]
+    fn default_compaction_threshold_reserves_half_the_context_window() {
+        assert_eq!(DEFAULT_COMPACTION_THRESHOLD, 0.5);
     }
 
     #[test]

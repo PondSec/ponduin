@@ -4611,12 +4611,14 @@ impl WorkflowCompactPlanParams {
     fn into_plan(self) -> WorkflowPlan {
         let mut command_parts = self.validation_program.split_whitespace();
         let program = command_parts.next().unwrap_or_default().to_string();
-        let mut args = command_parts
+        let inline_args = command_parts
             .map(|part| part.to_string())
             .collect::<Vec<_>>();
-        if args.is_empty() || !self.args.starts_with(&args) {
-            args.extend(self.args);
-        }
+        let args = if self.args.starts_with(&inline_args) {
+            self.args
+        } else {
+            inline_args.into_iter().chain(self.args).collect()
+        };
         let validation_id = "required-validation".to_string();
         let expected_files = self.relevant_files.clone();
         let intended_changes = if (3..=6).contains(&self.plan_steps.len()) {

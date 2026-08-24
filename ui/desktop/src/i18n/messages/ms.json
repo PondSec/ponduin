@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "Padatkan automatik pada"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "Edit ambang pemadatan automatik"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "Simpan ambang pemadatan automatik"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "Padatkan sekarang"
   },

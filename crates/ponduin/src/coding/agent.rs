@@ -606,7 +606,6 @@ impl CodingAgent {
                 Value::String(workflow_id.to_string()),
             );
     }
-
     fn fill_compact_workflow_defaults(
         &self,
         tool_call: &mut CallToolRequestParams,
@@ -2297,7 +2296,7 @@ mod tests {
         assert!(planning_names.contains(&tools::WORKFLOW_SET_PLAN_TOOL_NAME));
         assert!(planning_names.contains(&tools::WORKFLOW_STATUS_TOOL_NAME));
         let plan_tool = planning_tools
-            .into_iter()
+            .iter()
             .find(|tool| tool.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME)
             .unwrap();
         let plan_schema = Value::Object((*plan_tool.input_schema).clone());

@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "ऑटो कॉम्पैक्ट पर"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "स्वचालित संक्षेपण सीमा संपादित करें"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "स्वचालित संक्षेपण सीमा सहेजें"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "अब संक्षिप्त करें"
   },

@@ -24,6 +24,14 @@ const i18n = defineMessages({
     id: 'alertBox.autoCompactAt',
     defaultMessage: 'Auto compact at',
   },
+  editAutoCompactThreshold: {
+    id: 'alertBox.editAutoCompactThreshold',
+    defaultMessage: 'Edit auto-compaction threshold',
+  },
+  saveAutoCompactThreshold: {
+    id: 'alertBox.saveAutoCompactThreshold',
+    defaultMessage: 'Save auto-compaction threshold',
+  },
   compactNow: {
     id: 'alertBox.compactNow',
     defaultMessage: 'Compact now',
@@ -40,12 +48,15 @@ const alertStyles: Record<AlertType, string> = {
   [AlertType.Info]: 'dark:bg-white dark:text-black bg-black text-white',
 };
 
+const DEFAULT_AUTO_COMPACT_THRESHOLD = 0.5;
+const MAX_AUTO_COMPACT_PERCENTAGE = 95;
+
 export const AlertBox = ({ alert, className }: AlertBoxProps) => {
   const intl = useIntl();
   const { read, upsert } = useConfig();
   const [isEditingThreshold, setIsEditingThreshold] = useState(false);
-  const [loadedThreshold, setLoadedThreshold] = useState<number>(0.8);
-  const [thresholdValue, setThresholdValue] = useState(80);
+  const [loadedThreshold, setLoadedThreshold] = useState<number>(DEFAULT_AUTO_COMPACT_THRESHOLD);
+  const [thresholdValue, setThresholdValue] = useState(DEFAULT_AUTO_COMPACT_THRESHOLD * 100);
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
@@ -54,7 +65,7 @@ export const AlertBox = ({ alert, className }: AlertBoxProps) => {
         const threshold = await read('PONDUIN_AUTO_COMPACT_THRESHOLD', false);
         if (threshold !== undefined && threshold !== null && typeof threshold === 'number') {
           setLoadedThreshold(threshold);
-          setThresholdValue(Math.max(1, Math.round(threshold * 100)));
+          setThresholdValue(Math.max(1, Math.min(MAX_AUTO_COMPACT_PERCENTAGE, Math.round(threshold * 100))));
         }
       } catch (err) {
         console.error('Error fetching auto-compact threshold:', err);
@@ -69,7 +80,7 @@ export const AlertBox = ({ alert, className }: AlertBoxProps) => {
   const handleSaveThreshold = async () => {
     if (isSaving) return; // Prevent double-clicks
 
-    let validThreshold = Math.max(1, Math.min(100, thresholdValue));
+    let validThreshold = Math.max(1, Math.min(MAX_AUTO_COMPACT_PERCENTAGE, thresholdValue));
     if (validThreshold !== thresholdValue) {
       setThresholdValue(validThreshold);
     }
@@ -121,7 +132,7 @@ export const AlertBox = ({ alert, className }: AlertBoxProps) => {
                 <input
                   type="number"
                   min="1"
-                  max="100"
+                  max={MAX_AUTO_COMPACT_PERCENTAGE}
                   step="1"
                   value={thresholdValue}
                   onChange={(e) => {
@@ -129,15 +140,15 @@ export const AlertBox = ({ alert, className }: AlertBoxProps) => {
                     if (e.target.value === '') {
                       setThresholdValue(1);
                     } else if (!isNaN(val)) {
-                      setThresholdValue(Math.max(1, Math.min(100, val)));
+                      setThresholdValue(Math.max(1, Math.min(MAX_AUTO_COMPACT_PERCENTAGE, val)));
                     }
                   }}
                   onBlur={(e) => {
                     const val = parseInt(e.target.value, 10);
                     if (isNaN(val) || val < 1) {
                       setThresholdValue(1);
-                    } else if (val > 100) {
-                      setThresholdValue(100);
+                    } else if (val > MAX_AUTO_COMPACT_PERCENTAGE) {
+                      setThresholdValue(MAX_AUTO_COMPACT_PERCENTAGE);
                     }
                   }}
                   onKeyDown={(e) => {
@@ -146,7 +157,7 @@ export const AlertBox = ({ alert, className }: AlertBoxProps) => {
                     } else if (e.key === 'Escape') {
                       setIsEditingThreshold(false);
                       const resetValue = Math.round(currentThreshold * 100);
-                      setThresholdValue(Math.max(1, resetValue));
+                      setThresholdValue(Math.max(1, Math.min(MAX_AUTO_COMPACT_PERCENTAGE, resetValue)));
                     }
                   }}
                   onFocus={(e) => {
@@ -162,10 +173,11 @@ export const AlertBox = ({ alert, className }: AlertBoxProps) => {
                 <span className="text-[10px] opacity-70">%</span>
                 <button
                   type="button"
-                  onMouseDown={(e) => {
+                  aria-label={intl.formatMessage(i18n.saveAutoCompactThreshold)}
+                  onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    handleSaveThreshold();
+                    void handleSaveThreshold();
                   }}
                   disabled={isSaving}
                   className="p-1 hover:opacity-60 transition-opacity cursor-pointer relative z-50"
@@ -181,6 +193,7 @@ export const AlertBox = ({ alert, className }: AlertBoxProps) => {
                 </span>
                 <button
                   type="button"
+                  aria-label={intl.formatMessage(i18n.editAutoCompactThreshold)}
                   onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();

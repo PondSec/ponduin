@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "Compactage automatique à"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "Modifier le seuil de compactage automatique"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "Enregistrer le seuil de compactage automatique"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "Compacter maintenant"
   },

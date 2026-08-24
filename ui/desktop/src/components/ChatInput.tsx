@@ -169,6 +169,7 @@ interface ChatInputProps {
   onFilesProcessed?: () => void;
   setView: (view: View) => void;
   totalTokens?: number;
+  contextLimit?: number;
   accumulatedInputTokens?: number;
   accumulatedOutputTokens?: number;
   accumulatedCost?: number | null;
@@ -204,6 +205,7 @@ export default function ChatInput({
   onFilesProcessed,
   setView,
   totalTokens,
+  contextLimit,
   accumulatedInputTokens,
   accumulatedOutputTokens,
   accumulatedCost,
@@ -581,6 +583,12 @@ export default function ChatInput({
 
   // Load providers and get current model's token limit
   const loadProviderDetails = async () => {
+    if (contextLimit && contextLimit > 0) {
+      setTokenLimit(contextLimit);
+      setIsTokenLimitLoaded(true);
+      return;
+    }
+
     try {
       // Reset token limit loaded state
       setIsTokenLimitLoaded(false);
@@ -634,7 +642,7 @@ export default function ChatInput({
   useEffect(() => {
     loadProviderDetails();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveModel, effectiveProvider, configModel, configProvider]);
+  }, [contextLimit, effectiveModel, effectiveProvider, configModel, configProvider]);
 
   // Handle token usage alerts
   useEffect(() => {
