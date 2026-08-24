@@ -861,15 +861,13 @@ impl Config {
             .and_then(|v| Ok(serde_json::from_value(v.clone())?))
     }
 
-    /// Get a secret for non-interactive inventory work.
+    /// Get a secret without opening the system keyring.
     ///
-    /// Provider inventory is requested while the desktop client initializes. On
-    /// platforms with a system keyring, opening a keychain item may require user
-    /// interaction. Inventory must not make the client wait for that interaction
-    /// just to render a provider list, so it only uses keyring values already
-    /// present in this process's cache. File-backed secret storage remains safe
-    /// to load eagerly.
-    pub fn get_secret_for_inventory<T: for<'de> Deserialize<'de>>(
+    /// Startup and status work must not make the client wait for a keychain
+    /// permission prompt. This accessor uses keyring values already present in
+    /// this process's cache while file-backed secret storage remains safe to
+    /// load eagerly.
+    pub fn get_secret_without_keyring_access<T: for<'de> Deserialize<'de>>(
         &self,
         key: &str,
     ) -> Result<T, ConfigError> {
@@ -1456,11 +1454,11 @@ mod tests {
     }
 
     #[test]
-    fn inventory_secret_reads_file_backed_storage() -> Result<(), ConfigError> {
+    fn noninteractive_secret_reads_file_backed_storage() -> Result<(), ConfigError> {
         let config = new_test_config();
         config.set_secret("key", &"value")?;
 
-        let value: String = config.get_secret_for_inventory("key")?;
+        let value: String = config.get_secret_without_keyring_access("key")?;
 
         assert_eq!(value, "value");
         Ok(())
@@ -1468,7 +1466,7 @@ mod tests {
 
     #[cfg(feature = "system-keyring")]
     #[test]
-    fn inventory_secret_does_not_open_an_uncached_keyring() {
+    fn noninteractive_secret_does_not_open_an_uncached_keyring() {
         let config = Config {
             config_paths: vec![PathBuf::from("unused-config.yaml")],
             secrets: SecretStorage::Keyring {
@@ -1478,14 +1476,14 @@ mod tests {
             secrets_cache: Arc::new(Mutex::new(None)),
         };
 
-        let result: Result<String, ConfigError> = config.get_secret_for_inventory("key");
+        let result: Result<String, ConfigError> = config.get_secret_without_keyring_access("key");
 
         assert!(matches!(result, Err(ConfigError::NotFound(key)) if key == "key"));
     }
 
     #[cfg(feature = "system-keyring")]
     #[test]
-    fn inventory_secret_uses_cached_keyring_values() -> Result<(), ConfigError> {
+    fn noninteractive_secret_uses_cached_keyring_values() -> Result<(), ConfigError> {
         let mut values = HashMap::new();
         values.insert("key".to_string(), Value::String("value".to_string()));
         let config = Config {
@@ -1497,7 +1495,7 @@ mod tests {
             secrets_cache: Arc::new(Mutex::new(Some(values))),
         };
 
-        let value: String = config.get_secret_for_inventory("key")?;
+        let value: String = config.get_secret_without_keyring_access("key")?;
 
         assert_eq!(value, "value");
         Ok(())

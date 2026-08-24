@@ -988,7 +988,7 @@ impl ExtensionManager {
                     &resolved_headers,
                     name,
                     resolved_socket.as_deref(),
-                    Box::new(PonduinCredentialStore::new(name.to_string())),
+                    Box::new(PonduinCredentialStore::noninteractive(name.to_string())),
                     self.provider.clone(),
                     self.client_name.clone(),
                     self.mcp_client_capabilities(),

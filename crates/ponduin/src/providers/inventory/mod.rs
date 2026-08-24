@@ -891,7 +891,7 @@ pub fn default_inventory_configured(config_keys: &[ConfigKey], config: &Config) 
         }
         if key.secret {
             config
-                .get_secret_for_inventory::<serde_json::Value>(&key.name)
+                .get_secret_without_keyring_access::<serde_json::Value>(&key.name)
                 .is_ok()
         } else {
             config.get_param::<serde_json::Value>(&key.name).is_ok()
@@ -976,7 +976,7 @@ pub fn config_param_value(config: &Config, key: &str) -> Option<String> {
 
 pub fn config_secret_value(config: &Config, key: &str) -> Option<String> {
     config
-        .get_secret_for_inventory::<serde_json::Value>(key)
+        .get_secret_without_keyring_access::<serde_json::Value>(key)
         .ok()
         .and_then(|value| normalize_json_value(&value))
 }

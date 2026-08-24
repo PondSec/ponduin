@@ -125,7 +125,8 @@ pub fn hf_token_secret() -> Result<Option<String>> {
 }
 
 fn hf_token_secret_for_inventory() -> Result<Option<String>> {
-    match Config::global().get_secret_for_inventory::<String>(HUGGINGFACE_TOKEN_SECRET_KEY) {
+    match Config::global().get_secret_without_keyring_access::<String>(HUGGINGFACE_TOKEN_SECRET_KEY)
+    {
         Ok(token) => Ok(Some(token)),
         Err(ConfigError::NotFound(_)) => Ok(None),
         Err(error) => Err(error.into()),

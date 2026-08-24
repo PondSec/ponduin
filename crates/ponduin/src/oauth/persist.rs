@@ -10,11 +10,22 @@ use crate::config::Config;
 #[derive(Clone)]
 pub struct PonduinCredentialStore {
     name: String,
+    allow_keyring_access: bool,
 }
 
 impl PonduinCredentialStore {
     pub fn new(name: String) -> Self {
-        Self { name }
+        Self {
+            name,
+            allow_keyring_access: true,
+        }
+    }
+
+    pub fn noninteractive(name: String) -> Self {
+        Self {
+            name,
+            allow_keyring_access: false,
+        }
     }
 
     fn secret_key(&self) -> String {
@@ -28,7 +39,13 @@ impl CredentialStore for PonduinCredentialStore {
         let config = Config::global();
         let key = self.secret_key();
 
-        match config.get_secret::<StoredCredentials>(&key) {
+        let credentials = if self.allow_keyring_access {
+            config.get_secret::<StoredCredentials>(&key)
+        } else {
+            config.get_secret_without_keyring_access::<StoredCredentials>(&key)
+        };
+
+        match credentials {
             Ok(credentials) => Ok(Some(credentials)),
             Err(_) => Ok(None), // No credentials found
         }
@@ -50,5 +67,16 @@ impl CredentialStore for PonduinCredentialStore {
         config
             .delete_secret(&key)
             .map_err(|e| AuthError::InternalError(format!("Failed to clear credentials: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noninteractive_store_defers_keyring_access() {
+        assert!(!PonduinCredentialStore::noninteractive("test".to_string()).allow_keyring_access);
+        assert!(PonduinCredentialStore::new("test".to_string()).allow_keyring_access);
     }
 }

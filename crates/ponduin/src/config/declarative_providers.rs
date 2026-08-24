@@ -34,7 +34,7 @@ pub fn expand_env_vars(template: &str, env_vars: &[EnvVarConfig]) -> Result<Stri
 fn expand_env_vars_for_inventory(template: &str, env_vars: &[EnvVarConfig]) -> Result<String> {
     expand_env_vars_with_secret_lookup(template, env_vars, |key| {
         Config::global()
-            .get_secret_for_inventory::<String>(key)
+            .get_secret_without_keyring_access::<String>(key)
             .ok()
     })
 }
@@ -538,7 +538,7 @@ fn huggingface_declarative_inventory_configured(config: &DeclarativeProviderConf
         config,
         |key| {
             Config::global()
-                .get_secret_for_inventory::<String>(key)
+                .get_secret_without_keyring_access::<String>(key)
                 .is_ok()
         },
         || huggingface_auth::has_configured_token_for_inventory().unwrap_or(false),

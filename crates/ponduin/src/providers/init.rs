@@ -133,7 +133,7 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
                     .get_param::<serde_json::Value>("LITELLM_HOST")
                     .is_ok()
                     || config
-                        .get_secret_for_inventory::<serde_json::Value>("LITELLM_API_KEY")
+                        .get_secret_without_keyring_access::<serde_json::Value>("LITELLM_API_KEY")
                         .is_ok()
             })),
         );
@@ -152,7 +152,7 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
             Some(registrations::refresh_only().with_configured(|| {
                 let config = crate::config::Config::global();
                 config
-                    .get_secret_for_inventory::<serde_json::Value>("OPENROUTER_API_KEY")
+                    .get_secret_without_keyring_access::<serde_json::Value>("OPENROUTER_API_KEY")
                     .is_ok()
             })),
         );
