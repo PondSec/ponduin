@@ -14,6 +14,8 @@ import {
   LoaderCircle,
   ExternalLink,
   Copy,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
@@ -103,6 +105,12 @@ const i18n = defineMessages({
     defaultMessage:
       'Are you sure you want to delete the session "{name}"? This action cannot be undone.',
   },
+  deleteManyTitle: { id: 'sessions.deleteMany.title', defaultMessage: 'Delete {count} Sessions' },
+  deleteManyMessage: {
+    id: 'sessions.deleteMany.message',
+    defaultMessage:
+      'Are you sure you want to delete {count} sessions? This action cannot be undone.',
+  },
   duplicateSuccess: {
     id: 'sessions.toast.duplicated',
     defaultMessage: 'Session "{name}" duplicated successfully',
@@ -115,6 +123,14 @@ const i18n = defineMessages({
   deleteFailed: {
     id: 'sessions.toast.deleteFailed',
     defaultMessage: 'Failed to delete session "{name}": {error}',
+  },
+  deleteManySuccess: {
+    id: 'sessions.toast.deleteMany',
+    defaultMessage: '{count} sessions deleted successfully',
+  },
+  deleteManyFailed: {
+    id: 'sessions.toast.deleteManyFailed',
+    defaultMessage: 'Failed to delete {count} sessions. Please try again.',
   },
   importSuccess: { id: 'sessions.toast.imported', defaultMessage: 'Session imported successfully' },
   importFailed: {
@@ -135,6 +151,17 @@ const i18n = defineMessages({
   editSessionName: { id: 'sessions.action.editName', defaultMessage: 'Edit session name' },
   duplicateSession: { id: 'sessions.action.duplicate', defaultMessage: 'Duplicate session' },
   deleteSession: { id: 'sessions.action.delete', defaultMessage: 'Delete session' },
+  selectSessions: { id: 'sessions.action.select', defaultMessage: 'Select sessions' },
+  cancelSelection: { id: 'sessions.action.cancelSelection', defaultMessage: 'Cancel selection' },
+  selectAll: { id: 'sessions.action.selectAll', defaultMessage: 'Select all visible' },
+  clearSelection: { id: 'sessions.action.clearSelection', defaultMessage: 'Clear selection' },
+  deleteSelected: { id: 'sessions.action.deleteSelected', defaultMessage: 'Delete selected' },
+  selectedCount: { id: 'sessions.selection.count', defaultMessage: '{count} selected' },
+  selectSession: { id: 'sessions.selection.select', defaultMessage: 'Select session "{name}"' },
+  deselectSession: {
+    id: 'sessions.selection.deselect',
+    defaultMessage: 'Deselect session "{name}"',
+  },
   exportSession: { id: 'sessions.action.export', defaultMessage: 'Export session' },
   shareNostrSession: {
     id: 'sessions.action.shareNostr',
@@ -308,7 +335,10 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
 
   // Delete confirmation modal state
   const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
-  const [sessionToDelete, setSessionToDelete] = useState<SessionListItem | null>(null);
+  const [sessionsToDelete, setSessionsToDelete] = useState<SessionListItem[]>([]);
+  const [isDeletingSessions, setIsDeletingSessions] = useState(false);
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
 
   const [showImportLinkModal, setShowImportLinkModal] = useState(false);
   const [nostrImportLink, setNostrImportLink] = useState('');
@@ -346,6 +376,9 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
       setVisibleGroupsCount(15);
     }
   }, [debouncedSearchTerm, dateGroups.length]);
+
+  const allVisibleSessionsSelected =
+    sessions.length > 0 && sessions.every((session) => selectedSessionIds.has(session.id));
 
   const loadRemainingSessionPages = useCallback(
     async (initialCursor: string, loadId: number, keyword?: string) => {
@@ -476,6 +509,14 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
     });
   }, [memoizedDateGroups]);
 
+  useEffect(() => {
+    const availableSessionIds = new Set(sessions.map((session) => session.id));
+    setSelectedSessionIds((previous) => {
+      const next = new Set([...previous].filter((sessionId) => availableSessionIds.has(sessionId)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [sessions]);
+
   // Handle immediate search input (updates search term for debouncing).
   const handleSearch = useCallback((term: string) => {
     setSearchTerm(term);
@@ -507,9 +548,45 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
   }, []);
 
   const handleDeleteSession = useCallback((session: SessionListItem) => {
-    setSessionToDelete(session);
+    setSessionsToDelete([session]);
     setShowDeleteConfirmation(true);
   }, []);
+
+  const handleSelectionModeChange = useCallback((enabled: boolean) => {
+    setIsSelectionMode(enabled);
+    if (!enabled) {
+      setSelectedSessionIds(new Set());
+    }
+  }, []);
+
+  const handleToggleSessionSelection = useCallback((sessionId: string) => {
+    setSelectedSessionIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(sessionId)) {
+        next.delete(sessionId);
+      } else {
+        next.add(sessionId);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleSelectAllVisibleSessions = useCallback(() => {
+    setSelectedSessionIds((previous) => {
+      if (allVisibleSessionsSelected) {
+        return new Set();
+      }
+      return new Set([...previous, ...sessions.map((session) => session.id)]);
+    });
+  }, [allVisibleSessionsSelected, sessions]);
+
+  const handleDeleteSelectedSessions = useCallback(() => {
+    const selectedSessions = sessions.filter((session) => selectedSessionIds.has(session.id));
+    if (selectedSessions.length === 0) return;
+
+    setSessionsToDelete(selectedSessions);
+    setShowDeleteConfirmation(true);
+  }, [selectedSessionIds, sessions]);
 
   const handleDuplicateSession = useCallback(
     async (session: SessionListItem) => {
@@ -529,38 +606,72 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
   );
 
   const handleConfirmDelete = useCallback(async () => {
-    if (!sessionToDelete) return;
+    if (sessionsToDelete.length === 0 || isDeletingSessions) return;
 
-    setShowDeleteConfirmation(false);
-    const sessionToDeleteId = sessionToDelete.id;
-    const sessionName = sessionToDelete.name;
-    setSessionToDelete(null);
+    setIsDeletingSessions(true);
+    const deletingSessions = sessionsToDelete;
 
     try {
-      await acpDeleteSession(sessionToDeleteId);
-      toast.success(intl.formatMessage(i18n.deleteSuccess));
-      window.dispatchEvent(
-        new CustomEvent(AppEvents.SESSION_DELETED, { detail: { sessionId: sessionToDeleteId } })
-      );
-      cancelAcpPermissionRequestsForSession(sessionToDeleteId);
-      cancelAcpElicitationRequestsForSession(sessionToDeleteId);
-      acpChatSessionActions.deleteSnapshot(sessionToDeleteId);
-    } catch (error) {
-      console.error('Error deleting session:', error);
-      toast.error(
-        intl.formatMessage(i18n.deleteFailed, {
-          name: sessionName,
-          error: errorMessage(error, 'Unknown error'),
+      const results = await Promise.allSettled(
+        deletingSessions.map(async (session) => {
+          await acpDeleteSession(session.id);
+          return session;
         })
       );
+      const deletedSessions = results.flatMap((result) =>
+        result.status === 'fulfilled' ? [result.value] : []
+      );
+      const failedResults = results.filter(
+        (result): result is PromiseRejectedResult => result.status === 'rejected'
+      );
+
+      if (deletedSessions.length > 0) {
+        const deletedSessionIds = new Set(deletedSessions.map((session) => session.id));
+        setSessions((previous) => previous.filter((session) => !deletedSessionIds.has(session.id)));
+        setSelectedSessionIds(
+          (previous) =>
+            new Set([...previous].filter((sessionId) => !deletedSessionIds.has(sessionId)))
+        );
+        for (const session of deletedSessions) {
+          window.dispatchEvent(
+            new CustomEvent(AppEvents.SESSION_DELETED, { detail: { sessionId: session.id } })
+          );
+          cancelAcpPermissionRequestsForSession(session.id);
+          cancelAcpElicitationRequestsForSession(session.id);
+          acpChatSessionActions.deleteSnapshot(session.id);
+        }
+        toast.success(
+          deletedSessions.length === 1
+            ? intl.formatMessage(i18n.deleteSuccess)
+            : intl.formatMessage(i18n.deleteManySuccess, { count: deletedSessions.length })
+        );
+      }
+
+      if (failedResults.length > 0) {
+        const firstFailure = failedResults[0]?.reason;
+        console.error('Error deleting sessions:', firstFailure);
+        toast.error(
+          deletingSessions.length === 1
+            ? intl.formatMessage(i18n.deleteFailed, {
+                name: deletingSessions[0]?.name ?? '',
+                error: errorMessage(firstFailure, 'Unknown error'),
+              })
+            : intl.formatMessage(i18n.deleteManyFailed, { count: failedResults.length })
+        );
+      }
+      await loadSessions();
+    } finally {
+      setIsDeletingSessions(false);
+      setShowDeleteConfirmation(false);
+      setSessionsToDelete([]);
     }
-    await loadSessions();
-  }, [sessionToDelete, loadSessions, intl]);
+  }, [isDeletingSessions, sessionsToDelete, loadSessions, intl]);
 
   const handleCancelDelete = useCallback(() => {
+    if (isDeletingSessions) return;
     setShowDeleteConfirmation(false);
-    setSessionToDelete(null);
-  }, []);
+    setSessionsToDelete([]);
+  }, [isDeletingSessions]);
 
   const handleExportSession = useCallback(
     async (session: SessionListItem, e: React.MouseEvent) => {
@@ -697,6 +808,9 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
     onShareClick,
     onOpenInNewWindow,
     isSharing,
+    isSelectionMode,
+    isSelected,
+    onToggleSelection,
   }: {
     session: SessionListItem;
     onEditClick: (session: SessionListItem) => void;
@@ -706,6 +820,9 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
     onShareClick: (session: SessionListItem, e: React.MouseEvent) => void;
     onOpenInNewWindow: (session: SessionListItem, e: React.MouseEvent) => void;
     isSharing: boolean;
+    isSelectionMode: boolean;
+    isSelected: boolean;
+    onToggleSelection: (sessionId: string) => void;
   }) {
     const handleEditClick = useCallback(
       (e: React.MouseEvent) => {
@@ -732,8 +849,20 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
     );
 
     const handleCardClick = useCallback(() => {
-      onSelectSession(session.id);
-    }, [session.id]);
+      if (isSelectionMode) {
+        onToggleSelection(session.id);
+      } else {
+        onSelectSession(session.id);
+      }
+    }, [isSelectionMode, onToggleSelection, session.id]);
+
+    const handleToggleSelectionClick = useCallback(
+      (event: React.MouseEvent) => {
+        event.stopPropagation();
+        onToggleSelection(session.id);
+      },
+      [onToggleSelection, session.id]
+    );
 
     const handleExportClick = useCallback(
       (e: React.MouseEvent) => {
@@ -761,8 +890,26 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
     return (
       <Card
         onClick={handleCardClick}
-        className="h-full py-3 px-4 hover:shadow-default cursor-pointer transition-all duration-150 flex flex-col justify-between relative group"
+        className={`h-full py-3 px-4 hover:shadow-default cursor-pointer transition-all duration-150 flex flex-col justify-between relative group ${
+          isSelectionMode && isSelected ? 'ring-2 ring-border-active' : ''
+        }`}
       >
+        {isSelectionMode && (
+          <button
+            type="button"
+            onClick={handleToggleSelectionClick}
+            className="absolute right-3 top-3 rounded p-1 text-text-secondary hover:bg-background-secondary hover:text-text-primary"
+            title={intl.formatMessage(isSelected ? i18n.deselectSession : i18n.selectSession, {
+              name: session.name,
+            })}
+            aria-label={intl.formatMessage(isSelected ? i18n.deselectSession : i18n.selectSession, {
+              name: session.name,
+            })}
+            aria-pressed={isSelected}
+          >
+            {isSelected ? <CheckSquare className="h-5 w-5" /> : <Square className="h-5 w-5" />}
+          </button>
+        )}
         <div>
           <h3 className="text-base break-words line-clamp-2 w-full mb-1">{displayName}</h3>
           <div className="flex-1 mt-2">
@@ -784,57 +931,59 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
             </div>
           </div>
         </div>
-        <div className="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button
-            onClick={handleOpenInNewWindowClick}
-            className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-            title={intl.formatMessage(i18n.openInNewWindow)}
-          >
-            <ExternalLink className="w-3 h-3 text-text-secondary hover:text-text-primary" />
-          </button>
-          <button
-            onClick={handleEditClick}
-            className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-            title={intl.formatMessage(i18n.editSessionName)}
-          >
-            <Edit2 className="w-3 h-3 text-text-secondary hover:text-text-primary" />
-          </button>
-          <button
-            onClick={handleDuplicateClick}
-            className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-            title={intl.formatMessage(i18n.duplicateSession)}
-          >
-            <Copy className="w-3 h-3 text-text-secondary hover:text-text-primary" />
-          </button>
-          <button
-            onClick={handleDeleteClick}
-            className="p-2 rounded hover:bg-red-50 dark:hover:bg-red-900/20 cursor-pointer transition-colors"
-            title={intl.formatMessage(i18n.deleteSession)}
-          >
-            <Trash2 className="w-3 h-3 text-red-500 hover:text-red-600" />
-          </button>
-          <button
-            onClick={handleExportClick}
-            className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-            title={intl.formatMessage(i18n.exportSession)}
-          >
-            <Download className="w-3 h-3 text-text-secondary hover:text-text-primary" />
-          </button>
-          {nostrEnabled && (
+        {!isSelectionMode && (
+          <div className="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
             <button
-              onClick={handleShareClick}
-              disabled={isSharing}
-              className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer disabled:cursor-wait disabled:opacity-60"
-              title={intl.formatMessage(i18n.shareNostrSession)}
+              onClick={handleOpenInNewWindowClick}
+              className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
+              title={intl.formatMessage(i18n.openInNewWindow)}
             >
-              {isSharing ? (
-                <LoaderCircle className="w-3 h-3 text-text-secondary animate-spin" />
-              ) : (
-                <Share2 className="w-3 h-3 text-text-secondary hover:text-text-primary" />
-              )}
+              <ExternalLink className="w-3 h-3 text-text-secondary hover:text-text-primary" />
             </button>
-          )}
-        </div>
+            <button
+              onClick={handleEditClick}
+              className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
+              title={intl.formatMessage(i18n.editSessionName)}
+            >
+              <Edit2 className="w-3 h-3 text-text-secondary hover:text-text-primary" />
+            </button>
+            <button
+              onClick={handleDuplicateClick}
+              className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
+              title={intl.formatMessage(i18n.duplicateSession)}
+            >
+              <Copy className="w-3 h-3 text-text-secondary hover:text-text-primary" />
+            </button>
+            <button
+              onClick={handleDeleteClick}
+              className="p-2 rounded hover:bg-red-50 dark:hover:bg-red-900/20 cursor-pointer transition-colors"
+              title={intl.formatMessage(i18n.deleteSession)}
+            >
+              <Trash2 className="w-3 h-3 text-red-500 hover:text-red-600" />
+            </button>
+            <button
+              onClick={handleExportClick}
+              className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
+              title={intl.formatMessage(i18n.exportSession)}
+            >
+              <Download className="w-3 h-3 text-text-secondary hover:text-text-primary" />
+            </button>
+            {nostrEnabled && (
+              <button
+                onClick={handleShareClick}
+                disabled={isSharing}
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer disabled:cursor-wait disabled:opacity-60"
+                title={intl.formatMessage(i18n.shareNostrSession)}
+              >
+                {isSharing ? (
+                  <LoaderCircle className="w-3 h-3 text-text-secondary animate-spin" />
+                ) : (
+                  <Share2 className="w-3 h-3 text-text-secondary hover:text-text-primary" />
+                )}
+              </button>
+            )}
+          </div>
+        )}
       </Card>
     );
   });
@@ -930,6 +1079,9 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
                   onShareClick={handleShareSessionNostr}
                   onOpenInNewWindow={handleOpenInNewWindow}
                   isSharing={sharingSessionId === session.id}
+                  isSelectionMode={isSelectionMode}
+                  isSelected={selectedSessionIds.has(session.id)}
+                  onToggleSelection={handleToggleSessionSelection}
                 />
               ))}
             </div>
@@ -977,11 +1129,52 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
                     <Upload className="w-4 h-4" />
                     {intl.formatMessage(i18n.importSession)}
                   </Button>
+                  <Button
+                    onClick={() => handleSelectionModeChange(!isSelectionMode)}
+                    variant="outline"
+                    size="sm"
+                    className="flex items-center gap-2"
+                  >
+                    {isSelectionMode ? (
+                      <Square className="w-4 h-4" />
+                    ) : (
+                      <CheckSquare className="w-4 h-4" />
+                    )}
+                    {intl.formatMessage(
+                      isSelectionMode ? i18n.cancelSelection : i18n.selectSessions
+                    )}
+                  </Button>
                 </div>
               </div>
               <p className="text-sm text-text-secondary mb-4">
                 {intl.formatMessage(i18n.chatHistoryDesc, { shortcut: getSearchShortcutText() })}
               </p>
+              {isSelectionMode && (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border-primary bg-background-secondary px-3 py-2 text-sm">
+                  <span className="mr-auto text-text-secondary" aria-live="polite">
+                    {intl.formatMessage(i18n.selectedCount, { count: selectedSessionIds.size })}
+                  </span>
+                  <Button
+                    onClick={handleSelectAllVisibleSessions}
+                    variant="outline"
+                    size="sm"
+                    disabled={sessions.length === 0 || isDeletingSessions}
+                  >
+                    {intl.formatMessage(
+                      allVisibleSessionsSelected ? i18n.clearSelection : i18n.selectAll
+                    )}
+                  </Button>
+                  <Button
+                    onClick={handleDeleteSelectedSessions}
+                    variant="destructive"
+                    size="sm"
+                    disabled={selectedSessionIds.size === 0 || isDeletingSessions}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    {intl.formatMessage(i18n.deleteSelected)}
+                  </Button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1151,11 +1344,23 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(({ onSelectSe
 
       <ConfirmationModal
         isOpen={showDeleteConfirmation}
-        title={intl.formatMessage(i18n.deleteTitle)}
-        message={intl.formatMessage(i18n.deleteMessage, { name: sessionToDelete?.name ?? '' })}
-        confirmLabel={intl.formatMessage(i18n.deleteTitle)}
+        title={intl.formatMessage(
+          sessionsToDelete.length > 1 ? i18n.deleteManyTitle : i18n.deleteTitle,
+          { count: sessionsToDelete.length }
+        )}
+        message={intl.formatMessage(
+          sessionsToDelete.length > 1 ? i18n.deleteManyMessage : i18n.deleteMessage,
+          sessionsToDelete.length > 1
+            ? { count: sessionsToDelete.length }
+            : { name: sessionsToDelete[0]?.name ?? '' }
+        )}
+        confirmLabel={intl.formatMessage(
+          sessionsToDelete.length > 1 ? i18n.deleteManyTitle : i18n.deleteTitle,
+          { count: sessionsToDelete.length }
+        )}
         cancelLabel={intl.formatMessage(i18n.cancel)}
         confirmVariant="destructive"
+        isSubmitting={isDeletingSessions}
         onConfirm={handleConfirmDelete}
         onCancel={handleCancelDelete}
       />

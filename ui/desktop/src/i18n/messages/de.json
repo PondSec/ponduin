@@ -3764,6 +3764,9 @@
   "sessions.action.delete": {
     "defaultMessage": "Sitzung löschen"
   },
+  "sessions.action.deleteSelected": {
+    "defaultMessage": "Ausgewählte löschen"
+  },
   "sessions.action.duplicate": {
     "defaultMessage": "Sitzung duplizieren"
   },
@@ -3775,6 +3778,18 @@
   },
   "sessions.action.openNewWindow": {
     "defaultMessage": "In neuem Fenster öffnen"
+  },
+  "sessions.action.cancelSelection": {
+    "defaultMessage": "Auswahl beenden"
+  },
+  "sessions.action.clearSelection": {
+    "defaultMessage": "Auswahl aufheben"
+  },
+  "sessions.action.select": {
+    "defaultMessage": "Chats auswählen"
+  },
+  "sessions.action.selectAll": {
+    "defaultMessage": "Alle sichtbaren auswählen"
   },
   "sessions.action.shareNostr": {
     "defaultMessage": "Verschlüsselten Nostr-Link teilen"
@@ -3793,6 +3808,12 @@
   },
   "sessions.delete.message": {
     "defaultMessage": "Möchten Sie die Sitzung \"{name}\" wirklich löschen? Diese Aktion kann nicht rückgängig gemacht werden."
+  },
+  "sessions.deleteMany.message": {
+    "defaultMessage": "Möchten Sie {count} Sitzungen wirklich löschen? Diese Aktion kann nicht rückgängig gemacht werden."
+  },
+  "sessions.deleteMany.title": {
+    "defaultMessage": "{count} Sitzungen löschen"
   },
   "sessions.delete.title": {
     "defaultMessage": "Sitzung löschen"
@@ -3851,6 +3872,15 @@
   "sessions.searchPlaceholder": {
     "defaultMessage": "Verlauf durchsuchen..."
   },
+  "sessions.selection.count": {
+    "defaultMessage": "{count} ausgewählt"
+  },
+  "sessions.selection.deselect": {
+    "defaultMessage": "Sitzung \"{name}\" abwählen"
+  },
+  "sessions.selection.select": {
+    "defaultMessage": "Sitzung \"{name}\" auswählen"
+  },
   "sessions.shareNostr.description": {
     "defaultMessage": "Jeder mit diesem Link kann die Sitzung abrufen und entschlüsseln. Behandeln Sie ihn wie ein Geheimnis."
   },
@@ -3862,6 +3892,12 @@
   },
   "sessions.toast.deleteFailed": {
     "defaultMessage": "Sitzung \"{name}\" konnte nicht gelöscht werden: {error}"
+  },
+  "sessions.toast.deleteMany": {
+    "defaultMessage": "{count} Sitzungen erfolgreich gelöscht"
+  },
+  "sessions.toast.deleteManyFailed": {
+    "defaultMessage": "{count} Sitzungen konnten nicht gelöscht werden. Bitte versuchen Sie es erneut."
   },
   "sessions.toast.deleted": {
     "defaultMessage": "Sitzung erfolgreich gelöscht"
