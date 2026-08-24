@@ -13,6 +13,7 @@ const MAX_PLAN_ITEMS: usize = 200;
 const MAX_TEXT_BYTES: usize = 16 * 1_024;
 const MAX_EVIDENCE_RECORDS: usize = 200;
 const LOOP_THRESHOLD: usize = 3;
+const ORIGINAL_REQUEST_REQUIREMENT_ID: &str = "original-user-request";
 
 /// Auditable state machine for multi-step coding tasks.
 #[derive(Debug, Clone)]
@@ -284,8 +285,25 @@ impl CodingWorkflow {
         Ok(())
     }
 
-    pub fn set_plan(&mut self, plan: WorkflowPlan) -> Result<(), WorkflowError> {
+    pub fn set_plan(&mut self, mut plan: WorkflowPlan) -> Result<(), WorkflowError> {
         self.require_phase(&[WorkflowPhase::Searching])?;
+        let required_check_ids = plan
+            .checks()
+            .into_iter()
+            .filter(|check| check.required)
+            .map(|check| check.id.clone())
+            .collect();
+        plan.requirements.push(WorkflowRequirement {
+            id: ORIGINAL_REQUEST_REQUIREMENT_ID.to_string(),
+            description: self.task.original_user_request.clone(),
+            source: RequirementSource::User,
+            priority: RequirementPriority::Critical,
+            mandatory: true,
+            verification: RequirementVerification {
+                expected_files: plan.relevant_files.clone(),
+                check_ids: required_check_ids,
+            },
+        });
         plan.validate()?;
         self.plan = Some(plan);
         self.phase = WorkflowPhase::Planning;
@@ -2349,17 +2367,62 @@ mod tests {
     }
 
     #[test]
-    fn rejects_planned_files_that_no_user_requirement_verifies() {
+    fn original_request_requirement_covers_every_planned_file() {
         let mut plan = plan();
         plan.relevant_files.push(PathBuf::from("src/extra.rs"));
         let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
         workflow.note_repository_activity();
+        workflow.set_plan(plan).unwrap();
 
-        assert!(matches!(
-            workflow.set_plan(plan),
-            Err(WorkflowError::PlannedFileWithoutUserRequirement(path))
-                if path == PathBuf::from("src/extra.rs")
-        ));
+        let requirement = workflow
+            .status()
+            .plan
+            .unwrap()
+            .requirements
+            .into_iter()
+            .find(|requirement| requirement.id == ORIGINAL_REQUEST_REQUIREMENT_ID)
+            .unwrap();
+        assert!(requirement
+            .verification
+            .expected_files
+            .contains(&PathBuf::from("src/extra.rs")));
+    }
+
+    #[test]
+    fn completion_plan_retains_the_original_user_request() {
+        let task = WorkflowTaskState::new(
+            "implement feature and document the validation command".to_string(),
+            TaskInteractionMode::Autonomous,
+            PathBuf::new(),
+        )
+        .unwrap()
+        .with_objective("implement the feature".to_string())
+        .unwrap();
+        let mut workflow =
+            CodingWorkflow::new_with_task("implement the feature".to_string(), task, limits())
+                .unwrap();
+        workflow.note_repository_activity();
+        workflow.set_plan(plan()).unwrap();
+
+        let requirement = workflow
+            .status()
+            .plan
+            .unwrap()
+            .requirements
+            .into_iter()
+            .find(|requirement| requirement.id == ORIGINAL_REQUEST_REQUIREMENT_ID)
+            .unwrap();
+        assert_eq!(
+            requirement.description,
+            "implement feature and document the validation command"
+        );
+        assert_eq!(requirement.priority, RequirementPriority::Critical);
+        assert!(requirement.mandatory);
+        assert_eq!(
+            requirement.verification.expected_files,
+            vec![PathBuf::from("src/lib.rs")]
+        );
+        assert_eq!(requirement.verification.check_ids, vec!["cargo-test"]);
     }
 
     #[test]
@@ -2455,7 +2518,7 @@ mod tests {
         assert!(matches!(
             workflow.complete("incomplete".to_string(), Vec::new()),
             Err(WorkflowError::MandatoryRequirementsOpen(requirements))
-                if requirements == ["implementation"]
+                if requirements == ["implementation", ORIGINAL_REQUEST_REQUIREMENT_ID]
         ));
     }
 
@@ -2488,7 +2551,7 @@ mod tests {
         assert!(matches!(
             workflow.complete("deleted file".to_string(), Vec::new()),
             Err(WorkflowError::MandatoryRequirementsOpen(requirements))
-                if requirements == ["implementation"]
+                if requirements == ["implementation", ORIGINAL_REQUEST_REQUIREMENT_ID]
         ));
     }
 
