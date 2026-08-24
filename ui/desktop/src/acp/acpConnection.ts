@@ -23,7 +23,7 @@ type AcpConnection = {
 
 type AcpRecoveryListener = (recovering: boolean) => void;
 
-const ACP_INITIALIZE_TIMEOUT_MS = 10_000;
+const ACP_INITIALIZE_TIMEOUT_MS = 30_000;
 const ACP_RECONNECT_BASE_DELAY_MS = 500;
 const ACP_RECONNECT_MAX_DELAY_MS = 30_000;
 

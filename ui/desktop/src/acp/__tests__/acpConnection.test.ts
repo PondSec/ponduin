@@ -65,6 +65,18 @@ describe('ACP connection ownership', () => {
     expect(transport.createWebSocketStream).toHaveBeenCalledTimes(1);
   });
 
+  it('accepts a slow initial connection before the startup deadline', async () => {
+    sdk.initialize.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve({}), 29_999))
+    );
+    const { getAcpClient } = await import('../acpConnection');
+
+    const connection = getAcpClient();
+    await vi.advanceTimersByTimeAsync(29_999);
+
+    await expect(connection).resolves.toBe(sdk.instances[0]);
+  });
+
   it('automatically reconnects after close and shares the result between callers', async () => {
     const { getAcpClient } = await import('../acpConnection');
     const firstClient = await getAcpClient();
