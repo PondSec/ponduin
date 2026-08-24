@@ -5057,7 +5057,9 @@ mod tests {
             &workflow_id,
             "begin_editing",
         );
-        assert!(description(WRITE_FILE_TOOL_NAME).contains("Write one planned file now"));
+        let write_description = description(WRITE_FILE_TOOL_NAME);
+        assert!(write_description.contains("only immediate action"));
+        assert!(write_description.contains("Create `result.txt` now"));
         execute_with_state(
             &config,
             &state,
