@@ -106,13 +106,7 @@ impl CodingWorkflow {
     }
 
     pub(crate) fn active_mutation_digests(&self) -> Vec<(PathBuf, Option<String>)> {
-        let mut digests = BTreeMap::new();
-        for change in self.changes.iter().filter(|change| !change.rolled_back) {
-            for file in &change.file_digests {
-                digests.insert(file.path.clone(), file.new_digest.clone());
-            }
-        }
-        digests.into_iter().collect()
+        self.active_file_digests().into_iter().collect()
     }
 
     pub(crate) fn verify_active_mutation_digests(
@@ -295,7 +289,7 @@ impl CodingWorkflow {
     }
 
     pub fn set_plan(&mut self, plan: WorkflowPlan) -> Result<(), WorkflowError> {
-        self.require_phase(&[WorkflowPhase::Analyzing, WorkflowPhase::Searching])?;
+        self.require_phase(&[WorkflowPhase::Searching])?;
         plan.validate()?;
         self.plan = Some(plan);
         self.phase = WorkflowPhase::Planning;
@@ -648,7 +642,6 @@ impl CodingWorkflow {
                     return Err(WorkflowError::ValidationRequired);
                 }
             }
-            WorkflowPhase::Editing if required_checks.is_empty() => {}
             _ => {
                 return Err(WorkflowError::InvalidTransition {
                     from: self.phase,
@@ -782,6 +775,16 @@ impl CodingWorkflow {
             .collect()
     }
 
+    fn active_file_digests(&self) -> BTreeMap<PathBuf, Option<String>> {
+        let mut digests = BTreeMap::new();
+        for change in self.changes.iter().filter(|change| !change.rolled_back) {
+            for file in &change.file_digests {
+                digests.insert(file.path.clone(), file.new_digest.clone());
+            }
+        }
+        digests
+    }
+
     fn record_command_evidence(&mut self, command: CommandEvidence) {
         self.memory.executed_commands.push(command);
         if self.memory.executed_commands.len() > MAX_EVIDENCE_RECORDS {
@@ -821,7 +824,7 @@ impl CodingWorkflow {
         let Some(plan) = &self.plan else {
             return Vec::new();
         };
-        let changed_files = self.changed_files().into_iter().collect::<BTreeSet<_>>();
+        let active_files = self.active_file_digests();
         let current_validations = self.current_validation_evidence();
         plan.requirements
             .iter()
@@ -830,7 +833,7 @@ impl CodingWorkflow {
                     .verification
                     .expected_files
                     .iter()
-                    .all(|path| changed_files.contains(path));
+                    .all(|path| active_files.get(path).is_some_and(Option::is_some));
                 let matching_checks = current_validations
                     .iter()
                     .filter(|validation| {
@@ -1236,21 +1239,53 @@ impl WorkflowPlan {
         validate_requirements(&self.requirements, &relevant_files)?;
         let checks = self.checks();
         validate_checks(&checks)?;
-        let check_ids = checks
+        if !checks.iter().any(|check| check.required) {
+            return Err(WorkflowError::ValidationPlanRequired);
+        }
+        if !self.requirements.iter().any(|requirement| {
+            requirement.mandatory && requirement.source == RequirementSource::User
+        }) {
+            return Err(WorkflowError::UserRequirementRequired);
+        }
+        let check_by_id = checks
             .iter()
-            .map(|check| check.id.as_str())
-            .collect::<BTreeSet<_>>();
+            .map(|check| (check.id.as_str(), *check))
+            .collect::<BTreeMap<_, _>>();
+        let mut user_requirement_files = BTreeSet::new();
         for requirement in &self.requirements {
-            if requirement
-                .verification
-                .check_ids
-                .iter()
-                .any(|id| !check_ids.contains(id.as_str()))
-            {
-                return Err(WorkflowError::UnknownRequirementCheck(
-                    requirement.id.clone(),
-                ));
+            for check_id in &requirement.verification.check_ids {
+                let Some(check) = check_by_id.get(check_id.as_str()) else {
+                    return Err(WorkflowError::UnknownRequirementCheck(
+                        requirement.id.clone(),
+                    ));
+                };
+                if requirement.mandatory
+                    && requirement.source == RequirementSource::User
+                    && !check.required
+                {
+                    return Err(WorkflowError::MandatoryRequirementUsesOptionalCheck(
+                        requirement.id.clone(),
+                    ));
+                }
             }
+            if requirement.mandatory && requirement.source == RequirementSource::User {
+                if requirement.verification.check_ids.is_empty() {
+                    return Err(WorkflowError::MandatoryRequirementValidationRequired(
+                        requirement.id.clone(),
+                    ));
+                }
+                user_requirement_files
+                    .extend(requirement.verification.expected_files.iter().cloned());
+            }
+        }
+        if let Some(path) = self
+            .relevant_files
+            .iter()
+            .find(|path| !user_requirement_files.contains(*path))
+        {
+            return Err(WorkflowError::PlannedFileWithoutUserRequirement(
+                path.clone(),
+            ));
         }
         validate_text("rollback strategy", &self.rollback_strategy, false)
     }
@@ -2163,6 +2198,16 @@ pub enum WorkflowError {
     RequirementFileOutsidePlan(String),
     #[error("workflow requirement `{0}` references an unknown check")]
     UnknownRequirementCheck(String),
+    #[error("a mutable workflow plan requires at least one required validation check")]
+    ValidationPlanRequired,
+    #[error("a workflow plan requires at least one mandatory user requirement")]
+    UserRequirementRequired,
+    #[error("mandatory user requirement `{0}` requires a validation check")]
+    MandatoryRequirementValidationRequired(String),
+    #[error("mandatory user requirement `{0}` cannot use an optional validation check")]
+    MandatoryRequirementUsesOptionalCheck(String),
+    #[error("planned file is not covered by a mandatory user requirement: {0}")]
+    PlannedFileWithoutUserRequirement(PathBuf),
     #[error("workflow iteration limit reached: {0}")]
     IterationLimit(u32),
     #[error("workflow repair attempt limit reached: {0}")]
@@ -2285,6 +2330,71 @@ mod tests {
     }
 
     #[test]
+    fn requires_repository_observation_before_accepting_a_plan() {
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+
+        assert!(matches!(
+            workflow.set_plan(plan()),
+            Err(WorkflowError::InvalidTransition {
+                from: WorkflowPhase::Analyzing,
+                expected,
+            }) if expected == vec![WorkflowPhase::Searching]
+        ));
+    }
+
+    #[test]
+    fn rejects_mandatory_user_requirements_without_required_validation() {
+        let mut plan = plan();
+        plan.requirements[0].verification.check_ids.clear();
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+        workflow.note_repository_activity();
+
+        assert!(matches!(
+            workflow.set_plan(plan),
+            Err(WorkflowError::MandatoryRequirementValidationRequired(requirement))
+                if requirement == "implementation"
+        ));
+    }
+
+    #[test]
+    fn rejects_optional_validation_for_mandatory_user_requirements() {
+        let mut plan = plan();
+        plan.tests[0].required = false;
+        plan.validation.push(WorkflowCheck {
+            id: "independent-check".to_string(),
+            description: "run an independent required check".to_string(),
+            command: WorkflowCommand {
+                program: "cargo".to_string(),
+                args: vec!["fmt".to_string(), "--check".to_string()],
+                cwd: PathBuf::from("."),
+            },
+            required: true,
+        });
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+        workflow.note_repository_activity();
+
+        assert!(matches!(
+            workflow.set_plan(plan),
+            Err(WorkflowError::MandatoryRequirementUsesOptionalCheck(requirement))
+                if requirement == "implementation"
+        ));
+    }
+
+    #[test]
+    fn rejects_planned_files_that_no_user_requirement_verifies() {
+        let mut plan = plan();
+        plan.relevant_files.push(PathBuf::from("src/extra.rs"));
+        let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+        workflow.note_repository_activity();
+
+        assert!(matches!(
+            workflow.set_plan(plan),
+            Err(WorkflowError::PlannedFileWithoutUserRequirement(path))
+                if path == PathBuf::from("src/extra.rs")
+        ));
+    }
+
+    #[test]
     fn completes_only_after_real_change_validation_and_review() {
         let mut workflow = planned_workflow();
         workflow.authorize_change().unwrap();
@@ -2328,6 +2438,7 @@ mod tests {
             .check_ids
             .push("rustc-version".to_string());
         let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+        workflow.note_repository_activity();
         workflow.set_plan(plan).unwrap();
         workflow.begin_editing().unwrap();
         workflow.authorize_change().unwrap();
@@ -2354,6 +2465,7 @@ mod tests {
             .expected_files
             .push(PathBuf::from("src/missing.rs"));
         let mut workflow = CodingWorkflow::new("implement feature".to_string(), limits()).unwrap();
+        workflow.note_repository_activity();
         workflow.set_plan(plan).unwrap();
         workflow.begin_editing().unwrap();
         workflow.authorize_change().unwrap();
@@ -2374,6 +2486,39 @@ mod tests {
         workflow.record_review(&review()).unwrap();
         assert!(matches!(
             workflow.complete("incomplete".to_string(), Vec::new()),
+            Err(WorkflowError::MandatoryRequirementsOpen(requirements))
+                if requirements == ["implementation"]
+        ));
+    }
+
+    #[test]
+    fn deleted_required_artifacts_do_not_satisfy_completion_evidence() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("create".to_string(), &preview("created"))
+            .unwrap();
+        let deletion = MutationPreview {
+            files: vec![FileMutationPreview {
+                path: PathBuf::from("src/lib.rs"),
+                operation: MutationOperation::Delete,
+                original_digest: Some(content_digest(b"created")),
+                new_digest: None,
+                diff: "-created".to_string(),
+            }],
+        };
+        workflow
+            .record_change("delete".to_string(), &deletion)
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+        workflow.begin_review().unwrap();
+        workflow.record_review(&review()).unwrap();
+
+        assert!(matches!(
+            workflow.complete("deleted file".to_string(), Vec::new()),
             Err(WorkflowError::MandatoryRequirementsOpen(requirements))
                 if requirements == ["implementation"]
         ));
@@ -2440,6 +2585,7 @@ mod tests {
             },
         )
         .unwrap();
+        workflow.note_repository_activity();
         workflow.set_plan(plan()).unwrap();
         workflow.begin_editing().unwrap();
         for revision in 0..3 {
@@ -2843,6 +2989,7 @@ mod tests {
             },
         )
         .unwrap();
+        workflow.note_repository_activity();
         workflow.set_plan(plan()).unwrap();
         workflow.begin_editing().unwrap();
         workflow.authorize_change().unwrap();
@@ -2959,6 +3106,7 @@ mod tests {
         )
         .unwrap();
 
+        workflow.note_repository_activity();
         workflow.set_plan(plan()).unwrap();
         workflow.begin_editing().unwrap();
 
