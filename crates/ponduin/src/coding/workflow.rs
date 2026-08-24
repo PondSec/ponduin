@@ -32,8 +32,6 @@ pub struct CodingWorkflow {
     repair_episodes: Vec<RepairEpisode>,
     invocation_history: VecDeque<InvocationEvidence>,
     failure_counts: BTreeMap<String, usize>,
-    non_improving_failures: usize,
-    last_error_count: Option<usize>,
     stop_reason: Option<WorkflowStopReason>,
     completion: Option<CompletionDetails>,
     review: Option<ReviewEvidence>,
@@ -75,8 +73,6 @@ impl CodingWorkflow {
             repair_episodes: Vec::new(),
             invocation_history: VecDeque::new(),
             failure_counts: BTreeMap::new(),
-            non_improving_failures: 0,
-            last_error_count: None,
             stop_reason: None,
             completion: None,
             review: None,
@@ -365,8 +361,6 @@ impl CodingWorkflow {
                 rolled_back: false,
             });
         }
-        self.last_error_count = None;
-        self.non_improving_failures = 0;
         self.repair_pending = false;
         if repeated >= LOOP_THRESHOLD {
             self.block(WorkflowStopReason::RepeatedDiff {
@@ -515,14 +509,11 @@ impl CodingWorkflow {
         let outcome = validation.outcome;
         let failed = outcome.requires_repair();
         let diagnostic_fingerprint = validation.diagnostic_fingerprint.clone();
-        let error_count = validation.error_count;
         self.validations.push(validation);
         if self.validations.len() > MAX_EVIDENCE_RECORDS {
             self.validations.remove(0);
         }
         if outcome.is_success() {
-            self.non_improving_failures = 0;
-            self.last_error_count = Some(0);
             self.failure_counts.clear();
             return Ok(());
         }
@@ -544,34 +535,11 @@ impl CodingWorkflow {
             return Ok(());
         }
 
-        let repetitions = {
-            let count = self
-                .failure_counts
-                .entry(diagnostic_fingerprint)
-                .or_insert(0);
-            *count += 1;
-            *count
-        };
-        if repetitions >= LOOP_THRESHOLD {
-            self.block(WorkflowStopReason::RepeatedFailure { repetitions });
-            return Ok(());
-        }
-        if self
-            .last_error_count
-            .is_some_and(|previous| error_count >= previous)
-        {
-            self.non_improving_failures += 1;
-        } else {
-            self.non_improving_failures = 1;
-        }
-        self.last_error_count = Some(error_count);
-        if self.non_improving_failures >= LOOP_THRESHOLD {
-            self.block(WorkflowStopReason::NoDiagnosticProgress {
-                attempts: self.non_improving_failures,
-            });
-        } else {
-            self.phase = WorkflowPhase::Debugging;
-        }
+        *self
+            .failure_counts
+            .entry(diagnostic_fingerprint)
+            .or_insert(0) += 1;
+        self.phase = WorkflowPhase::Debugging;
         Ok(())
     }
 
@@ -2576,12 +2544,12 @@ mod tests {
     }
 
     #[test]
-    fn blocks_repeated_failures_across_bounded_repairs() {
+    fn repeated_failures_require_new_strategies_until_the_repair_budget_is_exhausted() {
         let mut workflow = CodingWorkflow::new(
             "repair".to_string(),
             WorkflowLimits {
                 max_iterations: 10,
-                max_repair_attempts: 5,
+                max_repair_attempts: 3,
             },
         )
         .unwrap();
@@ -2641,15 +2609,49 @@ mod tests {
             }
         }
 
-        assert_eq!(workflow.phase(), WorkflowPhase::Blocked);
-        assert!(matches!(
-            workflow.status().stop_reason,
-            Some(WorkflowStopReason::RepeatedFailure { repetitions: 3 })
-        ));
+        assert_eq!(workflow.phase(), WorkflowPhase::Debugging);
+        assert!(workflow.status().stop_reason.is_none());
         assert_eq!(
             workflow.status().memory.repair_strategies[1].approach,
             RepairApproach::DependencyBoundary
         );
+
+        workflow
+            .set_repair_strategy(
+                RepairApproach::Configuration,
+                "inspect the configuration that changes the failing path".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
+        workflow.begin_repair().unwrap();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-3".to_string(), &preview("diff-3"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+        workflow
+            .record_process(
+                "cargo",
+                &["test".to_string()],
+                &output(false, "error 123: same failure"),
+            )
+            .unwrap();
+        workflow
+            .set_repair_strategy(
+                RepairApproach::TestFixture,
+                "verify whether the fixture expresses an obsolete contract".to_string(),
+                vec![PathBuf::from("src/lib.rs")],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            workflow.begin_repair(),
+            Err(WorkflowError::RepairLimit(3))
+        ));
+        assert!(matches!(
+            workflow.status().stop_reason,
+            Some(WorkflowStopReason::RepairLimit { limit: 3 })
+        ));
     }
 
     #[test]
