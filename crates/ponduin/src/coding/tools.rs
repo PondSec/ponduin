@@ -4486,6 +4486,16 @@ mod tests {
         .unwrap();
     }
 
+    fn observe_repository(config: &CodingConfig, state: &CodingToolState, root: &Path) {
+        execute_with_state(
+            config,
+            state,
+            CallToolRequestParams::new(REPOSITORY_PROFILE_TOOL_NAME),
+            root,
+        )
+        .unwrap();
+    }
+
     fn begin_editing_workflow(
         config: &CodingConfig,
         state: &CodingToolState,
@@ -4506,7 +4516,7 @@ mod tests {
                     "source": "user",
                     "priority": "high",
                     "mandatory": true,
-                    "verification": {"expected_files": [path], "check_ids": []}
+                    "verification": {"expected_files": [path], "check_ids": ["fixture-check"]}
                 })
             })
             .collect::<Vec<_>>();
@@ -4526,6 +4536,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        observe_repository(config, state, root);
         execute_with_state(
             config,
             state,
@@ -4539,7 +4550,12 @@ mod tests {
                         "intended_changes": ["exercise a workspace mutation"],
                         "requirements": requirements,
                         "tests": [],
-                        "validation": [],
+                        "validation": [{
+                            "id": "fixture-check",
+                            "description": "confirm the fixture runtime",
+                            "command": {"program": "python3", "args": ["--version"], "cwd": "."},
+                            "required": true
+                        }],
                         "rollback_strategy": "roll back the test mutation"
                     }
                 })
@@ -4863,6 +4879,7 @@ mod tests {
         .unwrap();
         let started: Value = serde_json::from_str(&result_text(started)).unwrap();
         let intended_path = temp_dir.path().join("src/package/__init__.py");
+        observe_repository(&config, &state, temp_dir.path());
         let planned = execute_with_state(
             &config,
             &state,
@@ -4879,10 +4896,15 @@ mod tests {
                         "source": "user",
                         "priority": "high",
                         "mandatory": true,
-                        "verification": {"expected_files": ["src/package/__init__.py"], "check_ids": []}
+                        "verification": {"expected_files": ["src/package/__init__.py"], "check_ids": ["package-check"]}
                     }],
                     "tests": [],
-                    "validation": [],
+                    "validation": [{
+                        "id": "package-check",
+                        "description": "confirm the package runtime",
+                        "command": {"program": "python3", "args": ["--version"], "cwd": "."},
+                        "required": true
+                    }],
                     "rollback_strategy": "roll back the change batch"
                 }
             })),
@@ -4912,6 +4934,7 @@ mod tests {
         )
         .unwrap();
         let started: Value = serde_json::from_str(&result_text(started)).unwrap();
+        observe_repository(&config, &state, temp_dir.path());
 
         let planned = execute_with_state(
             &config,
@@ -4941,7 +4964,7 @@ mod tests {
                 "Run the library test suite"
             ])
         );
-        assert_eq!(planned["plan"]["requirements"].as_array().unwrap().len(), 2);
+        assert_eq!(planned["plan"]["requirements"].as_array().unwrap().len(), 3);
         assert_eq!(
             planned["plan"]["validation"][0]["command"]["program"],
             "cargo"

@@ -3786,7 +3786,7 @@ mod tests {
         use async_trait::async_trait;
         use ponduin::agents::{AgentEvent, SessionConfig};
         use ponduin::config::PonduinMode;
-        use ponduin::conversation::message::Message;
+        use ponduin::conversation::message::{Message, MessageContent};
         use ponduin::providers::base::{
             stream_from_single_message, MessageStream, Provider, ProviderDef, ProviderMetadata,
         };
@@ -3795,6 +3795,8 @@ mod tests {
         use ponduin_providers::errors::ProviderError;
         use ponduin_providers::model::ModelConfig;
         use rmcp::model::{CallToolRequestParams, Tool};
+        use std::fs;
+        use std::process::Command;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct WorkflowThenUnproductiveProvider {
@@ -3883,6 +3885,237 @@ mod tests {
             }
         }
 
+        struct WorkflowRepairProvider {
+            turn: AtomicUsize,
+            initial_digest: String,
+            repaired_digest: String,
+        }
+
+        impl WorkflowRepairProvider {
+            fn new() -> Self {
+                Self {
+                    turn: AtomicUsize::new(0),
+                    initial_digest: ponduin::coding::file::content_digest(b"pending\n"),
+                    repaired_digest: ponduin::coding::file::content_digest(b"still-broken\n"),
+                }
+            }
+        }
+
+        fn tool_response_text(messages: &[Message], id: &str) -> Option<String> {
+            messages.iter().find_map(|message| {
+                message.content.iter().find_map(|content| {
+                    let MessageContent::ToolResponse(response) = content else {
+                        return None;
+                    };
+                    if response.id != id {
+                        return None;
+                    }
+                    let result = response.tool_result.as_ref().ok()?;
+                    Some(
+                        result
+                            .content
+                            .iter()
+                            .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
+                            .collect(),
+                    )
+                })
+            })
+        }
+
+        impl ponduin::providers::base::ProviderDescriptor for WorkflowRepairProvider {
+            fn metadata() -> ProviderMetadata {
+                ProviderMetadata {
+                    name: "workflow-repair-mock".to_string(),
+                    display_name: "Workflow Repair Mock".to_string(),
+                    description: "Mock provider for a complete coding workflow repair".to_string(),
+                    default_model: "mock-model".to_string(),
+                    known_models: vec![],
+                    model_doc_link: "".to_string(),
+                    config_keys: vec![],
+                    setup_steps: vec![],
+                    model_selection_hint: None,
+                    fast_model: None,
+                }
+            }
+        }
+
+        impl ProviderDef for WorkflowRepairProvider {
+            type Provider = Self;
+
+            fn from_env(
+                _extensions: Vec<ponduin::config::ExtensionConfig>,
+                _tls_config: Option<ponduin::providers::api_client::TlsConfig>,
+            ) -> futures::future::BoxFuture<'static, anyhow::Result<Self>> {
+                unimplemented!()
+            }
+        }
+
+        #[async_trait]
+        impl Provider for WorkflowRepairProvider {
+            async fn stream(
+                &self,
+                _model_config: &ModelConfig,
+                _system_prompt: &str,
+                _messages: &[Message],
+                tools: &[Tool],
+            ) -> Result<MessageStream, ProviderError> {
+                let has_tool = |name| tools.iter().any(|tool| tool.name == name);
+                let tool_request = |id: &str, name: &str, arguments| {
+                    Message::assistant().with_tool_request(
+                        id,
+                        Ok(CallToolRequestParams::new(name.to_string()).with_arguments(arguments)),
+                    )
+                };
+                let message = if tools.is_empty() {
+                    Message::assistant().with_text("Fixture repair")
+                } else if has_tool(ponduin::coding::tools::ACTIVATE_AGENT_TOOL_NAME) {
+                    tool_request(
+                        "activate-coding-agent",
+                        ponduin::coding::tools::ACTIVATE_AGENT_TOOL_NAME,
+                        serde_json::Map::new(),
+                    )
+                } else {
+                    let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+                    match turn {
+                        0 => tool_request(
+                            "start-workflow",
+                            ponduin::coding::tools::WORKFLOW_START_TOOL_NAME,
+                            rmcp::object!({ "objective": "repair the fixture and validate the result" }),
+                        ),
+                        1 => tool_request(
+                            "inspect-workspace",
+                            ponduin::coding::tools::REPOSITORY_PROFILE_TOOL_NAME,
+                            rmcp::object!({}),
+                        ),
+                        2 => tool_request(
+                            "set-plan",
+                            ponduin::coding::tools::WORKFLOW_SET_PLAN_TOOL_NAME,
+                            rmcp::object!({
+                                "plan": {
+                                    "affected_components": ["fixture.txt"],
+                                    "relevant_files": ["fixture.txt"],
+                                    "risks": ["the repaired fixture may not satisfy the assertion"],
+                                    "intended_changes": ["repair fixture.txt and validate its contents"],
+                                    "requirements": [{
+                                        "id": "fixture-content",
+                                        "description": "fixture.txt contains the validated repaired value",
+                                        "source": "user",
+                                        "priority": "critical",
+                                        "mandatory": true,
+                                        "verification": {
+                                            "expected_files": ["fixture.txt"],
+                                            "check_ids": ["fixture-check"]
+                                        }
+                                    }],
+                                    "tests": [{
+                                        "id": "fixture-check",
+                                        "description": "assert fixture content",
+                                        "command": {
+                                            "program": "python3",
+                                            "args": ["-c", "from pathlib import Path; assert Path('fixture.txt').read_text() == 'done\\n'"],
+                                            "cwd": "."
+                                        },
+                                        "required": true
+                                    }],
+                                    "validation": [],
+                                    "rollback_strategy": "restore the last verified fixture content"
+                                }
+                            }),
+                        ),
+                        3 => tool_request(
+                            "begin-editing",
+                            ponduin::coding::tools::WORKFLOW_TRANSITION_TOOL_NAME,
+                            rmcp::object!({ "transition": "begin_editing" }),
+                        ),
+                        4 => tool_request(
+                            "introduce-diagnostic",
+                            ponduin::coding::tools::WRITE_FILE_TOOL_NAME,
+                            rmcp::object!({
+                                "path": "fixture.txt",
+                                "content": "still-broken\n",
+                                "expected_digest": self.initial_digest,
+                            }),
+                        ),
+                        5 => tool_request(
+                            "begin-validation",
+                            ponduin::coding::tools::WORKFLOW_TRANSITION_TOOL_NAME,
+                            rmcp::object!({ "transition": "begin_validation" }),
+                        ),
+                        6 => tool_request(
+                            "run-failing-validation",
+                            ponduin::coding::tools::RUN_PROCESS_TOOL_NAME,
+                            rmcp::object!({
+                                "program": "python3",
+                                "args": ["-c", "from pathlib import Path; assert Path('fixture.txt').read_text() == 'done\\n'"],
+                            }),
+                        ),
+                        7 => tool_request(
+                            "set-repair-strategy",
+                            ponduin::coding::tools::WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME,
+                            rmcp::object!({
+                                "approach": "local_logic",
+                                "hypothesis": "the fixture still contains the diagnostic value",
+                                "target_files": ["fixture.txt"],
+                            }),
+                        ),
+                        8 => tool_request(
+                            "begin-repair",
+                            ponduin::coding::tools::WORKFLOW_TRANSITION_TOOL_NAME,
+                            rmcp::object!({ "transition": "begin_repair" }),
+                        ),
+                        9 => tool_request(
+                            "repair-fixture",
+                            ponduin::coding::tools::WRITE_FILE_TOOL_NAME,
+                            rmcp::object!({
+                                "path": "fixture.txt",
+                                "content": "done\n",
+                                "expected_digest": self.repaired_digest,
+                            }),
+                        ),
+                        10 => tool_request(
+                            "revalidate",
+                            ponduin::coding::tools::WORKFLOW_TRANSITION_TOOL_NAME,
+                            rmcp::object!({ "transition": "begin_validation" }),
+                        ),
+                        11 => tool_request(
+                            "run-passing-validation",
+                            ponduin::coding::tools::RUN_PROCESS_TOOL_NAME,
+                            rmcp::object!({
+                                "program": "python3",
+                                "args": ["-c", "from pathlib import Path; assert Path('fixture.txt').read_text() == 'done\\n'"],
+                            }),
+                        ),
+                        12 => tool_request(
+                            "begin-review",
+                            ponduin::coding::tools::WORKFLOW_TRANSITION_TOOL_NAME,
+                            rmcp::object!({ "transition": "begin_review" }),
+                        ),
+                        13 => tool_request(
+                            "review-change",
+                            ponduin::coding::tools::REVIEW_CHANGES_TOOL_NAME,
+                            rmcp::object!({}),
+                        ),
+                        14 => tool_request(
+                            "complete-workflow",
+                            ponduin::coding::tools::WORKFLOW_COMPLETE_TOOL_NAME,
+                            rmcp::object!({
+                                "summary": "fixture repaired after a failed validation and revalidated successfully",
+                                "remaining_risks": [],
+                            }),
+                        ),
+                        _ => Message::assistant()
+                            .with_text("Fixture repair completed and validated."),
+                    }
+                };
+                let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+                Ok(stream_from_single_message(message, usage))
+            }
+
+            fn get_name(&self) -> &str {
+                "workflow-repair-mock"
+            }
+        }
+
         #[tokio::test]
         async fn active_coding_workflow_preserves_task_and_blocks_premature_completion(
         ) -> Result<()> {
@@ -3955,6 +4188,110 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(persisted_text.contains("Create a small fixture project with a test."));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn coding_workflow_repairs_a_real_failure_before_returning_a_final_answer(
+        ) -> Result<()> {
+            let workspace = tempfile::tempdir()?;
+            fs::write(workspace.path().join("fixture.txt"), "pending\n")?;
+            for arguments in [
+                ["init"].as_slice(),
+                ["config", "user.name", "Ponduin Workflow Test"].as_slice(),
+                ["config", "user.email", "workflow-test@example.invalid"].as_slice(),
+                ["add", "fixture.txt"].as_slice(),
+                ["commit", "-m", "baseline"].as_slice(),
+            ] {
+                assert!(Command::new("git")
+                    .args(arguments)
+                    .current_dir(workspace.path())
+                    .status()?
+                    .success());
+            }
+
+            let agent = Agent::new();
+            let session = agent
+                .config
+                .session_manager
+                .create_session(
+                    workspace.path().to_path_buf(),
+                    "coding-workflow-repair".to_string(),
+                    SessionType::Hidden,
+                    PonduinMode::Auto,
+                )
+                .await?;
+            let provider = Arc::new(WorkflowRepairProvider::new());
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+
+            let session_id = session.id.clone();
+            let stream = agent
+                .reply(
+                    Message::user().with_text(
+                        "Repair fixture.txt so it contains done, validate it, and report only after the repaired result is reviewed.",
+                    ),
+                    SessionConfig {
+                        id: session.id,
+                        schedule_id: None,
+                        max_turns: Some(30),
+                        retry_config: None,
+                    },
+                    None,
+                )
+                .await?;
+            tokio::pin!(stream);
+            let mut user_visible = Vec::new();
+            while let Some(event) = stream.next().await {
+                if let AgentEvent::Message(message) = event? {
+                    user_visible.push(message);
+                }
+            }
+
+            let user_visible_text = user_visible
+                .iter()
+                .map(Message::as_concat_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let persisted = agent
+                .config
+                .session_manager
+                .get_session(&session_id, true)
+                .await?
+                .conversation
+                .expect("persisted conversation");
+            let persisted_text = persisted
+                .messages()
+                .iter()
+                .map(Message::as_concat_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let completion = tool_response_text(persisted.messages(), "complete-workflow")
+                .expect("completion tool response");
+            assert!(user_visible_text.contains("Fixture repair completed and validated."));
+            let fixture = fs::read_to_string(workspace.path().join("fixture.txt"))?;
+            assert_eq!(
+                fixture,
+                "done\n",
+                "provider turns: {}; visible messages: {user_visible_text:?}; persisted: {persisted_text:?}",
+                provider.turn.load(Ordering::SeqCst),
+            );
+            let diff = Command::new("git")
+                .args(["diff", "--", "fixture.txt"])
+                .current_dir(workspace.path())
+                .output()?;
+            assert!(diff.status.success());
+            assert!(String::from_utf8(diff.stdout)?.contains("+done"));
+            assert!(provider.turn.load(Ordering::SeqCst) >= 15);
+
+            assert!(completion.contains("\"verified\": true"));
+            assert!(completion.contains("original-user-request"));
+            assert!(completion.contains("fixture repaired after a failed validation"));
             Ok(())
         }
     }

@@ -473,6 +473,8 @@ impl CodingAgent {
             tool_call.name.as_ref(),
             tools::WORKFLOW_SET_PLAN_TOOL_NAME
                 | tools::WORKFLOW_TRANSITION_TOOL_NAME
+                | tools::WORKFLOW_SET_REPAIR_STRATEGY_TOOL_NAME
+                | tools::WORKFLOW_UPDATE_MEMORY_TOOL_NAME
                 | tools::WORKFLOW_COMPLETE_TOOL_NAME
         ) {
             return;
