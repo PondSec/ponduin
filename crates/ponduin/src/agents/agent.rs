@@ -409,6 +409,10 @@ fn message_for_live_update(message: &Message) -> Option<Message> {
     (!message.content.is_empty()).then(|| message.clone())
 }
 
+fn live_response_allowed(coding_tools_active: bool, workflow_continuation: bool) -> bool {
+    !coding_tools_active || !workflow_continuation
+}
+
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
 }
@@ -2541,9 +2545,14 @@ impl Agent {
                                         .workflow_continuation(&session.working_dir)
                                         .is_some();
 
-                                if let Some(live_response) = message_for_live_update(&filtered_response) {
-                                    yield AgentEvent::Message(live_response);
-                                    tokio::task::yield_now().await;
+                                if live_response_allowed(
+                                    coding_tools_active,
+                                    suppress_user_visible_response,
+                                ) {
+                                    if let Some(live_response) = message_for_live_update(&filtered_response) {
+                                        yield AgentEvent::Message(live_response);
+                                        tokio::task::yield_now().await;
+                                    }
                                 }
 
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
@@ -4028,6 +4037,13 @@ mod tests {
             Some(false),
             &PonduinPlatform::PonduinDesktop
         ));
+    }
+
+    #[test]
+    fn active_coding_workflow_withholds_live_model_prose() {
+        assert!(!live_response_allowed(true, true));
+        assert!(live_response_allowed(true, false));
+        assert!(live_response_allowed(false, true));
     }
 
     #[test]
