@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "Automatisch verdichten bei"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "Schwellenwert für automatische Verdichtung bearbeiten"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "Schwellenwert für automatische Verdichtung speichern"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "Jetzt verdichten"
   },

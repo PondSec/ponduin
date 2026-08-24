@@ -159,9 +159,9 @@ impl CodingToolState {
         &self,
         _workspace_root: &Path,
     ) -> Vec<Tool> {
-        // Ollama-native Qwen runs do not reliably accept a changed tool list on the turn after a
-        // tool call. Keep the small contract stable; execute still derives authority from the
-        // workflow state through definitions_for_workspace before every call.
+        // Native Ollama Qwen calls become unreliable when the declared tool names change after a
+        // call. The compact contract therefore stays stable while workflow guidance and each
+        // tool description state the valid phase.
         compact_native_definitions(definitions())
     }
 
@@ -170,9 +170,12 @@ impl CodingToolState {
         let status = &context.status;
         let guidance = match status.phase {
             WorkflowPhase::Analyzing | WorkflowPhase::Searching => {
-                "Inspect only the repository context needed for the objective, then call \
-                 coding__workflow_set_plan. Editing and execution tools remain withheld until \
-                 the plan is accepted."
+                "Call coding__find_files and read the relevant source or test files before \
+                 coding__workflow_set_plan. For an existing project, put only returned \
+                 workspace-relative paths in the plan. If the initial inspection confirms an empty \
+                 workspace, plan the user-requested new workspace-relative paths instead; do not \
+                 repeat discovery for files that do not exist yet. Editing and execution tools \
+                 remain withheld until the plan is accepted."
                     .to_string()
             }
             WorkflowPhase::Planning => {
@@ -1230,16 +1233,18 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
             READ_FILE_TOOL_NAME => "Read one relative path.",
             PROJECT_CAPABILITIES_TOOL_NAME => "Inspect capabilities.",
             WORKFLOW_START_TOOL_NAME => "Start workflow; objective required.",
-            WORKFLOW_SET_PLAN_TOOL_NAME => "Set inspected plan.",
-            WORKFLOW_TRANSITION_TOOL_NAME => "Advance workflow phase.",
+            WORKFLOW_SET_PLAN_TOOL_NAME => {
+                "Set plan from returned paths, or requested new relative paths in an empty workspace; validation_program starts with an executable."
+            }
+            WORKFLOW_TRANSITION_TOOL_NAME => "Advance only to the valid next phase.",
             WORKFLOW_STATUS_TOOL_NAME => "Read workflow status.",
             WORKFLOW_COMPLETE_TOOL_NAME => "Complete after review.",
             APPLY_CHANGES_TOOL_NAME => "Apply versioned changes.",
-            WRITE_FILE_TOOL_NAME => "Create or update one file.",
+            WRITE_FILE_TOOL_NAME => "Write one planned file in Editing only.",
             ROLLBACK_CHANGES_TOOL_NAME => "Rollback change batch.",
-            RUN_PROCESS_TOOL_NAME => "Run validation process.",
+            RUN_PROCESS_TOOL_NAME => "Run validation in Testing only.",
             RUN_VALIDATION_TOOL_NAME => "Run planned validation.",
-            REVIEW_CHANGES_TOOL_NAME => "Review retained changes.",
+            REVIEW_CHANGES_TOOL_NAME => "Review only after validation in Reviewing.",
             _ => "Compact coding workflow action.",
         }
         .into(),
@@ -1318,27 +1323,27 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
         }),
         WORKFLOW_SET_PLAN_TOOL_NAME => object!({
             "type": "object",
-            "required": ["workflow_id", "relevant_files", "intended_change", "validation_program", "plan_steps"],
+            "required": ["relevant_files", "intended_change", "validation_program"],
+            "additionalProperties": false,
             "properties": {
-                "workflow_id": {"type": "string"},
                 "relevant_files": {"type": "array", "items": {"type": "string"}},
                 "intended_change": {"type": "string"},
-                "plan_steps": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 12,
-                    "description": "Concrete ordered task actions, never generic phases.",
-                    "items": {"type": "string"}
+                "validation_program": {
+                    "type": "string",
+                    "description": "Executable, for example python3; never an explanatory sentence."
                 },
-                "validation_program": {"type": "string"},
-                "args": {"type": "array", "items": {"type": "string"}}
+                "args": {
+                    "type": "array",
+                    "description": "Literal arguments after the executable, for example -m unittest -v.",
+                    "items": {"type": "string"}
+                }
             }
         }),
         WORKFLOW_TRANSITION_TOOL_NAME => object!({
             "type": "object",
-            "required": ["workflow_id", "transition"],
+            "required": ["transition"],
+            "additionalProperties": false,
             "properties": {
-                "workflow_id": {"type": "string"},
                 "transition": {"type": "string", "enum": ["begin_editing", "begin_validation", "begin_repair", "begin_review"]}
             }
         }),
@@ -1348,9 +1353,9 @@ fn compact_native_tool_schema(mut tool: Tool) -> Tool {
         }),
         WORKFLOW_COMPLETE_TOOL_NAME => object!({
             "type": "object",
-            "required": ["workflow_id", "summary", "remaining_risks"],
+            "required": ["summary", "remaining_risks"],
+            "additionalProperties": false,
             "properties": {
-                "workflow_id": {"type": "string"},
                 "summary": {"type": "string"},
                 "remaining_risks": {"type": "array", "items": {"type": "string"}}
             }
@@ -4125,12 +4130,14 @@ impl WorkflowCompactPlanParams {
     fn into_plan(self) -> WorkflowPlan {
         let mut command_parts = self.validation_program.split_whitespace();
         let program = command_parts.next().unwrap_or_default().to_string();
-        let mut args = command_parts
+        let inline_args = command_parts
             .map(|part| part.to_string())
             .collect::<Vec<_>>();
-        if args.is_empty() || !self.args.starts_with(&args) {
-            args.extend(self.args);
-        }
+        let args = if self.args.starts_with(&inline_args) {
+            self.args
+        } else {
+            inline_args.into_iter().chain(self.args).collect()
+        };
         let validation_id = "required-validation".to_string();
         let expected_files = self.relevant_files.clone();
         let intended_changes = if self.plan_steps.is_empty() {
@@ -4954,6 +4961,25 @@ mod tests {
             intended_change: "validate script.js".to_string(),
             plan_steps: Vec::new(),
             validation_program: "node --check script.js".to_string(),
+            args: vec!["--check".to_string(), "script.js".to_string()],
+        }
+        .into_plan();
+
+        assert_eq!(
+            plan.validation[0].command.args,
+            vec!["--check".to_string(), "script.js".to_string()]
+        );
+    }
+
+    #[test]
+    fn compact_plan_keeps_args_after_inline_program_arguments() {
+        let plan = WorkflowCompactPlanParams {
+            workflow_id: serde_json::from_str("\"workflow_00000000-0000-7000-8000-000000000000\"")
+                .unwrap(),
+            relevant_files: vec![PathBuf::from("script.js")],
+            intended_change: "validate script.js".to_string(),
+            plan_steps: Vec::new(),
+            validation_program: "node --check".to_string(),
             args: vec!["--check".to_string(), "script.js".to_string()],
         }
         .into_plan();

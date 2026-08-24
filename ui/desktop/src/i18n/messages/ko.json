@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "자동 압축 기준"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "자동 압축 임계값 편집"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "자동 압축 임계값 저장"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "지금 압축"
   },

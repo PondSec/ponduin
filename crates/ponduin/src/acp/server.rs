@@ -568,6 +568,34 @@ impl PonduinAcpAgent {
         )
     }
 
+    async fn notify_session_usage(
+        &self,
+        cx: &ConnectionTo<Client>,
+        acp_session_id: &SessionId,
+        session_id: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let session = self
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .internal_err_ctx("Failed to load session")?;
+        let totals = self
+            .session_manager
+            .get_session_usage_totals(session_id)
+            .await
+            .unwrap_or_default();
+        if let Some(updates) = build_usage_updates(&session, &totals) {
+            if self.supports_ponduin_custom_notifications() {
+                cx.send_notification(updates.custom)?;
+            }
+            cx.send_notification(SessionNotification::new(
+                acp_session_id.clone(),
+                SessionUpdate::UsageUpdate(updates.standard),
+            ))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn supports_recipe_param_requests(&self) -> bool {
         self.client_supports_recipe_param_requests
             .get()
@@ -1908,12 +1936,24 @@ impl PonduinAcpAgent {
                 }
                 Ok(crate::agents::AgentEvent::MessageUsage { message_id, usage }) => {
                     if self.supports_ponduin_custom_notifications() {
-                        cx.send_notification(PonduinSessionNotification {
+                        if let Err(error) = cx.send_notification(PonduinSessionNotification {
                             session_id: session_id.clone(),
                             update: PonduinSessionUpdate::MessageUsage(message_usage_update(
                                 message_id, &usage,
                             )),
-                        })?;
+                        }) {
+                            stream_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                Ok(crate::agents::AgentEvent::Usage(_)) => {
+                    if let Err(error) = self
+                        .notify_session_usage(cx, &args.session_id, &session_id)
+                        .await
+                    {
+                        stream_error = Some(error);
+                        break;
                     }
                 }
                 Ok(_) => {}
@@ -1938,28 +1978,14 @@ impl PonduinAcpAgent {
             return Err(error);
         }
 
+        self.notify_session_usage(cx, &args.session_id, &session_id)
+            .await?;
+
         let session = self
             .session_manager
             .get_session(&session_id, false)
             .await
             .internal_err_ctx("Failed to load session")?;
-        let totals = self
-            .session_manager
-            .get_session_usage_totals(&session_id)
-            .await
-            .unwrap_or_default();
-        if let Some(updates) = build_usage_updates(&session, &totals) {
-            if self.supports_ponduin_custom_notifications() {
-                cx.send_notification(updates.custom)?;
-            }
-            // Standard ACP notification — emitted alongside the custom one for
-            // backwards compatibility. Remove once all known clients have
-            // migrated to `_ponduin/unstable/session/update`.
-            cx.send_notification(SessionNotification::new(
-                args.session_id.clone(),
-                SessionUpdate::UsageUpdate(updates.standard),
-            ))?;
-        }
 
         let stop_reason = if was_cancelled {
             StopReason::Cancelled

@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "自動壓縮於"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "編輯自動壓縮閾值"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "儲存自動壓縮閾值"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "立即壓縮"
   },

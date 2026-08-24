@@ -195,10 +195,13 @@ impl CodingAgent {
         let compact_tool_guidance = if uses_compact_qwen_coding_tools(model_config) {
             "When work remains, call exactly one suitable tool for the next smallest verified step \
              and emit no prose before it. Do not announce a tool or wait for a helper: only a \
-             valid call from the disclosed tools advances the task. The compact tool contract is \
-             intentional: use only the fields it shows, then use the returned result before \
-             choosing the next action. For a file creation or update, use coding__write_file for \
-             one file at a time; do not serialize a change batch inside a string."
+             valid call from the disclosed tools advances the task. Never write a tool call, JSON, \
+             or a code fence as prose; invoke the native tool interface. The compact tool contract \
+             is intentional: use only the fields it shows, then use the returned result before \
+             choosing the next action. Follow the workflow sequence: start, inspect, set plan, \
+             begin_editing, write, begin_validation, run validation, begin_review, review, then \
+             complete. For a file creation or update, use coding__write_file for one file at a \
+             time; do not serialize a change batch inside a string."
         } else {
             ""
         };
@@ -282,6 +285,7 @@ impl CodingAgent {
         let workspace = CodingWorkspace::new(working_dir)
             .map_err(|error| ErrorData::new(ErrorCode::INVALID_PARAMS, error.to_string(), None))?;
         self.fill_missing_workflow_objective(&mut tool_call, workspace.root());
+        self.fill_placeholder_workflow_id(&mut tool_call, workspace.root());
         normalize_structured_tool_arguments(&mut tool_call);
         let exposed = self.tool_state.definitions_for_workspace(workspace.root());
         if !exposed.iter().any(|tool| tool.name == tool_call.name) {
@@ -408,10 +412,16 @@ impl CodingAgent {
             }
             1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME
                 && error.message.contains("plan field `intended changes`") => {
-                "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"] with the current workflow_id."
+                "For the compact plan, intended_change must be one non-empty sentence. Use relevant_files [\"lib.rs\"], intended_change \"Update lib.rs to normalize labels\", validation_program \"cargo\", and args [\"test\"]. Do not include workflow_id."
+            }
+            1 if tool_name == tools::WORKFLOW_SET_PLAN_TOOL_NAME => {
+                "Use only relevant_files, intended_change, validation_program, and optional args. \
+                 validation_program must start with an executable, never an explanatory sentence. \
+                 For Python tests use validation_program \"python3\" and args [\"-m\", \
+                 \"unittest\", \"-v\"]. Do not include workflow_id."
             }
             1 => "The request was not executed. Correct the tool name and arguments from the currently exposed schema before retrying.",
-            2 => "Do not repeat this tool contract. Call coding__find_files with one concrete filename or symbol next, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
+            2 => "Do not repeat this tool contract. Call coding__find_files with a source-file glob suitable for the repository language, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
             _ => "The workflow is now blocked after repeated identical tool-contract failures. Report the recorded stop reason and do not claim success.",
         };
         ErrorData::new(
@@ -451,6 +461,44 @@ impl CodingAgent {
             .insert(
                 "objective".to_string(),
                 Value::String(task.normalized_objective),
+            );
+    }
+
+    fn fill_placeholder_workflow_id(
+        &self,
+        tool_call: &mut CallToolRequestParams,
+        workspace_root: &Path,
+    ) {
+        if !matches!(
+            tool_call.name.as_ref(),
+            tools::WORKFLOW_SET_PLAN_TOOL_NAME
+                | tools::WORKFLOW_TRANSITION_TOOL_NAME
+                | tools::WORKFLOW_COMPLETE_TOOL_NAME
+        ) {
+            return;
+        }
+        let placeholder = tool_call
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("workflow_id"))
+            .and_then(Value::as_str)
+            .is_none_or(|workflow_id| {
+                let workflow_id = workflow_id.trim();
+                workflow_id.is_empty()
+                    || (workflow_id.starts_with("{{") && workflow_id.ends_with("}}"))
+            });
+        if !placeholder {
+            return;
+        }
+        let Some(workflow_id) = self.tool_state.active_workflow_id(workspace_root) else {
+            return;
+        };
+        tool_call
+            .arguments
+            .get_or_insert_with(Default::default)
+            .insert(
+                "workflow_id".to_string(),
+                Value::String(workflow_id.to_string()),
             );
     }
 }
@@ -547,7 +595,7 @@ fn is_versioned_mutation_tool(tool_name: &str) -> bool {
 
 fn uses_compact_qwen_coding_tools(model_config: &ModelConfig) -> bool {
     let model = model_config.model_name.to_ascii_lowercase();
-    model.contains("qwen3") && !model.contains("qwen3-coder")
+    model.contains("qwen2.5") || (model.contains("qwen3") && !model.contains("qwen3-coder"))
 }
 
 #[cfg(test)]
@@ -555,6 +603,7 @@ mod tests {
     use super::*;
     use rmcp::object;
     use serde_json::Value;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpStream};
@@ -802,6 +851,55 @@ mod tests {
             .message
             .contains("intended_change must be one non-empty sentence"));
         assert!(error.message.contains("validation_program \"cargo\""));
+    }
+
+    #[tokio::test]
+    async fn compact_plan_adds_the_active_workflow_id_when_it_is_omitted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = enabled_agent();
+        agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_START_TOOL_NAME)
+                    .with_arguments(object!({"objective": "repair lib.rs"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        let planned = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_SET_PLAN_TOOL_NAME).with_arguments(
+                    object!({
+                        "relevant_files": ["lib.rs"],
+                        "intended_change": "normalize the label",
+                        "validation_program": "cargo",
+                        "args": ["test"]
+                    }),
+                ),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let status: Value =
+            serde_json::from_str(&planned.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(status["phase"], "planning");
+
+        let editing = agent
+            .execute(
+                PonduinMode::Auto,
+                CallToolRequestParams::new(tools::WORKFLOW_TRANSITION_TOOL_NAME)
+                    .with_arguments(object!({"transition": "begin_editing"})),
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+        let status: Value =
+            serde_json::from_str(&editing.content[0].as_text().unwrap().text).unwrap();
+
+        assert_eq!(status["phase"], "editing");
     }
 
     #[tokio::test]
@@ -1328,6 +1426,7 @@ mod tests {
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
 
+        assert_eq!(names.len(), names.iter().collect::<HashSet<_>>().len());
         assert_eq!(tools.len(), 16);
         assert!(names.contains(&tools::WRITE_FILE_TOOL_NAME));
         assert!(!names.contains(&tools::APPLY_CHANGES_TOOL_NAME));
@@ -1343,6 +1442,7 @@ mod tests {
             .unwrap();
         assert!(prompt.contains("call exactly one suitable tool"));
         assert!(prompt.contains("coding__write_file"));
+        assert!(prompt.contains("Never write a tool call, JSON"));
 
         let emulated_model = model.clone().with_toolshim(true);
         let emulated_tools = agent.tools_for_workspace_for_model(
@@ -1377,7 +1477,7 @@ mod tests {
         assert!(planning_names.contains(&tools::WORKFLOW_SET_PLAN_TOOL_NAME));
         assert!(planning_names.contains(&tools::WORKFLOW_STATUS_TOOL_NAME));
         let plan_tool = planning_tools
-            .into_iter()
+            .iter()
             .find(|tool| tool.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME)
             .unwrap();
         let plan_schema = Value::Object((*plan_tool.input_schema).clone());
@@ -1385,7 +1485,27 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&Value::String("intended_change".to_string())));
+        assert!(!plan_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("plan_steps".to_string())));
         assert!(plan_schema["properties"].get("plan").is_none());
+        assert!(plan_schema["properties"].get("workflow_id").is_none());
+        assert!(plan_schema["properties"].get("plan_steps").is_none());
+        assert_eq!(plan_schema["additionalProperties"], Value::Bool(false));
+
+        for workflow_tool in [
+            tools::WORKFLOW_TRANSITION_TOOL_NAME,
+            tools::WORKFLOW_COMPLETE_TOOL_NAME,
+        ] {
+            let schema = &planning_tools
+                .iter()
+                .find(|tool| tool.name == workflow_tool)
+                .unwrap()
+                .input_schema;
+            assert_eq!(schema["additionalProperties"], Value::Bool(false));
+            assert!(schema["properties"].get("workflow_id").is_none());
+        }
 
         let coder_model = ModelConfig::new("qwen3-coder:30b");
         assert!(
@@ -1394,6 +1514,18 @@ mod tests {
                 .len()
                 > tools.len()
         );
+
+        let qwen25_coder = ModelConfig::new("qwen2.5-coder:7b");
+        let qwen25_tools =
+            agent.tools_for_workspace_for_model(PonduinMode::Auto, temp_dir.path(), &qwen25_coder);
+        assert_eq!(qwen25_tools.len(), tools.len());
+        assert!(qwen25_tools
+            .iter()
+            .any(|tool| tool.name == tools::WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(agent
+            .system_prompt_for_model(PonduinMode::Auto, &qwen25_coder)
+            .unwrap()
+            .contains("call exactly one suitable tool"));
     }
 
     #[test]

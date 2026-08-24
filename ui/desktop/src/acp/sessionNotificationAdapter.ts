@@ -99,7 +99,16 @@ function applyAcpSessionNotification(
       return changes;
     }
     case 'usage_update':
-      return [];
+      return [
+        {
+          type: 'tokenState',
+          tokenState: {
+            totalTokens: update.used,
+            contextLimit: update.size,
+            ...(update.cost ? { accumulatedCost: update.cost.amount } : {}),
+          },
+        },
+      ];
     default:
       return [];
   }

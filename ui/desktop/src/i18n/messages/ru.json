@@ -2,6 +2,12 @@
   "alertBox.autoCompactAt": {
     "defaultMessage": "Автосжимать при"
   },
+  "alertBox.editAutoCompactThreshold": {
+    "defaultMessage": "Изменить порог автосжатия"
+  },
+  "alertBox.saveAutoCompactThreshold": {
+    "defaultMessage": "Сохранить порог автосжатия"
+  },
   "alertBox.compactNow": {
     "defaultMessage": "Сжать сейчас"
   },

@@ -8,10 +8,16 @@ import { IntlTestWrapper } from '../../../i18n/test-utils';
 const renderWithIntl = (ui: React.ReactElement, options?: RenderOptions) =>
   render(ui, { wrapper: IntlTestWrapper, ...options });
 
+const configMocks = vi.hoisted(() => ({
+  read: vi.fn(),
+  upsert: vi.fn(),
+}));
+
 // Mock the ConfigContext
 vi.mock('../../ConfigContext', () => ({
   useConfig: () => ({
-    read: vi.fn().mockResolvedValue(0.8),
+    read: configMocks.read,
+    upsert: configMocks.upsert,
   }),
 }));
 
@@ -20,6 +26,8 @@ describe('AlertBox', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    configMocks.read.mockResolvedValue(undefined);
+    configMocks.upsert.mockResolvedValue(undefined);
   });
 
   describe('Basic Rendering', () => {
@@ -86,8 +94,33 @@ describe('AlertBox', () => {
 
       renderWithIntl(<AlertBox alert={alert} />);
 
-      // Should show auto-compact threshold (default 80%)
-      expect(await screen.findByText(/Auto compact at 80%/)).toBeInTheDocument();
+      // Should show the safe default threshold for local models.
+      expect(await screen.findByText(/Auto compact at 50%/)).toBeInTheDocument();
+    });
+
+    it('allows raising the threshold up to 95% and persists the choice', async () => {
+      const user = userEvent.setup();
+      const alert: Alert = {
+        type: AlertType.Info,
+        message: 'Context window',
+        progress: { current: 50, total: 100 },
+      };
+
+      renderWithIntl(<AlertBox alert={alert} />);
+      await screen.findByText(/Auto compact at 50%/);
+
+      await user.click(screen.getByRole('button', { name: 'Edit auto-compaction threshold' }));
+      const input = screen.getByRole('spinbutton');
+      await user.clear(input);
+      await user.type(input, '99');
+      expect(input).toHaveValue(95);
+
+      await user.click(screen.getByRole('button', { name: 'Save auto-compaction threshold' }));
+      expect(configMocks.upsert).toHaveBeenCalledWith(
+        'PONDUIN_AUTO_COMPACT_THRESHOLD',
+        0.95,
+        false
+      );
     });
 
     it('should not render progress dots or token counts', () => {
@@ -230,7 +263,7 @@ describe('AlertBox', () => {
 
       renderWithIntl(<AlertBox alert={alert} />);
 
-      expect(await screen.findByText(/Auto compact at 80%/)).toBeInTheDocument();
+      expect(await screen.findByText(/Auto compact at 50%/)).toBeInTheDocument();
       expect(screen.getByText('Compact now')).toBeInTheDocument();
     });
 
@@ -277,7 +310,7 @@ describe('AlertBox', () => {
       renderWithIntl(<AlertBox alert={alert} />);
 
       // Should still render threshold settings
-      expect(await screen.findByText(/Auto compact at 80%/)).toBeInTheDocument();
+      expect(await screen.findByText(/Auto compact at 50%/)).toBeInTheDocument();
     });
   });
 });
