@@ -12,7 +12,7 @@ use uuid::Uuid;
 const MAX_PLAN_ITEMS: usize = 200;
 const MAX_TEXT_BYTES: usize = 16 * 1_024;
 const MAX_EVIDENCE_RECORDS: usize = 200;
-const LOOP_THRESHOLD: usize = 3;
+pub(crate) const LOOP_THRESHOLD: usize = 3;
 const ORIGINAL_REQUEST_REQUIREMENT_ID: &str = "original-user-request";
 
 /// Auditable state machine for multi-step coding tasks.
@@ -213,10 +213,6 @@ impl CodingWorkflow {
         }
         if repetitions >= LOOP_THRESHOLD {
             self.record_capability_state(tool_name, TaskCapabilityState::Unsuitable);
-            self.block(WorkflowStopReason::RepeatedToolContract {
-                tool_name: tool_name.to_string(),
-                repetitions,
-            });
         }
         repetitions
     }
@@ -3201,7 +3197,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_repeated_tool_contract_failures_with_retained_evidence() {
+    fn retains_repeated_tool_contract_failures_for_replanning() {
         let mut workflow = CodingWorkflow::new("repair the fixture".to_string(), limits()).unwrap();
 
         assert_eq!(
@@ -3218,19 +3214,13 @@ mod tests {
         );
 
         let status = workflow.status();
-        assert_eq!(status.phase, WorkflowPhase::Blocked);
+        assert_eq!(status.phase, WorkflowPhase::Analyzing);
         assert_eq!(status.memory.tool_contract_errors.len(), 3);
         assert!(status.memory.capability_feedback.iter().any(|feedback| {
             feedback.capability == "coding__apply_changes"
                 && feedback.state == TaskCapabilityState::Unsuitable
         }));
-        assert!(matches!(
-            status.stop_reason,
-            Some(WorkflowStopReason::RepeatedToolContract {
-                tool_name,
-                repetitions: 3
-            }) if tool_name == "coding__apply_changes"
-        ));
+        assert!(status.stop_reason.is_none());
     }
 
     #[test]

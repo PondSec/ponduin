@@ -23,7 +23,7 @@ use crate::coding::workflow::{
     CodingWorkflow, RepairApproach, RequirementPriority, RequirementSource,
     RequirementVerification, TaskCapabilityState, WorkflowCheck, WorkflowCommand, WorkflowId,
     WorkflowLimits, WorkflowPhase, WorkflowPlan, WorkflowReport, WorkflowRequirement,
-    WorkflowStatus, WorkflowTaskState,
+    WorkflowStatus, WorkflowTaskState, LOOP_THRESHOLD,
 };
 use crate::coding::{CodingWorkspace, RepositoryInstructions, RepositoryProfile, RepositorySearch};
 use ponduin_providers::thinking::ThinkingEffort;
@@ -168,7 +168,7 @@ impl CodingToolState {
     pub(crate) fn workflow_guidance_for_workspace(&self, workspace_root: &Path) -> Option<String> {
         let context = self.workflow_tool_context(workspace_root)?;
         let status = &context.status;
-        let guidance = match status.phase {
+        let phase_guidance = match status.phase {
             WorkflowPhase::Analyzing | WorkflowPhase::Searching => {
                 "Call coding__find_files and read the relevant source or test files before \
                  coding__workflow_set_plan. For an existing project, put only returned \
@@ -254,8 +254,9 @@ impl CodingToolState {
             }
         };
         Some(format!(
-            "Current internal workflow phase: {:?}. {guidance}",
-            status.phase
+            "Current internal workflow phase: {:?}. {}{phase_guidance}",
+            status.phase,
+            repeated_contract_recovery_guidance(status),
         ))
     }
 
@@ -1138,6 +1139,22 @@ fn capability_recovery_guidance(status: &WorkflowStatus) -> String {
         ),
         TaskCapabilityState::Available => String::new(),
     }
+}
+
+fn repeated_contract_recovery_guidance(status: &WorkflowStatus) -> String {
+    let Some(error) = status
+        .memory
+        .tool_contract_errors
+        .last()
+        .filter(|error| error.repetitions >= LOOP_THRESHOLD)
+    else {
+        return String::new();
+    };
+    format!(
+        "The tool contract for `{}` has failed {} times with the same diagnostic. Do not repeat \
+         that call. Inspect the current workflow state and use a distinct allowed tool or strategy. ",
+        error.tool_name, error.repetitions
+    )
 }
 
 fn repair_pending_guidance() -> String {

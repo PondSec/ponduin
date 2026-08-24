@@ -422,7 +422,7 @@ impl CodingAgent {
             }
             1 => "The request was not executed. Correct the tool name and arguments from the currently exposed schema before retrying.",
             2 => "Do not repeat this tool contract. Call coding__find_files with a source-file glob suitable for the repository language, then use one returned workspace-relative path. Continue with the active workflow guidance after that.",
-            _ => "The workflow is now blocked after repeated identical tool-contract failures. Report the recorded stop reason and do not claim success.",
+            _ => "This tool contract has failed repeatedly. Do not retry it. Inspect the active workflow state, then use a distinct allowed tool or strategy; the task remains incomplete until its evidence-backed workflow completes.",
         };
         ErrorData::new(
             error.code,
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_the_recorded_contract_stop_reason_instead_of_an_action_limit() {
+    async fn repeated_contract_failures_keep_the_workflow_recoverable() {
         let temp_dir = tempfile::tempdir().unwrap();
         let agent = enabled_agent();
         agent
@@ -758,10 +758,13 @@ mod tests {
             );
         }
 
-        let message = agent.terminal_workflow_message(temp_dir.path()).unwrap();
-        assert!(message.contains("RepeatedToolContract"));
-        assert!(message.contains(tools::WORKFLOW_SET_PLAN_TOOL_NAME));
-        assert!(!message.contains("ActionLimit"));
+        assert!(agent.terminal_workflow_message(temp_dir.path()).is_none());
+        let guidance = agent.workflow_guidance(temp_dir.path()).unwrap();
+        assert!(guidance.contains(tools::WORKFLOW_SET_PLAN_TOOL_NAME));
+        assert!(guidance.contains("Do not repeat that call"));
+        assert!(agent
+            .active_workflow_continuation(temp_dir.path())
+            .is_some());
     }
 
     #[tokio::test]
