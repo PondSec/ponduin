@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
+import { Page } from '@playwright/test';
 import { promisify } from 'util';
 import { expect, test } from './fixtures';
 
@@ -9,6 +10,12 @@ const enabled = process.env.PONDUIN_LIVE_AGENT_E2E === '1' && Boolean(workingDir
 const execFileAsync = promisify(execFile);
 
 test.setTimeout(30 * 60_000);
+
+async function waitForCompletion(page: Page) {
+  const stopButton = page.getByRole('button', { name: 'Stop', exact: true });
+  await stopButton.waitFor({ state: 'visible', timeout: 30_000 });
+  await stopButton.waitFor({ state: 'hidden', timeout: 900_000 });
+}
 
 test.describe('live native coding agent repair GUI', () => {
   test.skip(
@@ -51,6 +58,7 @@ test.describe('live native coding agent repair GUI', () => {
     );
     await input.press('Enter');
     await expect(input).toHaveValue('', { timeout: 30_000 });
+    await waitForCompletion(ponduinPage);
 
     await expect
       .poll(async () => readFile(join(root, 'test_hello.py'), 'utf8').catch(() => ''), {

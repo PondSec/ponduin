@@ -26,6 +26,8 @@ test.describe('live native coding agent progress GUI', () => {
     );
     await input.press('Enter');
     await expect(input).toHaveValue('', { timeout: 30_000 });
+    const stopButton = ponduinPage.getByRole('button', { name: 'Stop', exact: true });
+    await stopButton.waitFor({ state: 'visible', timeout: 30_000 });
 
     await expect(toolCalls).toHaveCount(toolCallCount + 1, {
       timeout: 240_000,
@@ -37,5 +39,6 @@ test.describe('live native coding agent progress GUI', () => {
     await expect(agentMessages.nth(agentMessageCount)).toBeVisible({
       timeout: 240_000,
     });
+    await stopButton.waitFor({ state: 'hidden', timeout: 900_000 });
   });
 });
