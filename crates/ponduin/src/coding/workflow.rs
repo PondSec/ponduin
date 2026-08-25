@@ -253,6 +253,12 @@ impl CodingWorkflow {
         }
     }
 
+    pub fn block_for_unproductive_response_limit(&mut self, limit: u32) {
+        if !self.is_terminal() {
+            self.block(WorkflowStopReason::UnproductiveResponseLimit { limit });
+        }
+    }
+
     pub fn set_repair_strategy(
         &mut self,
         approach: RepairApproach,
@@ -1970,6 +1976,9 @@ pub enum WorkflowStopReason {
     ActionLimit {
         limit: u32,
     },
+    UnproductiveResponseLimit {
+        limit: u32,
+    },
     IterationLimit {
         limit: u32,
     },
@@ -2778,6 +2787,20 @@ mod tests {
             .unwrap();
 
         assert!(!workflow.status().repair_pending);
+    }
+
+    #[test]
+    fn blocks_after_the_unproductive_response_budget_without_claiming_completion() {
+        let mut workflow = planned_workflow();
+
+        workflow.block_for_unproductive_response_limit(3);
+
+        assert_eq!(workflow.phase(), WorkflowPhase::Blocked);
+        assert_eq!(
+            workflow.status().stop_reason,
+            Some(WorkflowStopReason::UnproductiveResponseLimit { limit: 3 })
+        );
+        assert!(!workflow.report().verified);
     }
 
     #[test]

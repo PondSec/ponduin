@@ -439,6 +439,23 @@ fn live_updates_for_response(message: &Message, workflow_continuation: bool) -> 
     updates
 }
 
+fn is_unproductive_provider_response(
+    no_tools_called: bool,
+    exit_chat: bool,
+    provider_errored: bool,
+    did_recovery_compact: bool,
+    provider_produced_non_reasoning_content: bool,
+    last_assistant_text: &str,
+    workflow_requires_action: bool,
+) -> bool {
+    no_tools_called
+        && !exit_chat
+        && !provider_errored
+        && !did_recovery_compact
+        && (workflow_requires_action
+            || (!provider_produced_non_reasoning_content && last_assistant_text.is_empty()))
+}
+
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
 }
@@ -3148,20 +3165,31 @@ impl Agent {
                     }
                 }
 
-                // A provider turn is unproductive when it contains neither a tool
-                // call nor non-reasoning content. A completely empty assistant
-                // response must never be persisted because strict providers reject
-                // it. Reasoning-only content is valid provider state, but it is not
-                // a completed action and must not silently end the user turn.
-                let unproductive_response = no_tools_called
-                    && !exit_chat
-                    && !provider_errored
-                    && !did_recovery_compact_this_iteration
-                    && !provider_produced_non_reasoning_content
-                    && last_assistant_text.is_empty();
+                // A non-terminal coding workflow needs a concrete native action.
+                // Its prose is deliberately withheld from the user, so accepting
+                // that prose as a productive turn would leave the workflow active
+                // while repeatedly asking the provider to continue without any
+                // corrective feedback.
+                let workflow_requires_action = coding_tools_active
+                    && self
+                        .coding_agent
+                        .workflow_continuation(&session.working_dir)
+                        .is_some();
+                let unproductive_response = is_unproductive_provider_response(
+                    no_tools_called,
+                    exit_chat,
+                    provider_errored,
+                    did_recovery_compact_this_iteration,
+                    provider_produced_non_reasoning_content,
+                    &last_assistant_text,
+                    workflow_requires_action,
+                );
                 let empty_response = unproductive_response && !provider_produced_content;
-                let reasoning_only_response =
-                    unproductive_response && provider_produced_content;
+                let reasoning_only_response = unproductive_response
+                    && provider_produced_content
+                    && !provider_produced_non_reasoning_content;
+                let missing_coding_action_response =
+                    unproductive_response && workflow_requires_action;
 
                 if empty_response {
                     messages_to_add = Conversation::default();
@@ -3192,6 +3220,55 @@ impl Agent {
                             // continue from last user message after recovery compact
                         }
                         None if self.has_pending_steers(&session_config.id).await => {}
+                        None if coding_tools_active && unproductive_response => {
+                            if unproductive_turn_retries < MAX_UNPRODUCTIVE_TURN_RETRIES {
+                                unproductive_turn_retries += 1;
+                                retrying_after_unproductive_turn = true;
+                                let continuation = self
+                                    .coding_agent
+                                    .recovery_instruction(&session.working_dir)
+                                    .unwrap_or_else(|| {
+                                        UNPRODUCTIVE_TURN_CONTINUATION.to_string()
+                                    });
+                                messages_to_add.push(
+                                    Message::user()
+                                        .with_text(continuation)
+                                        .with_visibility(false, true),
+                                );
+                                warn!(
+                                    response_kind = if missing_coding_action_response {
+                                        "missing-coding-action"
+                                    } else if reasoning_only_response {
+                                        "reasoning-only"
+                                    } else {
+                                        "empty"
+                                    },
+                                    "Coding workflow received an unproductive response; retrying ({}/{})",
+                                    unproductive_turn_retries,
+                                    MAX_UNPRODUCTIVE_TURN_RETRIES
+                                );
+                            } else {
+                                self.coding_agent.block_for_unproductive_response_limit(
+                                    &session.working_dir,
+                                    MAX_UNPRODUCTIVE_TURN_RETRIES,
+                                );
+                                let fallback = self
+                                    .coding_agent
+                                    .recovery_exhausted_message(&session.working_dir)
+                                    .unwrap_or_else(|| {
+                                        "The active coding workflow stopped after repeated responses without a required tool action. The original request and collected evidence were retained."
+                                            .to_string()
+                                    });
+                                warn!(
+                                    "Coding workflow stopped after repeated responses without a required tool action"
+                                );
+                                last_assistant_text = fallback.clone();
+                                let message = Message::assistant().with_text(fallback);
+                                messages_to_add.push(message.clone());
+                                yield AgentEvent::Message(message);
+                                exit_chat = true;
+                            }
+                        }
                         None if coding_tools_active => {
                             if let Some(continuation) = self
                                 .coding_agent
@@ -4083,6 +4160,25 @@ mod tests {
         assert!(updates
             .iter()
             .all(|update| !update.as_concat_text().contains("The task is complete.")));
+    }
+
+    #[test]
+    fn active_coding_workflow_retries_prose_without_a_tool_action() {
+        assert!(is_unproductive_provider_response(
+            true, false, false, false, true, "", true,
+        ));
+        assert!(!is_unproductive_provider_response(
+            true,
+            false,
+            false,
+            false,
+            true,
+            "visible answer",
+            false,
+        ));
+        assert!(!is_unproductive_provider_response(
+            false, false, false, false, true, "", true,
+        ));
     }
 
     #[test]

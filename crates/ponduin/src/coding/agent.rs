@@ -134,6 +134,14 @@ impl CodingAgent {
             .block_for_action_limit(workspace.root(), limit);
     }
 
+    pub(crate) fn block_for_unproductive_response_limit(&self, working_dir: &Path, limit: u32) {
+        let Ok(workspace) = CodingWorkspace::new(working_dir) else {
+            return;
+        };
+        self.tool_state
+            .block_for_unproductive_response_limit(workspace.root(), limit);
+    }
+
     pub fn routing_tools(&self, ponduin_mode: PonduinMode) -> Vec<Tool> {
         if self.available(ponduin_mode) {
             tools::routing_definitions()
@@ -723,6 +731,7 @@ mod tests {
         let recovery = agent.recovery_instruction(temp_dir.path()).unwrap();
 
         assert!(recovery.contains("Create a small interactive web project"));
+        assert!(recovery.contains("Invoke exactly one currently exposed coding__ tool"));
         assert!(recovery.contains("Do not ask the user to repeat the task"));
         assert!(!recovery.contains("Please resend"));
         assert!(agent

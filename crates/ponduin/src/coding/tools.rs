@@ -622,9 +622,11 @@ impl CodingToolState {
         }
         let guidance = self.workflow_guidance_for_workspace(workspace_root)?;
         Some(format!(
-            "Resume the active coding task after an internal model failure. Original user request: \
-             {}. Objective: {}. Intent: {:?}. Interaction mode: {:?}. {} Do not ask the user to \
-             repeat the task; take the next allowed tool action.",
+            "Your preceding response made no native coding tool call while the task remains incomplete. \
+             Resume the active coding task now. Do not narrate or promise a future action. Do not ask \
+             the user to repeat the task. Invoke exactly one currently exposed coding__ tool for the next \
+             allowed action. Original user request: {}. Objective: {}. Intent: {:?}. Interaction \
+             mode: {:?}. {}",
             status.task.original_user_request,
             status.task.normalized_objective,
             status.task.intent,
@@ -702,8 +704,9 @@ impl CodingToolState {
             return None;
         }
         Some(format!(
-            "The active coding task remains preserved at {:?} after repeated empty model responses. \
-             The original request and workflow evidence were retained; no user resubmission is required.",
+            "The active coding task is blocked at {:?} after repeated responses without a required \
+             coding tool action. The original request and workflow evidence were retained; no user \
+             resubmission is required.",
             status.phase
         ))
     }
@@ -1025,6 +1028,16 @@ impl CodingToolState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow.block_for_action_limit(limit);
+        });
+    }
+
+    pub(crate) fn block_for_unproductive_response_limit(&self, workspace_root: &Path, limit: u32) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.block_for_unproductive_response_limit(limit);
         });
     }
 
