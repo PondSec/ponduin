@@ -11,13 +11,9 @@ test.describe('live native coding agent progress GUI', () => {
     'set PONDUIN_LIVE_AGENT_E2E=1 and PONDUIN_E2E_WORKING_DIR to run local-model E2E'
   );
 
-  test('shows model updates and tool calls while autonomous work is still running', async ({
-    ponduinPage,
-  }) => {
+  test('shows real tool progress without synthetic workflow messages', async ({ ponduinPage }) => {
     const input = ponduinPage.locator('[data-testid="chat-input"]');
-    const agentMessages = ponduinPage.locator('.agent-message-bubble');
     const toolCalls = ponduinPage.getByTestId('tool-call-progress');
-    const agentMessageCount = await agentMessages.count();
     const toolCallCount = await toolCalls.count();
 
     await input.waitFor({ state: 'visible', timeout: 60_000 });
@@ -33,12 +29,6 @@ test.describe('live native coding agent progress GUI', () => {
       timeout: 240_000,
     });
     await expect(toolCalls.nth(toolCallCount)).toBeVisible({ timeout: 240_000 });
-    await expect(agentMessages).toHaveCount(agentMessageCount + 1, {
-      timeout: 240_000,
-    });
-    await expect(agentMessages.nth(agentMessageCount)).toBeVisible({
-      timeout: 240_000,
-    });
     await stopButton.waitFor({ state: 'hidden', timeout: 900_000 });
   });
 });

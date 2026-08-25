@@ -250,7 +250,9 @@ impl CodingAgent {
              relevant_files must name the workspace-relative paths that will be created; it must \
              never be an empty array. Never claim a check passed from model text; process results \
              are recorded automatically. For direct workspace work, use the currently exposed \
-             coding__ tools. execute_typescript and invented wrappers never replace the exposed \
+             coding__ tools. Use the language of the latest user request for user-visible prose \
+             and thinking updates unless the user explicitly requests another language. \
+             execute_typescript and invented wrappers never replace the exposed \
              mutation tool or coding__run_process. Optional local retrieval: LSP={}, \
              feature_embeddings={}. \
              {} {} {} {}",
@@ -651,6 +653,7 @@ mod tests {
         assert!(prompt.contains("relevant_files"));
         assert!(prompt.contains("paths that will be created"));
         assert!(prompt.contains("Never claim a check passed"));
+        assert!(prompt.contains("language of the latest user request"));
         assert!(prompt.contains("execute_typescript"));
         assert!(prompt.contains("active for this model-selected request"));
         assert!(prompt.contains("Model capability profile"));

@@ -430,12 +430,6 @@ fn live_updates_for_response(message: &Message, workflow_continuation: bool) -> 
         updates.push(workflow_trace);
     }
 
-    if !message.as_concat_text().trim().is_empty() {
-        updates.push(Message::assistant().with_text(
-            "Workflow in progress: Ponduin is continuing with the required actions and validation before it can report a final result.",
-        ));
-    }
-
     updates
 }
 
@@ -4170,23 +4164,23 @@ mod tests {
     #[test]
     fn active_coding_workflow_surfaces_trace_without_unverified_model_prose() {
         let response = Message::assistant()
-            .with_thinking("I need to inspect the project first.", "sig")
-            .with_text("The task is complete.");
+            .with_thinking("Ich prüfe zuerst das Projekt.", "sig")
+            .with_text("Die Aufgabe ist abgeschlossen.");
 
         let updates = live_updates_for_response(&response, true);
 
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 1);
         assert!(matches!(
             updates[0].content.as_slice(),
             [MessageContent::Thinking(_)]
         ));
-        assert!(updates[1]
-            .content
-            .iter()
-            .any(|content| matches!(content, MessageContent::Text(text) if text.text.contains("Workflow in progress"))));
-        assert!(updates
-            .iter()
-            .all(|update| !update.as_concat_text().contains("The task is complete.")));
+        assert!(matches!(
+            updates[0].content.as_slice(),
+            [MessageContent::Thinking(thinking)] if thinking.thinking == "Ich prüfe zuerst das Projekt."
+        ));
+        assert!(updates.iter().all(|update| !update
+            .as_concat_text()
+            .contains("Die Aufgabe ist abgeschlossen.")));
     }
 
     #[test]
@@ -4838,15 +4832,15 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
         let updates = live_updates_for_response(&response, true);
 
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 1);
         assert!(matches!(
             updates[0].content.as_slice(),
             [MessageContent::ToolRequest(_)]
         ));
-        assert!(updates[1]
+        assert!(updates.iter().all(|update| update
             .content
             .iter()
-            .any(|content| matches!(content, MessageContent::Text(text) if text.text.contains("Workflow in progress"))));
+            .all(|content| !matches!(content, MessageContent::Text(_)))));
     }
 
     #[tokio::test]
