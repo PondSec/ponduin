@@ -169,6 +169,21 @@ impl CodingToolState {
         let context = self.workflow_tool_context(workspace_root)?;
         let status = &context.status;
         let phase_guidance = match status.phase {
+            WorkflowPhase::Analyzing | WorkflowPhase::Searching
+                if status
+                    .memory
+                    .repository_inventory
+                    .as_ref()
+                    .is_some_and(|inventory| {
+                        inventory.scanned_files == 0 && !inventory.truncated
+                    }) =>
+            {
+                "A complete repository inventory found no project files. Call \
+                 coding__workflow_set_plan now with the user-requested new workspace-relative \
+                 paths and a concrete validation command. Do not repeat repository discovery \
+                 until a plan is accepted. Editing and execution tools remain withheld until then."
+                    .to_string()
+            }
             WorkflowPhase::Analyzing | WorkflowPhase::Searching => {
                 "Call coding__find_files and read the relevant source or test files before \
                  coding__workflow_set_plan. For an existing project, put only returned \
@@ -740,6 +755,21 @@ impl CodingToolState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow.note_repository_activity();
+        });
+    }
+
+    fn note_repository_inventory(
+        &self,
+        workspace_root: &Path,
+        scanned_files: usize,
+        truncated: bool,
+    ) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.note_repository_inventory(scanned_files, truncated);
         });
     }
 
@@ -2007,6 +2037,11 @@ pub(crate) fn execute_with_state(
             }
             let profile = RepositoryProfile::discover(&workspace, params.max_files)
                 .map_err(|error| internal_error(error.to_string()))?;
+            state.note_repository_inventory(
+                workspace.root(),
+                profile.scanned_files,
+                profile.truncated,
+            );
             json_result(&profile, config.output_limit)
         }
         REPOSITORY_INSTRUCTIONS_TOOL_NAME => {
@@ -5286,6 +5321,43 @@ mod tests {
 
         assert_eq!(json["manifests"][0]["kind"], "cargo");
         assert_eq!(json["languages"]["rust"], 1);
+    }
+
+    #[test]
+    fn guides_an_empty_workspace_inventory_to_planning() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WORKFLOW_START_TOOL_NAME).with_arguments(object!({
+                "objective": "create a new project"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(REPOSITORY_PROFILE_TOOL_NAME),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let root = temp_dir.path().canonicalize().unwrap();
+        let status = state.workflow_status(&root, None).unwrap();
+
+        assert_eq!(
+            status.memory.repository_inventory,
+            Some(crate::coding::workflow::RepositoryInventoryEvidence {
+                scanned_files: 0,
+                truncated: false,
+            })
+        );
+        assert!(state
+            .workflow_guidance_for_workspace(&root)
+            .is_some_and(|guidance| guidance.contains("Call coding__workflow_set_plan now")));
     }
 
     #[test]

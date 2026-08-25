@@ -125,6 +125,17 @@ impl CodingWorkflow {
         }
     }
 
+    pub fn note_repository_inventory(&mut self, scanned_files: usize, truncated: bool) {
+        if self.is_terminal() {
+            return;
+        }
+        self.note_repository_activity();
+        self.memory.repository_inventory = Some(RepositoryInventoryEvidence {
+            scanned_files,
+            truncated,
+        });
+    }
+
     pub fn note_read_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         if self.is_terminal() {
             return;
@@ -1489,6 +1500,8 @@ pub struct ReviewEvidence {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowMemory {
     pub assumptions: Vec<String>,
+    #[serde(default)]
+    pub repository_inventory: Option<RepositoryInventoryEvidence>,
     pub read_files: Vec<PathBuf>,
     pub read_file_digests: Vec<ReadFileEvidence>,
     pub relevant_symbols: Vec<RelevantSymbolEvidence>,
@@ -1504,6 +1517,12 @@ pub struct WorkflowMemory {
 pub struct ReadFileEvidence {
     pub path: PathBuf,
     pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryInventoryEvidence {
+    pub scanned_files: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2380,6 +2399,22 @@ mod tests {
                 expected,
             }) if expected == vec![WorkflowPhase::Searching]
         ));
+    }
+
+    #[test]
+    fn retains_complete_empty_repository_inventory() {
+        let mut workflow = CodingWorkflow::new("create a feature".to_string(), limits()).unwrap();
+
+        workflow.note_repository_inventory(0, false);
+
+        assert_eq!(workflow.status().phase, WorkflowPhase::Searching);
+        assert_eq!(
+            workflow.status().memory.repository_inventory,
+            Some(RepositoryInventoryEvidence {
+                scanned_files: 0,
+                truncated: false,
+            })
+        );
     }
 
     #[test]
