@@ -106,6 +106,7 @@ export const test = base.extend<PonduinTestFixtures>({
           PONDUIN_ALLOWLIST_BYPASS: 'true',
           PONDUIN_E2E_PATH_ROOT: e2eUserDataDir,
           ENABLE_PLAYWRIGHT: 'true',
+          PONDUIN_DISABLE_AUTO_DOWNLOAD: 'true',
           PLAYWRIGHT_DEBUG_PORT: debugPort.toString(), // Unique port per test for parallel execution
           RUST_LOG: 'info', // Enable info-level logging for ponduind backend
         },
