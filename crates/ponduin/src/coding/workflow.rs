@@ -144,6 +144,36 @@ impl CodingWorkflow {
         self.memory.read_files = known.into_iter().collect();
     }
 
+    pub fn note_file_snapshot(&mut self, path: PathBuf, digest: String) {
+        self.note_read_files([path.clone()]);
+        let mut snapshots = self
+            .memory
+            .read_file_digests
+            .iter()
+            .cloned()
+            .map(|snapshot| (snapshot.path, snapshot.digest))
+            .collect::<BTreeMap<_, _>>();
+        snapshots.insert(path, digest);
+        while snapshots.len() > MAX_EVIDENCE_RECORDS {
+            let Some(path) = snapshots.keys().next().cloned() else {
+                break;
+            };
+            snapshots.remove(&path);
+        }
+        self.memory.read_file_digests = snapshots
+            .into_iter()
+            .map(|(path, digest)| ReadFileEvidence { path, digest })
+            .collect();
+    }
+
+    pub(crate) fn read_file_digest(&self, path: &Path) -> Option<String> {
+        self.memory
+            .read_file_digests
+            .iter()
+            .find(|snapshot| snapshot.path == path)
+            .map(|snapshot| snapshot.digest.clone())
+    }
+
     pub fn note_symbols<'a>(&mut self, symbols: impl IntoIterator<Item = &'a CodeSymbol>) {
         if self.is_terminal() {
             return;
@@ -1442,6 +1472,7 @@ pub struct ReviewEvidence {
 pub struct WorkflowMemory {
     pub assumptions: Vec<String>,
     pub read_files: Vec<PathBuf>,
+    pub read_file_digests: Vec<ReadFileEvidence>,
     pub relevant_symbols: Vec<RelevantSymbolEvidence>,
     pub executed_commands: Vec<CommandEvidence>,
     pub known_errors: Vec<KnownErrorEvidence>,
@@ -1449,6 +1480,12 @@ pub struct WorkflowMemory {
     pub repair_strategies: Vec<RepairStrategyEvidence>,
     pub capability_feedback: Vec<CapabilityFeedbackEvidence>,
     pub open_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReadFileEvidence {
+    pub path: PathBuf,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3140,6 +3177,7 @@ mod tests {
 
         let memory = workflow.status().memory;
         assert_eq!(memory.read_files, vec![PathBuf::from("src/lib.rs")]);
+        assert!(memory.read_file_digests.is_empty());
         assert_eq!(memory.relevant_symbols[0].name, "target");
         assert_eq!(memory.relevant_symbols[0].qualified_name, "module::target");
         assert_eq!(memory.executed_commands[0].program, "cargo");

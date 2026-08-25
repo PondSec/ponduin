@@ -740,6 +740,16 @@ impl CodingToolState {
         });
     }
 
+    fn note_read_snapshot(&self, workspace_root: &Path, snapshot: &FileSnapshot) {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.with_current_workflow_mut(workspace_root, |workflow| {
+            workflow.note_file_snapshot(snapshot.path.clone(), snapshot.digest.clone());
+        });
+    }
+
     fn note_read_files(&self, workspace_root: &Path, paths: Vec<PathBuf>) {
         let _mutation = self
             .mutation_lock
@@ -748,6 +758,20 @@ impl CodingToolState {
         self.with_current_workflow_mut(workspace_root, |workflow| {
             workflow.note_read_files(paths);
         });
+    }
+
+    fn retained_read_digest(&self, workspace_root: &Path, path: &Path) -> Option<String> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.workflows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|entry| entry.workspace_root == workspace_root)
+            .and_then(|entry| entry.workflow.read_file_digest(path))
     }
 
     fn note_symbols(
@@ -2028,7 +2052,7 @@ pub(crate) fn execute_with_state(
                 },
             )
             .map_err(|error| invalid_arguments(error.to_string()))?;
-            state.note_read_files(workspace.root(), vec![snapshot.path.clone()]);
+            state.note_read_snapshot(workspace.root(), &snapshot);
             json_result(&snapshot, config.output_limit)
         }
         PREVIEW_CHANGES_TOOL_NAME => {
@@ -2071,26 +2095,36 @@ pub(crate) fn execute_with_state(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(invalid_arguments(error.to_string())),
             };
-            let updating_existing_file = path_exists && params.expected_digest.is_some();
+            let relative_path = write_path
+                .strip_prefix(workspace.root())
+                .map(Path::to_path_buf)
+                .map_err(|_| invalid_arguments("mutation path escaped the workspace"))?;
+            let expected_digest = if path_exists {
+                Some(
+                    params
+                        .expected_digest
+                        .or_else(|| state.retained_read_digest(workspace.root(), &relative_path))
+                        .ok_or_else(|| {
+                            invalid_arguments(
+                                "existing files require the digest returned by coding__read_file; \
+                                 read the file before writing it or supply its expected_digest",
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             let mut change = serde_json::Map::new();
             change.insert(
                 "operation".to_string(),
-                Value::String(
-                    if updating_existing_file {
-                        "write"
-                    } else {
-                        "create"
-                    }
-                    .to_string(),
-                ),
+                Value::String(if path_exists { "write" } else { "create" }.to_string()),
             );
             change.insert(
                 "path".to_string(),
                 Value::String(params.path.to_string_lossy().into_owned()),
             );
             change.insert("content".to_string(), Value::String(params.content));
-            if let Some(expected_digest) = params.expected_digest.filter(|_| updating_existing_file)
-            {
+            if let Some(expected_digest) = expected_digest {
                 change.insert(
                     "expected_digest".to_string(),
                     Value::String(expected_digest),
@@ -2538,7 +2572,8 @@ fn write_file_tool() -> Tool {
     Tool::new(
         WRITE_FILE_TOOL_NAME.to_string(),
         "Create one new workspace file or update one versioned file. Existing files require the \
-         complete BLAKE3 digest returned by coding__read_file. This applies the same guarded \
+         complete BLAKE3 digest returned by coding__read_file. When an active workflow has already \
+         read the file, that retained digest is used if expected_digest is omitted. This applies the same guarded \
          mutation contract as coding__apply_changes with a smaller single-file input."
             .to_string(),
         object!({
@@ -4731,6 +4766,98 @@ mod tests {
                 .unwrap()
                 .changed_files,
             vec![PathBuf::from("index.html")]
+        );
+    }
+
+    #[test]
+    fn write_file_reuses_a_retained_read_digest_for_an_existing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("index.html"), "<h1>Before</h1>\n").unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["index.html"]);
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(READ_FILE_TOOL_NAME)
+                .with_arguments(object!({"path": "index.html"})),
+            temp_dir.path(),
+        )
+        .unwrap();
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "index.html",
+                "content": "<h1>After</h1>\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("index.html")).unwrap(),
+            "<h1>After</h1>\n"
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_an_existing_file_without_read_evidence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("index.html"), "<h1>Before</h1>\n").unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["index.html"]);
+
+        let error = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "index.html",
+                "content": "<h1>After</h1>\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("require the digest returned"));
+    }
+
+    #[test]
+    fn write_file_rejects_stale_retained_read_evidence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("index.html");
+        fs::write(&path, "<h1>Before</h1>\n").unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        begin_editing_workflow(&config, &state, temp_dir.path(), &["index.html"]);
+
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(READ_FILE_TOOL_NAME)
+                .with_arguments(object!({"path": "index.html"})),
+            temp_dir.path(),
+        )
+        .unwrap();
+        fs::write(&path, "<h1>External change</h1>\n").unwrap();
+
+        let error = execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "index.html",
+                "content": "<h1>After</h1>\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("digest"));
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "<h1>External change</h1>\n"
         );
     }
 
