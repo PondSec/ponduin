@@ -502,7 +502,8 @@ impl CodingWorkflow {
             planned_check_ids,
         );
         self.bind_validation_scope(&mut validation);
-        self.accept_validation(validation)
+        self.accept_validation(validation)?;
+        self.advance_to_review_when_validated()
     }
 
     pub fn record_validation_execution(
@@ -521,7 +522,8 @@ impl CodingWorkflow {
         let mut validation =
             ValidationEvidence::from_execution(self.revision, execution, planned_check_ids);
         self.bind_validation_scope(&mut validation);
-        self.accept_validation(validation)
+        self.accept_validation(validation)?;
+        self.advance_to_review_when_validated()
     }
 
     pub fn record_review(&mut self, review: &ReviewReport) -> Result<(), WorkflowError> {
@@ -628,6 +630,9 @@ impl CodingWorkflow {
     }
 
     pub fn begin_review(&mut self) -> Result<(), WorkflowError> {
+        if self.phase == WorkflowPhase::Reviewing {
+            return Ok(());
+        }
         let required_checks = self
             .plan
             .as_ref()
@@ -668,6 +673,13 @@ impl CodingWorkflow {
             }
         }
         self.phase = WorkflowPhase::Reviewing;
+        Ok(())
+    }
+
+    fn advance_to_review_when_validated(&mut self) -> Result<(), WorkflowError> {
+        if self.can_begin_review() {
+            self.begin_review()?;
+        }
         Ok(())
     }
 
@@ -2491,6 +2503,23 @@ mod tests {
         assert_eq!(report.requirements[0].status, RequirementStatus::Verified);
         assert!(report.review.is_some());
         assert!(!report.validations[0].diagnostic_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn successful_required_validation_advances_to_reviewing() {
+        let mut workflow = planned_workflow();
+        workflow.authorize_change().unwrap();
+        workflow
+            .record_change("change-1".to_string(), &preview("+new"))
+            .unwrap();
+        workflow.begin_validation().unwrap();
+
+        workflow
+            .record_process("cargo", &["test".to_string()], &output(true, "ok"))
+            .unwrap();
+
+        assert_eq!(workflow.phase(), WorkflowPhase::Reviewing);
+        workflow.begin_review().unwrap();
     }
 
     #[test]

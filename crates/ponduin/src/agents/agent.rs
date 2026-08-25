@@ -456,6 +456,16 @@ fn is_unproductive_provider_response(
             || (!provider_produced_non_reasoning_content && last_assistant_text.is_empty()))
 }
 
+fn coding_tool_followup(continuation: Option<String>) -> Option<Message> {
+    continuation.map(|continuation| {
+        Message::user()
+            .with_text(format!(
+                "Interpret the preceding coding tool result and take the next required action now. {continuation}"
+            ))
+            .with_visibility(false, true)
+    })
+}
+
 fn agent_visible_message_text(message: &Message) -> String {
     message.agent_visible_content().as_concat_text()
 }
@@ -2606,6 +2616,14 @@ impl Agent {
                                     continue;
                                 }
 
+                                let has_internal_coding_request = remaining_requests.iter().any(
+                                    |request| {
+                                        request.tool_call.as_ref().is_ok_and(|tool_call| {
+                                            crate::coding::tools::is_reserved_name(&tool_call.name)
+                                        })
+                                    },
+                                );
+
                                 let mut request_to_response_map = HashMap::new();
                                 let mut request_metadata: HashMap<String, Option<ProviderMetadata>> = HashMap::new();
                                 for request in frontend_requests.iter().chain(remaining_requests.iter()) {
@@ -2991,6 +3009,15 @@ impl Agent {
                                     messages_to_add.push(request_msg);
                                     yield AgentEvent::Message(project_message_for_user_event(&final_response));
                                     messages_to_add.push(final_response);
+                                }
+
+                                if has_internal_coding_request {
+                                    if let Some(followup) = coding_tool_followup(
+                                        self.coding_agent
+                                            .active_workflow_continuation(&session.working_dir),
+                                    ) {
+                                        messages_to_add.push(followup);
+                                    }
                                 }
 
                                 no_tools_called = false;
@@ -4179,6 +4206,19 @@ mod tests {
         assert!(!is_unproductive_provider_response(
             false, false, false, false, true, "", true,
         ));
+    }
+
+    #[test]
+    fn coding_tool_followup_restates_the_next_workflow_action() {
+        let followup = coding_tool_followup(Some("Call coding__review_changes now.".to_string()))
+            .expect("workflow continuation");
+
+        assert!(followup
+            .as_concat_text()
+            .contains("Interpret the preceding coding tool result"));
+        assert!(followup
+            .as_concat_text()
+            .contains("Call coding__review_changes now."));
     }
 
     #[test]
