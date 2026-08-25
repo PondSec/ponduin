@@ -15,7 +15,7 @@ use crate::coding::patch::{
     DEFAULT_PATCH_BATCH_LIMIT, MAX_PATCH_FILE_LIMIT,
 };
 use crate::coding::process::{ProcessLimits, ProcessOutput, ProcessRequest, ProcessRunner};
-use crate::coding::project::ProjectDiscovery;
+use crate::coding::project::{ProjectDiscovery, ValidationCommand, ValidationKind};
 use crate::coding::review::{ReviewAnalyzer, ReviewReport};
 use crate::coding::search::{SearchLimits, TextSearchRequest};
 use crate::coding::validation::{ValidationExecution, ValidationService};
@@ -1021,6 +1021,31 @@ impl CodingToolState {
         Ok(())
     }
 
+    fn planned_validation_command(
+        &self,
+        workspace_root: &Path,
+        command_id: &str,
+    ) -> Option<ValidationCommand> {
+        self.workflows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.workspace_root == workspace_root
+                    && entry.workflow.phase() == WorkflowPhase::Testing
+            })
+            .and_then(|entry| entry.workflow.planned_check(command_id))
+            .map(|command| ValidationCommand {
+                id: command_id.to_string(),
+                kind: ValidationKind::Test,
+                program: command.program,
+                args: command.args,
+                cwd: command.cwd,
+                evidence: "active workflow plan".to_string(),
+            })
+    }
+
     fn record_review(&self, workspace_root: &Path, review: &ReviewReport) -> Result<(), ErrorData> {
         let _mutation = self
             .mutation_lock
@@ -1966,7 +1991,7 @@ pub(crate) async fn execute_async(
             }
             let capabilities = ProjectDiscovery::discover(&workspace, params.max_files)
                 .map_err(|error| invalid_arguments(error.to_string()))?;
-            let execution = ValidationService::run(
+            let mut execution = ValidationService::run(
                 &workspace,
                 &capabilities,
                 &params.command_id,
@@ -1976,6 +2001,21 @@ pub(crate) async fn execute_async(
                 },
             )
             .await;
+            if execution.status == crate::coding::validation::ValidationStatus::NotPresent {
+                if let Some(command) =
+                    state.planned_validation_command(workspace.root(), &params.command_id)
+                {
+                    execution = ValidationService::run_command(
+                        &workspace,
+                        command,
+                        ProcessLimits {
+                            timeout,
+                            output_limit: config.output_limit,
+                        },
+                    )
+                    .await;
+                }
+            }
             state.invalidate_intelligence(workspace.root());
             state.record_validation_execution(workspace.root(), &execution)?;
             bounded_validation_result(execution, config.output_limit)
@@ -3344,10 +3384,10 @@ fn workflow_complete_tool() -> Tool {
 fn run_validation_tool() -> Tool {
     Tool::new(
         RUN_VALIDATION_TOOL_NAME.to_string(),
-        "Run exactly one validation command id returned by coding__project_capabilities. Never \
-         pass a file path, executable name, or command text as command_id; use \
-         coding__run_process when no exact discovered id exists. The command is rediscovered \
-         before execution and runs through the bounded process policy. \
+        "Run exactly one validation command id returned by coding__project_capabilities or \
+         declared by the active workflow plan. Never pass a file path, executable name, or \
+         command text as command_id; use coding__run_process when no exact command id exists. \
+         The command runs through the bounded process policy. \
          Results distinguish passed, failed, missing, unavailable, blocked, timed out, and \
          incomplete checks and are automatically attached to an active testing workflow."
             .to_string(),
@@ -5685,6 +5725,47 @@ mod tests {
         assert_eq!(json["status"], "not_present");
         assert!(json["command"].is_null());
         assert!(json["output"].is_null());
+    }
+
+    #[tokio::test]
+    async fn validation_tool_runs_a_planned_check_without_project_discovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = enabled_config();
+        let state = CodingToolState::default();
+        let workflow_id = begin_editing_workflow(&config, &state, temp_dir.path(), &["fixture.py"]);
+        execute_with_state(
+            &config,
+            &state,
+            CallToolRequestParams::new(WRITE_FILE_TOOL_NAME).with_arguments(object!({
+                "path": "fixture.py",
+                "content": "value = 1\n"
+            })),
+            temp_dir.path(),
+        )
+        .unwrap();
+        transition(
+            &config,
+            &state,
+            temp_dir.path(),
+            &workflow_id,
+            "begin_validation",
+        );
+
+        let result = execute_async(
+            &config,
+            &state,
+            CallToolRequestParams::new(RUN_VALIDATION_TOOL_NAME).with_arguments(object!({
+                "command_id": "fixture-check"
+            })),
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
+        let json: Value = serde_json::from_str(&result_text(result)).unwrap();
+
+        assert_eq!(json["status"], "passed");
+        assert_eq!(json["command"]["id"], "fixture-check");
+        assert!(exposed_tool_names(&state, temp_dir.path()).contains(REVIEW_CHANGES_TOOL_NAME));
     }
 
     #[test]

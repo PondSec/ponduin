@@ -33,6 +33,14 @@ impl ValidationService {
             };
         };
 
+        Self::run_command(workspace, command.clone(), limits).await
+    }
+
+    pub async fn run_command(
+        workspace: &CodingWorkspace,
+        command: ValidationCommand,
+        limits: ProcessLimits,
+    ) -> ValidationExecution {
         let output = ProcessRunner::new(workspace, limits)
             .run(ProcessRequest {
                 program: command.program.clone(),
@@ -43,13 +51,13 @@ impl ValidationService {
             .await;
         match output {
             Ok(output) => ValidationExecution {
-                command: Some(command.clone()),
+                command: Some(command),
                 status: status_for_output(&output),
                 reason: None,
                 output: Some(output),
             },
             Err(error) => ValidationExecution {
-                command: Some(command.clone()),
+                command: Some(command),
                 status: status_for_error(&error),
                 reason: Some(error.to_string()),
                 output: None,

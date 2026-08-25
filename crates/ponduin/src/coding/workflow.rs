@@ -699,6 +699,15 @@ impl CodingWorkflow {
         candidate.begin_review().is_ok()
     }
 
+    pub fn planned_check(&self, check_id: &str) -> Option<WorkflowCommand> {
+        self.plan
+            .as_ref()?
+            .checks()
+            .into_iter()
+            .find(|check| check.id == check_id)
+            .map(|check| check.command.clone())
+    }
+
     pub fn can_complete(&self) -> bool {
         self.phase == WorkflowPhase::Reviewing
             && self
